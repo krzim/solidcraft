@@ -23,6 +23,7 @@ solidcraft-smlib = { path = "crates/smlib" }
 solidcraft-step = { path = "crates/step" }
 solidcraft-render = { path = "crates/render" }
 solidcraft-dynamics = { path = "crates/dynamics" }
+solidcraft-cam = { path = "crates/cam" }
 solidcraft-gpu = { path = "crates/gpu" }
 solidcraft-doc = { path = "crates/doc" }
 solidcraft-io = { path = "crates/io" }
