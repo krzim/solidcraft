@@ -174,19 +174,25 @@ impl Post {
         }
         fill(&self.dwell, &Values::default())?;
         for block in [&self.header, &self.tool_change, &self.spindle_on, &self.spindle_off, &self.coolant_on, &self.coolant_off, &self.footer] {
-            if block.len() > MAX_TEMPLATE_LINES {
-                return Err(CamError::TooLarge(format!("a post template has more than {MAX_TEMPLATE_LINES} lines")));
-            }
-            for line in block {
-                if line.len() > MAX_TEMPLATE_LEN || line.chars().any(char::is_control) {
-                    return invalid("a post template line is too long or has control characters");
-                }
-                // Catches unknown placeholders before any program is written.
-                fill(line, &Values::default())?;
-            }
+            check_template(block)?;
         }
         Ok(())
     }
+}
+
+/// Checks a template block: not too many or too long lines, no control characters, only known placeholders.
+pub(crate) fn check_template(block: &[String]) -> Result<()> {
+    if block.len() > MAX_TEMPLATE_LINES {
+        return Err(CamError::TooLarge(format!("a post template has more than {MAX_TEMPLATE_LINES} lines")));
+    }
+    for line in block {
+        if line.len() > MAX_TEMPLATE_LEN || line.chars().any(char::is_control) {
+            return invalid("a post template line is too long or has control characters");
+        }
+        // Catches unknown placeholders before any program is written.
+        fill(line, &Values::default())?;
+    }
+    Ok(())
 }
 
 /// What the placeholders stand for.

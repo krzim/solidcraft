@@ -1,6 +1,7 @@
 use std::f64::consts::PI;
 
-use solidcraft_geom::{Loop2, Region2, Vec2, Vec3};
+use solidcore_record::{Loop2, Region2, Vec2, Vec3};
+use solidcraft_geom::prelude::*;
 
 use super::*;
 use crate::offset::Shape;
@@ -382,8 +383,8 @@ T3 M6
 G43 H3
 S3000 M3
 M8
-G0 X10 Y10
 G0 Z10
+G0 X10 Y10
 G0 Z2
 G1 Z-10 F200
 G4 P0.25

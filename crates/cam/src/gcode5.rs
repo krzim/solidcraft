@@ -1,0 +1,1091 @@
+//! Multi-axis programs as G-code: linear and rotary axis words, inverse-time feeds and tool
+//! centre point control.
+//!
+//! [`emit5`] writes a [`Program5`] (and [`emit_program`] a [`MachineProgram`], which may also
+//! hold indexed operations) for one [`Machine`] through a [`Post5`]: the same header, tool
+//! changes, spindle, coolant, comments and line numbers as [`crate::emit`], then the motion as
+//! `G0`/`G1` blocks with `X Y Z` and the machine's rotary letters, a word written only when it
+//! changes. Angles are written in degrees, unwound: a continuous axis adds up past ±360° (a
+//! wrapped helix keeps turning one way), as a rotary that does not roll over reads them.
+//!
+//! Two ways of writing the motion of a simultaneous operation:
+//! - machine coordinates (no [`Tcp`]): `X Y Z` are the machine's linear axes as
+//!   [`crate::kinematics`] places them, every cut broken into pieces the machine can move
+//!   through evenly within the post's tolerance. A cut that turns a rotary is timed in inverse
+//!   time (`G93`, `F` = 1 / the piece's minutes) when the post says so, and `G94` comes back for
+//!   cuts that do not; otherwise its `F` is the rate of the linear axes (of the rotaries alone,
+//!   in degrees a minute, when they are all that moves) that takes the planned time.
+//! - tool centre point control ([`Tcp`], `G43.4`): `X Y Z` are the tip in work coordinates and
+//!   the controller keeps it on its line while the rotaries turn; `F` is the tip's feed.
+//!
+//! An indexed operation turns the rotaries once (`G0 A…`) and is then written with the 3-axis
+//! rules, arcs kept as `G2`/`G3`.
+//!
+//! A rapid that turns a rotary first writes the post's `safe_rotate` lines and, with
+//! `clearance_retract`, rises to the clearance height (never down to it from higher); then the
+//! rotaries turn alone, and the linear axes follow, never diagonally: up first when rising,
+//! across first when descending. Where the tool's height is not known (the program's start,
+//! after a tool change) it first rises to the program's highest clearance. With the same tool,
+//! an operation starts from where the last one left the tool. Inverse time (`G93`) never
+//! stays in force over the blocks between operations (tool change, spindle, coolant), and every
+//! `F` is checked to be written as a feed the controller can run (never `F0`).
+//!
+//! [`parse5`] reads the motion back (the subset these write), which is how the output is
+//! checked: see [`crate::readback5`].
+
+use std::f64::consts::{FRAC_PI_4, PI};
+
+use serde::{Deserialize, Serialize};
+use solidcore_record::{Vec2, Vec3};
+use solidcraft_geom::prelude::*;
+
+use crate::gcode::{MAX_FEED, MAX_LINES, MAX_OPERATIONS, MIN_FEED, feed_in_range, feed_word_ok, number, plain, words, work_offset_code};
+use crate::indexed::{IndexedOperation, frame_for_index, head_upright};
+use crate::kinematics::{AxisLetter, JointMove, Joints, Machine, check_limits, solve_from};
+use crate::multiaxis::{Operation5, Program5, verify5};
+use crate::path::{MAX_MOVES, Move, arc_sweep};
+use crate::post::{CommentStyle, Post, Values, check_template, fill};
+use crate::tool::Tool;
+
+use crate::{CamError, Result, invalid};
+
+/// Shortest time an inverse-time block is given (minutes), so its `F` stays finite.
+const MIN_MINUTES: f64 = 1e-9;
+/// Most decimals of an inverse-time `F`.
+const MAX_INVERSE_DECIMALS: u8 = 12;
+/// Largest turn of the rotaries an indexed operation written with tool centre point control
+/// may be solved to, away from its own angles (radians).
+const HELD: f64 = 1e-9;
+
+/// Tool centre point control: the lines that switch it on (after the tool change, spindle and
+/// coolant of an operation; e.g. `G43.4 H{tool}`) and off (before the next tool change and at
+/// the end; e.g. `G49`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Tcp {
+    pub on: Vec<String>,
+    pub off: Vec<String>,
+}
+
+/// A post processor for multi-axis programs: a [`Post`] for everything but the motion, and how
+/// the rotaries are written.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Post5 {
+    pub base: Post,
+    /// Tool centre point control; `None` for output in machine coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<Tcp>,
+    /// Whether cuts that turn a rotary are written in inverse time (`G93`); machine-coordinate
+    /// output only.
+    #[serde(default)]
+    pub inverse_time: bool,
+    /// Decimals of angles (degrees, at most 6).
+    pub angle_decimals: u8,
+    /// Written before a rapid that turns a rotary, to take the tool clear first (`G53 G0 Z0`:
+    /// up to the machine's top in machine coordinates). After it the next rapid states every
+    /// linear axis, across first and down last.
+    #[serde(default)]
+    pub safe_rotate: Vec<String>,
+    /// Whether a rapid that turns a rotary first rises to the clearance height (`G0 Z…` in the
+    /// program's coordinates, after `safe_rotate`), so the part never turns into the tool. The
+    /// height is `clearance`, or else the highest rapid of the operation, which is where its
+    /// toolpaths retract to; a tool already higher stays where it is. With neither, the
+    /// rotaries turn wherever the tool is, which is safe only where the toolpath's rapids
+    /// already rise clear (except where its height is not known: then it always rises to the
+    /// program's highest clearance first).
+    #[serde(default)]
+    pub clearance_retract: bool,
+    /// The clearance height for `clearance_retract` (mm, program coordinates: on a 4th axis
+    /// with the work origin on its centreline, above the largest radius of the stock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearance: Option<f64>,
+    /// Largest distance of the tip from its planned line in machine-coordinate output (mm).
+    pub tolerance: f64,
+    /// Largest angle of the tool axis from its planned turn in machine-coordinate output (radians).
+    pub angle_tolerance: f64,
+}
+
+fn lines(l: &[&str]) -> Vec<String> {
+    l.iter().map(|s| s.to_string()).collect()
+}
+
+impl Post5 {
+    /// The 4th-axis setup shared by the small-mill posts: inverse time for cuts that turn the
+    /// rotary (these controllers otherwise read `F` for a rotary as if degrees were
+    /// millimetres), and a rise to the clearance height before a rapid turns it.
+    fn four_axis(base: Post) -> Post5 {
+        Post5 {
+            base,
+            tcp: None,
+            inverse_time: true,
+            angle_decimals: 4,
+            safe_rotate: Vec::new(),
+            clearance_retract: true,
+            clearance: None,
+            tolerance: 0.005,
+            angle_tolerance: 0.1f64.to_radians(),
+        }
+    }
+
+    /// Mach3-style controllers with a 4th axis: `G90 G91.1 G94 G17`, the units, `G40 G49
+    /// G80`; spindle off (`M5`) before `M6 T` with `G43 H`, `M3 S`, arcs with incremental
+    /// `I J` (`G91.1`, set in the header so a controller left in absolute `I J` reads them
+    /// right), `A` in degrees, `G4 P` in seconds. The header sets no work offset, so programs
+    /// run in the first (`G54`).
+    pub fn mach3_4axis() -> Post5 {
+        Post5::four_axis(Post {
+            name: "mach3".into(),
+            extension: "tap".into(),
+            header: lines(&["G90 G91.1 G94 G17 {units} G40 G49 G80"]),
+            tool_change: lines(&["M5", "M6 T{tool}", "G43 H{tool}"]),
+            spindle_on: lines(&["M3 S{rpm}"]),
+            ..Post::rs274()
+        })
+    }
+
+    /// LinuxCNC with a 4th axis: [`Post::rs274`] with incremental arc centres (`G91.1`) set in
+    /// the header, and the 4th-axis setup.
+    pub fn linuxcnc_4axis() -> Post5 {
+        Post5::four_axis(Post {
+            name: "linuxcnc-4axis".into(),
+            header: lines(&["G17 {units} G40 G49 {work_offset} G80 G90 G91.1 G94"]),
+            ..Post::rs274()
+        })
+    }
+
+    /// grblHAL with a 4th axis: `;` comments, incremental arc centres (`G91.1`) set in the
+    /// header, no tool length offset words (a build without a tool changer refuses them), a
+    /// manual tool change (spindle off, a comment naming the tool, and a pause, `M0`, for the
+    /// operator; the spindle starts again after it), and the 4th-axis setup.
+    pub fn grblhal_4axis() -> Post5 {
+        Post5::four_axis(Post {
+            name: "grblhal-4axis".into(),
+            extension: "nc".into(),
+            comments: CommentStyle::Semicolon,
+            header: lines(&["G90 G91.1 G94 G17 {units}"]),
+            tool_change: lines(&["M5", "; change to tool {tool}, diameter {diameter}", "M0"]),
+            tool_change_first: false,
+            spindle_on: lines(&["M3 S{rpm}"]),
+            ..Post::rs274()
+        })
+    }
+
+    /// RS-274/NGC controllers without TCP: the machine's own axis positions, inverse-time feeds
+    /// for cuts that turn a rotary, and a retract to the machine's top before turning one.
+    pub fn rs274_5axis() -> Post5 {
+        Post5 {
+            base: Post { name: "rs274-5axis".into(), ..Post::rs274() },
+            safe_rotate: lines(&["G53 G0 Z0"]),
+            clearance_retract: false,
+            ..Post5::four_axis(Post::rs274())
+        }
+    }
+
+    /// RS-274/NGC controllers with tool centre point control (`G43.4`): the tip in work
+    /// coordinates and the rotary angles, the controller moving the linear axes to keep the tip
+    /// on its line.
+    pub fn tcp_g43_4() -> Post5 {
+        Post5 {
+            base: Post { name: "rs274-tcp".into(), tool_change: lines(&["M5", "T{tool} M6"]), ..Post::rs274() },
+            tcp: Some(Tcp { on: lines(&["G43.4 H{tool}"]), off: lines(&["G49"]) }),
+            inverse_time: false,
+            ..Post5::four_axis(Post::rs274())
+        }
+    }
+
+    /// The built-in multi-axis post called `name`.
+    pub fn builtin(name: &str) -> Option<Post5> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "mach3" | "mach3-4axis" => Some(Post5::mach3_4axis()),
+            "linuxcnc-4axis" => Some(Post5::linuxcnc_4axis()),
+            "grblhal" | "grblhal-4axis" => Some(Post5::grblhal_4axis()),
+            "rs274-5axis" => Some(Post5::rs274_5axis()),
+            "rs274-tcp" | "g43.4" => Some(Post5::tcp_g43_4()),
+            _ => None,
+        }
+    }
+
+    pub const BUILTIN: &'static [&'static str] = &["mach3", "linuxcnc-4axis", "grblhal-4axis", "rs274-5axis", "rs274-tcp"];
+
+    /// How the toolpaths are turned into machine moves for this post.
+    pub fn solve_options(&self) -> crate::kinematics::SolveOptions {
+        crate::kinematics::SolveOptions {
+            tolerance: self.tolerance,
+            angle_tolerance: self.angle_tolerance,
+            tcp: self.tcp.is_some(),
+            ..crate::kinematics::SolveOptions::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.base.validate()?;
+        if self.angle_decimals > 6 {
+            return invalid("a post writes at most 6 decimals for angles");
+        }
+        if let Some(tcp) = &self.tcp {
+            if self.inverse_time {
+                return invalid("a post with tool centre point control writes the tip's feed, not inverse time");
+            }
+            check_template(&tcp.on)?;
+            check_template(&tcp.off)?;
+        }
+        check_template(&self.safe_rotate)?;
+        if self.clearance.is_some_and(|c| !(c.abs() <= 1.0e6)) {
+            return invalid("the clearance height must be a finite number");
+        }
+        self.solve_options().validate()
+    }
+}
+
+/// One operation of a [`MachineProgram`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MachineOperation {
+    /// The rotaries move with the cut (or stay where the toolpath keeps the tool axis).
+    Continuous(Operation5),
+    /// The rotaries turn once and hold still; arcs are kept.
+    Indexed(IndexedOperation),
+}
+
+/// A program of indexed and continuous multi-axis operations.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MachineProgram {
+    pub name: String,
+    pub operations: Vec<MachineOperation>,
+    /// Work offset 1 to 6 (`G54` to `G59`); left out, the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_offset: Option<u8>,
+}
+
+impl From<&Program5> for MachineProgram {
+    fn from(p: &Program5) -> MachineProgram {
+        MachineProgram {
+            name: p.name.clone(),
+            operations: p.operations.iter().cloned().map(MachineOperation::Continuous).collect(),
+            work_offset: p.work_offset,
+        }
+    }
+}
+
+/// How a cut's `F` is meant.
+#[derive(Clone, Copy)]
+enum Rate {
+    /// mm/min, written in the post's units.
+    Linear(f64),
+    /// Degrees a minute.
+    Degrees(f64),
+    /// 1 / minutes.
+    Inverse(f64),
+}
+
+/// What the writer knows of the tool's height.
+#[derive(Clone, Copy, PartialEq)]
+enum Height {
+    /// Nothing (the program's start, after a tool change or a switch of tool centre point
+    /// control): the next rapid rises before it moves across, and a turn of the rotaries rises
+    /// to the program's highest clearance first.
+    Unknown,
+    /// At the machine's top, after the post's `safe_rotate`.
+    Top,
+    /// At this height (the program's coordinates).
+    At(f64),
+}
+
+struct Writer5<'a> {
+    post: &'a Post,
+    angle_decimals: u8,
+    out: String,
+    line: Option<u32>,
+    /// The linear words as written, and the position they say.
+    lin: [Option<String>; 3],
+    pos: Option<Vec3>,
+    /// The tool's height, which may be known while X and Y are not.
+    height: Height,
+    /// The rotary words as written, in joint order.
+    rot: Vec<Option<String>>,
+    /// Joint indices and letters, in letter order (the order the words are written in).
+    order: Vec<(usize, char)>,
+    feed: Option<String>,
+    inverse: bool,
+}
+
+impl Writer5<'_> {
+    fn block(&mut self, text: &str) {
+        if let (Some(n), Some(numbering)) = (self.line, self.post.line_numbers) {
+            self.out.push_str(&format!("N{n} "));
+            self.line = Some(n.saturating_add(numbering.step));
+        }
+        self.out.push_str(text);
+        self.out.push('\n');
+    }
+
+    fn comment(&mut self, text: &str) {
+        let text = plain(text);
+        match self.post.comments {
+            CommentStyle::Parentheses => self.out.push_str(&format!("({text})\n")),
+            CommentStyle::Semicolon => self.out.push_str(&format!("; {text}\n")),
+            CommentStyle::None => {}
+        }
+    }
+
+    fn template(&mut self, lines: &[String], values: &Values) -> Result<()> {
+        for line in lines {
+            let text = fill(line, values)?;
+            self.block(&text);
+        }
+        Ok(())
+    }
+
+    fn value(&self, v: f64, decimals: u8) -> String {
+        let s = number(v, decimals);
+        if self.post.trailing_decimal && !s.contains('.') { format!("{s}.") } else { s }
+    }
+
+    fn coord(&self, mm: f64) -> String {
+        self.value(mm / self.post.units.mm(), self.post.decimals)
+    }
+
+    fn angle(&self, radians: f64) -> String {
+        self.value(radians.to_degrees(), self.angle_decimals)
+    }
+
+    fn motion(&self, n: u8) -> String {
+        if self.post.two_digit_codes { format!("G{n:02}") } else { format!("G{n}") }
+    }
+
+    /// Forget where the linear axes are (after a block that may move them, such as a tool
+    /// change): the next move states each of them, and the next rapid rises first.
+    fn forget(&mut self) {
+        (self.lin, self.pos, self.height, self.feed) = ([None, None, None], None, Height::Unknown, None);
+    }
+
+    /// `G94` if inverse time is in force, so the blocks that follow (a tool change, the spindle,
+    /// a macro the controller runs for them) read any `F` per minute.
+    fn per_minute(&mut self) {
+        if self.inverse {
+            self.block("G94");
+            (self.inverse, self.feed) = (false, None);
+        }
+    }
+
+    /// Whether moving the rotaries to `rot` changes a word.
+    fn turns(&self, rot: &[f64]) -> bool {
+        self.order.iter().any(|&(i, _)| rot.get(i).is_some_and(|&a| self.rot.get(i).and_then(Option::as_ref) != Some(&self.angle(a))))
+    }
+
+    /// The rotary words that change, noted as written.
+    fn rotary_words(&mut self, rot: &[f64]) -> String {
+        let mut words = String::new();
+        for k in 0..self.order.len() {
+            let Some(&(i, c)) = self.order.get(k) else { continue };
+            let Some(&a) = rot.get(i) else { continue };
+            let s = self.angle(a);
+            if let Some(slot) = self.rot.get_mut(i)
+                && slot.as_ref() != Some(&s)
+            {
+                words.push_str(&format!(" {c}{s}"));
+                *slot = Some(s);
+            }
+        }
+        words
+    }
+
+    /// The linear words among `xy` and `z` that change, noted as written.
+    fn linear_words(&mut self, to: Vec3, xy: bool, z: bool) -> String {
+        let new = [self.coord(to.x), self.coord(to.y), self.coord(to.z)];
+        let mut words = String::new();
+        for (k, (letter, s)) in ['X', 'Y', 'Z'].into_iter().zip(new).enumerate() {
+            let wanted = if k < 2 { xy } else { z };
+            if let Some(slot) = self.lin.get_mut(k)
+                && wanted
+                && slot.as_ref() != Some(&s)
+            {
+                words.push_str(&format!(" {letter}{s}"));
+                *slot = Some(s);
+            }
+        }
+        words
+    }
+
+    fn rapid_block(&mut self, to: Vec3, xy: bool, z: bool) {
+        let words = self.linear_words(to, xy, z);
+        if !words.is_empty() {
+            let code = self.motion(0);
+            self.block(&format!("{code}{words}"));
+        }
+    }
+
+    /// Turns the rotaries to `rot` at rapid if that changes a word: the post's safe lines, the
+    /// rise to `clearance`, then the rotaries alone. The rise never goes down: a tool above the
+    /// clearance stays where it is, one at the machine's top after the safe lines stays there,
+    /// and one whose height is not known rises to `top` (the program's highest clearance) or
+    /// `clearance`, whichever is higher, even when the post asks for no rise.
+    fn turn(&mut self, rot: &[f64], safe: &[String], clearance: Option<f64>, top: Option<f64>, values: &Values) -> Result<()> {
+        if !self.turns(rot) {
+            return Ok(());
+        }
+        self.template(safe, values)?;
+        if !safe.is_empty() {
+            (self.lin, self.pos, self.height) = ([None, None, None], None, Height::Top);
+        }
+        let rise = match self.height {
+            Height::Top => None,
+            Height::Unknown => clearance.into_iter().chain(top).reduce(f64::max),
+            Height::At(z) => clearance.filter(|&c| c > z),
+        };
+        if let Some(h) = rise {
+            let at = self.pos.map_or(Vec3::new(0.0, 0.0, h), |p| Vec3::new(p.x, p.y, h));
+            self.rapid_block(at, false, true);
+            self.pos = self.pos.map(|_| at);
+            self.height = Height::At(h);
+        }
+        let words = self.rotary_words(rot);
+        let code = self.motion(0);
+        self.block(&format!("{code}{words}"));
+        Ok(())
+    }
+
+    /// A rapid of the linear axes, never a diagonal: up first when rising, across first when
+    /// descending. Where the tool's height is not known it first rises to `rise` (or the
+    /// rapid's own height, if higher), so it never moves across at a height it does not know.
+    fn rapid(&mut self, to: Vec3, rise: Option<f64>) {
+        let up_first = match self.height {
+            Height::At(z) => to.z > z,
+            Height::Top => false,
+            Height::Unknown => {
+                let up = rise.map_or(to.z, |r| r.max(to.z));
+                self.rapid_block(Vec3::new(to.x, to.y, up), false, true);
+                false
+            }
+        };
+        if up_first {
+            self.rapid_block(to, false, true);
+            self.rapid_block(to, true, false);
+        } else {
+            self.rapid_block(to, true, false);
+            self.rapid_block(to, false, true);
+        }
+        (self.pos, self.height) = (Some(to), Height::At(to.z));
+    }
+
+    /// ` F…` in feed per minute when it changes.
+    fn feed_word(&mut self, f: String) -> String {
+        if self.feed.as_ref() == Some(&f) {
+            return String::new();
+        }
+        self.feed = Some(f.clone());
+        format!(" F{f}")
+    }
+
+    /// `G93 `/`G94 ` when the feed mode changes to `inverse`.
+    fn feed_mode(&mut self, inverse: bool) -> &'static str {
+        if inverse == self.inverse {
+            return "";
+        }
+        self.inverse = inverse;
+        self.feed = None;
+        if inverse { "G93 " } else { "G94 " }
+    }
+
+    /// The ` F…` of a cut; refused when it would be written as `F0` or as an absurd rate.
+    fn rate_word(&mut self, rate: Rate) -> Result<String> {
+        let (f, per_minute) = match rate {
+            Rate::Linear(mm) => (self.value(mm / self.post.units.mm(), self.post.feed_decimals), true),
+            Rate::Degrees(deg) => (self.value(deg, self.post.feed_decimals), true),
+            // Inverse time wants its F on every block, with enough digits to keep about five
+            // significant ones, so a long, slow cut is never written as F0.
+            Rate::Inverse(v) => {
+                let digits = (4.0 - v.log10().floor()).clamp(f64::from(self.post.feed_decimals), f64::from(MAX_INVERSE_DECIMALS)) as u8;
+                (self.value(v, digits), false)
+            }
+        };
+        if !feed_word_ok(&f, per_minute) {
+            return Err(CamError::Unsafe(format!("a cut would be written with the feed F{f}, which the controller cannot run")));
+        }
+        Ok(if per_minute { self.feed_word(f) } else { format!(" F{f}") })
+    }
+
+    fn feed(&mut self, to: Vec3, rot: &[f64], rate: Rate) -> Result<()> {
+        let mut words = self.linear_words(to, true, true);
+        words.push_str(&self.rotary_words(rot));
+        (self.pos, self.height) = (Some(to), Height::At(to.z));
+        if words.is_empty() {
+            return Ok(());
+        }
+        let mode = self.feed_mode(matches!(rate, Rate::Inverse(_)));
+        let f = self.rate_word(rate)?;
+        let code = self.motion(1);
+        self.block(&format!("{mode}{code}{words}{f}"));
+        Ok(())
+    }
+
+    /// An arc in the machine's XY plane, the rotaries held: as [`crate::emit`] writes one.
+    fn arc(&mut self, to: Vec3, center: Vec2, ccw: bool, feed: f64, rot: &[f64]) -> Result<()> {
+        let Some(from) = self.pos else { return Err(CamError::Unsafe("an arc before the first positioning move".into())) };
+        let (nx, ny) = (self.coord(to.x), self.coord(to.y));
+        let same_x = self.lin.first().and_then(Option::as_ref) == Some(&nx);
+        let same_y = self.lin.get(1).and_then(Option::as_ref) == Some(&ny);
+        // An arc whose end is written the same as its start would be read as a full circle.
+        if same_x && same_y {
+            return self.feed(to, rot, Rate::Linear(feed));
+        }
+        let nz = self.coord(to.z);
+        let helix = self.lin.get(2).and_then(Option::as_ref) != Some(&nz);
+        if !self.post.arcs || (helix && !self.post.helical_arcs) {
+            let start = Vec2::new(from.x, from.y) - center;
+            let (r, sweep) = (start.len(), arc_sweep(from, to, center, ccw));
+            let tol = self.post.arc_tolerance;
+            let step = if tol < r { 2.0 * (1.0 - tol / r).acos() } else { FRAC_PI_4 };
+            let n = ((sweep.abs() / step.max(1e-3)).ceil() as usize).clamp(1, 4096);
+            for i in 1..n {
+                let t = i as f64 / n as f64;
+                let p = center + Vec2::from_angle(start.angle() + sweep * t) * r;
+                self.feed(p.extend(from.z + (to.z - from.z) * t), rot, Rate::Linear(feed))?;
+            }
+            return self.feed(to, rot, Rate::Linear(feed));
+        }
+        let mode = self.feed_mode(false);
+        let mut words = format!("{mode}{} X{nx} Y{ny}", self.motion(if ccw { 3 } else { 2 }));
+        if helix {
+            words.push_str(&format!(" Z{nz}"));
+        }
+        words.push_str(&format!(" I{} J{}", self.coord(center.x - from.x), self.coord(center.y - from.y)));
+        let f = self.rate_word(Rate::Linear(feed))?;
+        words.push_str(&f);
+        self.lin = [Some(nx), Some(ny), Some(nz)];
+        (self.pos, self.height) = (Some(to), Height::At(to.z));
+        self.block(&words);
+        Ok(())
+    }
+
+    fn dwell(&mut self, seconds: f64, template: &str, values: &mut Values) -> Result<()> {
+        if !(seconds >= 0.0) || !(seconds <= 1.0e6) {
+            return Err(CamError::Unsafe("a dwell must be 0 seconds or longer".into()));
+        }
+        values.seconds = self.value(seconds, 3);
+        values.milliseconds = number(seconds * 1000.0, 0);
+        let dwell = fill(template, values)?;
+        self.block(&dwell);
+        Ok(())
+    }
+}
+
+/// Writes `program` for `machine` through `post`.
+pub fn emit5(program: &Program5, post: &Post5, machine: &Machine) -> Result<String> {
+    let ops: Vec<Op<'_>> = program.operations.iter().map(Op::Continuous).collect();
+    emit_ops(&program.name, program.work_offset, &ops, post, machine)
+}
+
+/// Writes `program`, its indexed operations with their arcs kept, for `machine` through `post`.
+/// Indexed operations need the head upright (a tilted head would need a tilted work plane);
+/// with tool centre point control they are written as continuous ones, arcs as lines, the
+/// rotaries held at the operation's own angles (refused if they would have to move).
+pub fn emit_program(program: &MachineProgram, post: &Post5, machine: &Machine) -> Result<String> {
+    let ops: Vec<Op<'_>> = program
+        .operations
+        .iter()
+        .map(|o| match o {
+            MachineOperation::Continuous(c) => Op::Continuous(c),
+            MachineOperation::Indexed(i) => Op::Indexed(i),
+        })
+        .collect();
+    emit_ops(&program.name, program.work_offset, &ops, post, machine)
+}
+
+#[derive(Clone, Copy)]
+enum Op<'a> {
+    Continuous(&'a Operation5),
+    Indexed(&'a IndexedOperation),
+}
+
+/// The motion of one operation, ready to write.
+enum Motion {
+    Joints(Vec<JointMove>),
+    Indexed { rotary: Vec<f64>, path: Vec<Move> },
+}
+
+fn in_op(name: &str) -> impl Fn(CamError) -> CamError + '_ {
+    move |e| match e {
+        CamError::Unsafe(s) => CamError::Unsafe(format!("operation `{name}`: {s}")),
+        CamError::Invalid(s) => CamError::Invalid(format!("operation `{name}`: {s}")),
+        CamError::TooLarge(s) => CamError::TooLarge(format!("operation `{name}`: {s}")),
+        other => other,
+    }
+}
+
+/// An indexed operation's moves checked: finite, feeds [`MIN_FEED`] to [`MAX_FEED`] mm/min,
+/// within the machine's travel.
+fn check_indexed(op: &IndexedOperation, machine: &Machine) -> Result<()> {
+    if op.path.moves.len() > MAX_MOVES {
+        return Err(CamError::TooLarge(format!("the toolpath has more than {MAX_MOVES} moves")));
+    }
+    let mut started = false;
+    for (i, m) in op.path.moves.iter().enumerate() {
+        if m.target().is_some_and(|to| !to.is_finite() || !(to.len() <= 1.0e7)) {
+            return Err(CamError::Unsafe(format!("move {i}: a coordinate is not a finite number")));
+        }
+        match *m {
+            Move::Rapid { .. } => started = true,
+            Move::Feed { feed, .. } | Move::Arc { feed, .. } => {
+                if !started {
+                    return Err(CamError::Unsafe(format!("move {i}: a cut before the first positioning move")));
+                }
+                if !feed_in_range(feed) {
+                    return Err(CamError::Unsafe(format!("move {i}: the feed must be {MIN_FEED} to {MAX_FEED} mm/min")));
+                }
+            }
+            Move::Dwell { seconds } => {
+                if !(seconds >= 0.0) || !(seconds <= 1.0e6) {
+                    return Err(CamError::Unsafe(format!("move {i}: a dwell must be 0 seconds or longer")));
+                }
+            }
+        }
+    }
+    // The machine is at X = p for every point p of the path in its frame.
+    for (p, _) in op.path.points(0.01) {
+        check_limits(machine, &Joints { linear: p, rotary: op.rotary.clone() })?;
+    }
+    Ok(())
+}
+
+/// One operation solved and ready to write.
+struct Planned<'a> {
+    name: &'a str,
+    tool: &'a Tool,
+    rpm: f64,
+    coolant: bool,
+    motion: Motion,
+    /// The highest rapid (the program's coordinates: the tip with tool centre point control,
+    /// otherwise the machine's Z), where the operation's toolpaths retract to.
+    top: Option<f64>,
+}
+
+/// The motion of an indexed operation with tool centre point control: its poses solved from
+/// its own angles, which must hold all the way (they are written as asked, not as an equivalent
+/// solution nearer the previous operation's).
+fn indexed_with_tcp(o: &IndexedOperation, machine: &Machine, post: &Post5, previous: Option<&Joints>) -> Result<Vec<JointMove>> {
+    let path = o.poses(machine, post.base.arc_tolerance)?;
+    verify5(&path, PI)?;
+    let held = Joints { linear: previous.map_or(Vec3::ZERO, |j| j.linear), rotary: o.rotary.clone() };
+    let mut moves = solve_from(machine, &path, &post.solve_options(), Some(&held))?;
+    for m in &mut moves {
+        let source = m.source();
+        if let JointMove::Rapid { to, .. } | JointMove::Feed { to, .. } = m {
+            if to.rotary_change(&held) > HELD {
+                return Err(CamError::Unsafe(format!("move {source}: the rotaries would have to move during an indexed operation")));
+            }
+            to.rotary.clone_from(&o.rotary);
+        }
+    }
+    Ok(moves)
+}
+
+fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, machine: &Machine) -> Result<String> {
+    post.validate()?;
+    machine.validate()?;
+    let base = &post.base;
+    if ops.is_empty() {
+        return invalid("the program has no operation");
+    }
+    if ops.len() > MAX_OPERATIONS {
+        return Err(CamError::TooLarge(format!("more than {MAX_OPERATIONS} operations")));
+    }
+    let offset = work_offset.unwrap_or(1);
+    // A post that leaves the offset to the operator can only mean the first one.
+    if offset != 1 && !base.writes_work_offset() {
+        return invalid(format!(
+            "post `{}` writes no work offset, so the program would run in whatever offset the machine is in rather than {}",
+            plain(&base.name),
+            work_offset_code(offset)?
+        ));
+    }
+    let opts = post.solve_options();
+    let tcp = post.tcp.as_ref();
+
+    // Every operation solved first, so the program's highest clearance is known before the
+    // first rotary turns.
+    let mut planned: Vec<Planned<'_>> = Vec::with_capacity(ops.len());
+    let mut chain: Option<Joints> = None;
+    let mut total = 0usize;
+    for op in ops {
+        let (op_name, op_tool, op_rpm, op_coolant) = match op {
+            Op::Continuous(o) => (o.name.as_str(), &o.tool, o.spindle_rpm, o.coolant),
+            Op::Indexed(o) => (o.name.as_str(), &o.tool, o.spindle_rpm, o.coolant),
+        };
+        let label = plain(op_name);
+        op_tool.validate()?;
+        if !(op_rpm > 0.0) || !(op_rpm <= 1.0e6) {
+            return invalid(format!("operation `{label}`: the spindle speed must be above 0"));
+        }
+        let motion = match op {
+            Op::Indexed(o) if tcp.is_none() => {
+                frame_for_index(machine, &o.rotary).map_err(in_op(&label))?;
+                if !head_upright(machine, &o.rotary) {
+                    return Err(CamError::Unsupported(format!(
+                        "operation `{label}`: indexed output with a tilted head (it needs a tilted work plane)"
+                    )));
+                }
+                check_indexed(o, machine).map_err(in_op(&label))?;
+                Motion::Indexed { rotary: o.rotary.clone(), path: o.path.moves.clone() }
+            }
+            Op::Indexed(o) => Motion::Joints(indexed_with_tcp(o, machine, post, chain.as_ref()).map_err(in_op(&label))?),
+            Op::Continuous(o) => {
+                verify5(&o.path, PI).map_err(in_op(&label))?;
+                Motion::Joints(solve_from(machine, &o.path, &opts, chain.as_ref()).map_err(in_op(&label))?)
+            }
+        };
+        total = total.saturating_add(match &motion {
+            Motion::Joints(m) => m.len(),
+            Motion::Indexed { path, .. } => path.len(),
+        });
+        if total > MAX_MOVES {
+            return Err(CamError::TooLarge(format!("the program would have more than {MAX_MOVES} moves")));
+        }
+        let top = match &motion {
+            Motion::Joints(moves) => {
+                if let Some(j) = moves.iter().rev().find_map(JointMove::joints) {
+                    chain = Some(j.clone());
+                }
+                moves
+                    .iter()
+                    .filter_map(|m| match m {
+                        JointMove::Rapid { to, pose, .. } => Some(if tcp.is_some() { pose.tip.z } else { to.linear.z }),
+                        _ => None,
+                    })
+                    .reduce(f64::max)
+            }
+            Motion::Indexed { rotary, path } => {
+                if let Some(to) = path.iter().rev().find_map(Move::target) {
+                    chain = Some(Joints { linear: to, rotary: rotary.clone() });
+                }
+                path.iter()
+                    .filter_map(|m| match m {
+                        Move::Rapid { to } => Some(to.z),
+                        _ => None,
+                    })
+                    .reduce(f64::max)
+            }
+        };
+        planned.push(Planned { name: op_name, tool: op_tool, rpm: op_rpm, coolant: op_coolant, motion, top });
+    }
+    // Where the tool's height is not known, it rises to the highest clearance of the program
+    // (the post's, or any operation's highest rapid above it) before it moves across or a
+    // rotary turns.
+    let top = planned.iter().filter_map(|p| p.top).chain(post.clearance).reduce(f64::max);
+
+    let mut order: Vec<(usize, char)> = machine.rotaries.iter().enumerate().map(|(i, r)| (i, r.letter.char())).collect();
+    order.sort_by_key(|&(_, c)| c);
+    let mut w = Writer5 {
+        post: base,
+        angle_decimals: post.angle_decimals,
+        out: String::new(),
+        line: base.line_numbers.map(|n| n.start),
+        lin: [None, None, None],
+        pos: None,
+        height: Height::Unknown,
+        rot: vec![None; machine.rotaries.len()],
+        order,
+        feed: None,
+        inverse: false,
+    };
+    let mut values = Values { program: plain(name), units: base.units.code().into(), work_offset: work_offset_code(offset)?, ..Values::default() };
+    w.comment(name);
+    w.template(&base.header, &values)?;
+    let mut tool: Option<u32> = None;
+    let mut rpm: Option<String> = None;
+    let mut coolant = false;
+    let mut tcp_on = false;
+    let mut joints: Option<Joints> = None;
+    for p in planned {
+        let speed = number(p.rpm, 0);
+        values.tool = p.tool.number.to_string();
+        values.diameter = number(p.tool.diameter / base.units.mm(), base.decimals);
+        values.rpm = speed.clone();
+        let new_tool = tool != Some(p.tool.number);
+        // The blocks before the motion read any F per minute.
+        if new_tool || rpm.as_ref() != Some(&speed) || p.coolant != coolant || (tcp.is_some() && !tcp_on) {
+            w.per_minute();
+        }
+        w.comment(&format!("{}: T{} D{} {}", p.name, p.tool.number, number(p.tool.diameter, 3), p.tool.kind.label()));
+        if new_tool {
+            if let Some(t) = tcp
+                && tcp_on
+            {
+                w.template(&t.off, &values)?;
+                tcp_on = false;
+            }
+            if tool.is_some() || base.tool_change_first {
+                // Coolant off while the tool is changed; the operation turns it back on.
+                if coolant {
+                    w.template(&base.coolant_off, &values)?;
+                    coolant = false;
+                }
+                w.template(&base.tool_change, &values)?;
+            }
+            // A tool change stops the spindle and may leave the tool anywhere.
+            rpm = None;
+            tool = Some(p.tool.number);
+            w.forget();
+        }
+        if rpm.as_ref() != Some(&speed) {
+            w.template(&base.spindle_on, &values)?;
+            rpm = Some(speed);
+        }
+        if p.coolant != coolant {
+            w.template(if p.coolant { &base.coolant_on } else { &base.coolant_off }, &values)?;
+            coolant = p.coolant;
+        }
+        if let Some(t) = tcp
+            && !tcp_on
+        {
+            w.template(&t.on, &values)?;
+            tcp_on = true;
+            // X Y Z now mean the tip.
+            w.forget();
+        }
+        // With the same tool the tool is still where the last operation left it: only the
+        // feed is stated again.
+        w.feed = None;
+        let clearance = if post.clearance_retract { post.clearance.or(p.top) } else { None };
+        match p.motion {
+            Motion::Joints(moves) => {
+                for m in &moves {
+                    match m {
+                        JointMove::Rapid { to, pose, .. } => {
+                            let lin = if tcp.is_some() { pose.tip } else { to.linear };
+                            w.turn(&to.rotary, &post.safe_rotate, clearance, top, &values)?;
+                            w.rapid(lin, top);
+                        }
+                        JointMove::Feed { to, pose, feed, minutes, .. } => {
+                            let lin = if tcp.is_some() { pose.tip } else { to.linear };
+                            let minutes = minutes.max(MIN_MINUTES);
+                            let rate = if tcp.is_some() || !w.turns(&to.rotary) {
+                                Rate::Linear(*feed)
+                            } else if post.inverse_time {
+                                Rate::Inverse(1.0 / minutes)
+                            } else {
+                                let from = joints.as_ref();
+                                let len = from.map_or(0.0, |j| j.linear.dist(to.linear));
+                                if len > 1e-9 {
+                                    Rate::Linear(len / minutes)
+                                } else {
+                                    Rate::Degrees(from.map_or(0.0, |j| j.rotary_change(to)).to_degrees() / minutes)
+                                }
+                            };
+                            w.feed(lin, &to.rotary, rate)?;
+                        }
+                        JointMove::Dwell { seconds, .. } => w.dwell(*seconds, &base.dwell, &mut values)?,
+                    }
+                    if let Some(j) = m.joints() {
+                        joints = Some(j.clone());
+                    }
+                }
+            }
+            Motion::Indexed { rotary, path } => {
+                if !path.is_empty() {
+                    w.turn(&rotary, &post.safe_rotate, clearance, top, &values)?;
+                }
+                for m in &path {
+                    match *m {
+                        Move::Rapid { to } => w.rapid(to, top),
+                        Move::Feed { to, feed } => w.feed(to, &rotary, Rate::Linear(feed))?,
+                        Move::Arc { to, center, ccw, feed } => w.arc(to, center, ccw, feed, &rotary)?,
+                        Move::Dwell { seconds } => w.dwell(seconds, &base.dwell, &mut values)?,
+                    }
+                    if let Some(to) = m.target() {
+                        joints = Some(Joints { linear: to, rotary: rotary.clone() });
+                    }
+                }
+            }
+        }
+    }
+    w.per_minute();
+    if let Some(t) = tcp
+        && tcp_on
+    {
+        w.template(&t.off, &values)?;
+    }
+    if coolant {
+        w.template(&base.coolant_off, &values)?;
+    }
+    w.template(&base.spindle_off, &values)?;
+    w.template(&base.footer, &values)?;
+    Ok(w.out)
+}
+
+/// One motion block of a multi-axis program as read: where every axis is after it (mm and
+/// radians, rotaries in the order of the letters asked for) and whether tool centre point
+/// control was on (`X Y Z` then being the tip in work coordinates).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JointWords {
+    Rapid {
+        line: usize,
+        linear: Vec3,
+        rotary: Vec<f64>,
+        tcp: bool,
+    },
+    /// A cut. `f` is the `F` word in force: per minute (`G94`; the linear axes' feed in units
+    /// of `mm_per_unit` mm, or degrees a minute for a move of the rotaries alone) or, with
+    /// `inverse_time` (`G93`), 1 / the block's minutes.
+    Feed {
+        line: usize,
+        linear: Vec3,
+        rotary: Vec<f64>,
+        tcp: bool,
+        f: f64,
+        inverse_time: bool,
+        mm_per_unit: f64,
+    },
+    /// An arc about `center` in the XY plane of the linear axes, the rotaries held, at `f` per minute.
+    Arc {
+        line: usize,
+        linear: Vec3,
+        center: Vec2,
+        ccw: bool,
+        rotary: Vec<f64>,
+        tcp: bool,
+        f: f64,
+        mm_per_unit: f64,
+    },
+    Dwell {
+        line: usize,
+        seconds: f64,
+    },
+}
+
+/// Reads the motion of a multi-axis program in absolute coordinates: `G0`–`G3` with `X Y Z`,
+/// `I J` (arcs, the rotaries held), the rotary words `letters` (degrees) and `F`, `G93`/`G94`,
+/// `G20`/`G21`, `G4`, `G91.1` (arc centres from the arc's start; `G90.1` is refused), and
+/// `G43.4`/`G49` for tool centre point control on and off. A `G53`
+/// block moves in machine coordinates, so the axes it names are unknown until written again.
+/// Incremental coordinates are refused; everything else (spindle, tools, coolant, offsets) is
+/// skipped, and so are blocks before every axis is known.
+pub fn parse5(text: &str, letters: &[AxisLetter]) -> Result<Vec<JointWords>> {
+    let mut units = 1.0;
+    let mut mode: Option<u8> = None;
+    let mut inverse = false;
+    let mut tcp = false;
+    let mut feed: Option<f64> = None;
+    let mut lin: [Option<f64>; 3] = [None, None, None];
+    let mut rot: Vec<Option<f64>> = vec![None; letters.len()];
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let n = i + 1;
+        if n > MAX_LINES {
+            return Err(CamError::TooLarge(format!("more than {MAX_LINES} lines")));
+        }
+        let ws = words(line, n)?;
+        let (mut dwell, mut machine_coords) = (false, false);
+        for &(c, v) in &ws {
+            if c != 'G' {
+                continue;
+            }
+            match (v * 10.0).round() as i64 {
+                0 => mode = Some(0),
+                10 => mode = Some(1),
+                20 => mode = Some(2),
+                30 => mode = Some(3),
+                40 => dwell = true,
+                200 => units = 25.4,
+                210 => units = 1.0,
+                434 => tcp = true,
+                490 => tcp = false,
+                530 => machine_coords = true,
+                910 => return Err(CamError::Parse(n, "not supported yet: incremental coordinates (G91)".into())),
+                901 => return Err(CamError::Parse(n, "not supported yet: absolute arc centres (G90.1)".into())),
+                930 => (inverse, feed) = (true, None),
+                940 => (inverse, feed) = (false, None),
+                _ => {}
+            }
+        }
+        let word = |letter: char| ws.iter().find(|(c, _)| *c == letter).map(|(_, v)| *v);
+        if dwell {
+            out.push(JointWords::Dwell { line: n, seconds: word('X').or(word('P')).unwrap_or(0.0).max(0.0) });
+            continue;
+        }
+        for c in ['A', 'B', 'C'] {
+            if word(c).is_some() && !letters.iter().any(|l| l.char() == c) {
+                return Err(CamError::Parse(n, format!("the machine has no {c} axis")));
+            }
+        }
+        let f = word('F');
+        if let Some(f) = f {
+            if !(f > 0.0) {
+                return Err(CamError::Parse(n, "a feed rate must be above 0".into()));
+            }
+            feed = Some(f);
+        }
+        let linear_words = [word('X'), word('Y'), word('Z')];
+        let rotary_words: Vec<Option<f64>> = letters.iter().map(|l| word(l.char())).collect();
+        if machine_coords {
+            for (slot, w) in lin.iter_mut().zip(linear_words) {
+                if w.is_some() {
+                    *slot = None;
+                }
+            }
+            for (slot, w) in rot.iter_mut().zip(&rotary_words) {
+                if w.is_some() {
+                    *slot = None;
+                }
+            }
+            continue;
+        }
+        let (ti, tj) = (word('I'), word('J'));
+        if linear_words.iter().chain(&rotary_words).chain([&ti, &tj]).all(Option::is_none) {
+            continue;
+        }
+        let Some(mode) = mode else { return Err(CamError::Parse(n, "coordinates before any G0, G1, G2 or G3".into())) };
+        let from = match lin {
+            [Some(x), Some(y), Some(z)] => Some(Vec3::new(x, y, z)),
+            _ => None,
+        };
+        for (slot, w) in lin.iter_mut().zip(linear_words) {
+            if let Some(v) = w {
+                *slot = Some(v * units);
+            }
+        }
+        for (slot, w) in rot.iter_mut().zip(&rotary_words) {
+            if let Some(v) = w {
+                *slot = Some(v.to_radians());
+            }
+        }
+        let block_rate = if inverse { f } else { feed };
+        if inverse {
+            feed = None;
+        }
+        let ([Some(x), Some(y), Some(z)], Some(rotary)) = (lin, rot.iter().copied().collect::<Option<Vec<f64>>>()) else {
+            if mode >= 2 {
+                return Err(CamError::Parse(n, "an arc before the position is known".into()));
+            }
+            continue;
+        };
+        let linear = Vec3::new(x, y, z);
+        if mode == 0 {
+            out.push(JointWords::Rapid { line: n, linear, rotary, tcp });
+            continue;
+        }
+        let Some(rate) = block_rate else {
+            return Err(CamError::Parse(
+                n,
+                if inverse { "an inverse-time cut (G93) without its F".into() } else { "a cutting move without a feed rate".to_string() },
+            ));
+        };
+        if mode == 1 {
+            out.push(JointWords::Feed { line: n, linear, rotary, tcp, f: rate, inverse_time: inverse, mm_per_unit: units });
+            continue;
+        }
+        if inverse {
+            return Err(CamError::Parse(n, "not supported yet: arcs in inverse time (G93)".into()));
+        }
+        if rotary_words.iter().any(Option::is_some) {
+            return Err(CamError::Parse(n, "not supported yet: an arc that turns a rotary".into()));
+        }
+        let Some(from) = from else { return Err(CamError::Parse(n, "an arc before the position is known".into())) };
+        if ti.is_none() && tj.is_none() {
+            return Err(CamError::Parse(n, "not supported yet: arcs without I and J".into()));
+        }
+        let center = Vec2::new(from.x + ti.unwrap_or(0.0) * units, from.y + tj.unwrap_or(0.0) * units);
+        out.push(JointWords::Arc { line: n, linear, center, ccw: mode == 3, rotary, tcp, f: rate, mm_per_unit: units });
+    }
+    Ok(out)
+}

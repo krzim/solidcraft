@@ -1,0 +1,353 @@
+//! Tests of the multi-axis collision checks and of tilting a toolpath clear.
+
+use std::f64::consts::{PI, TAU};
+
+use solidcore_record::Vec3;
+
+use crate::collision::*;
+use crate::foundation_tests::*;
+use crate::*;
+
+fn deg(d: f64) -> f64 {
+    d * PI / 180.0
+}
+
+fn path3(points: &[(Vec3, bool)]) -> Toolpath5 {
+    let moves = points
+        .iter()
+        .map(|&(p, cut)| if cut { Move5::Feed { to: Pose::vertical(p), feed: 500.0 } } else { Move5::Rapid { to: Pose::vertical(p) } })
+        .collect();
+    Toolpath5 { moves }
+}
+
+#[test]
+fn a_path_through_a_block_gouges_and_a_dropped_one_does_not() {
+    let b = block(Vec3::new(-10.0, -10.0, 0.0), Vec3::new(10.0, 10.0, 5.0));
+    let ball = Cutter::ball(3.0).unwrap();
+    let through = path3(&[(Vec3::new(-20.0, 0.0, 20.0), false), (Vec3::new(-20.0, 0.0, 3.0), true), (Vec3::new(20.0, 0.0, 3.0), true)]);
+    let hits = gouges(&b, &ball, &through, 0.01, 0.5).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let h = hits[0];
+    assert_eq!((h.index, h.envelope), (2, None));
+    // On the top the tip must be at 5: 2 mm farther out.
+    close(h.distance, 2.0, 1e-9);
+    assert!(h.pose.tip.x.abs() <= 10.0 + 1e-9);
+
+    // Across the top with every point dropped onto the block (sampled finely: over the edges
+    // the ball rolls round a circle of its radius, and the chords of that cut in by their
+    // sagitta, 3·(1 − cos(0.25/3)) < 0.01).
+    let mut pts = vec![(Vec3::new(-12.0, 0.0, 20.0), false)];
+    for i in 0..=96 {
+        let x = -12.0 + 0.25 * i as f64;
+        pts.push((Vec3::new(x, 0.0, drop_z(&b, &ball, x, 0.0).unwrap()), true));
+    }
+    let dropped = path3(&pts);
+    assert!(gouges(&b, &ball, &dropped, 0.01, 0.1).unwrap().is_empty());
+    // Rapids are not checked: a rapid through the block is the links' business.
+    let rapid = path3(&[(Vec3::new(-20.0, 0.0, 3.0), false), (Vec3::new(20.0, 0.0, 3.0), false)]);
+    assert!(gouges(&b, &ball, &rapid, 0.01, 0.5).unwrap().is_empty());
+}
+
+#[test]
+fn rotary_poses_round_a_cylinder() {
+    // A ball held radially to a cylinder about X, as a rotary axis turns the part under it.
+    let (rc, r) = (20.0, 3.0);
+    let cyl = cylinder_x(rc, -50.0, 50.0, 256);
+    let ball = Cutter::ball(r).unwrap();
+    let radial = |phi: f64, x: f64, rho: f64| {
+        let d = Vec3::new(0.0, phi.cos(), phi.sin());
+        Pose::new(Vec3::new(x, 0.0, 0.0) + d * rho, d)
+    };
+    let around = |rho: f64| {
+        let mut moves = vec![Move5::Rapid { to: radial(0.0, 0.0, rc + 10.0) }];
+        for k in 0..=72 {
+            let phi = TAU * k as f64 / 72.0;
+            moves.push(Move5::Feed { to: radial(phi, 5.0 * phi, rho), feed: 400.0 });
+        }
+        Toolpath5 { moves }
+    };
+    // On the cylinder: the chords between poses 5° apart are inside it by 20·(1 − cos 2.5°).
+    let sag = rc * (1.0 - deg(2.5).cos());
+    assert!(gouges(&cyl, &ball, &around(rc), sag + 0.005, 0.5).unwrap().is_empty());
+    let deep = gouges(&cyl, &ball, &around(rc - 1.0), 0.05, 0.5).unwrap();
+    assert_eq!(deep.len(), 73, "every move cuts 1 mm in");
+    for h in &deep {
+        assert!((1.0 - 0.01..=1.0 + sag + 0.01).contains(&h.distance), "{h:?}");
+    }
+    // A short tool with a wide holder, radially over the cylinder, its holder clear of it.
+    let mut tool = Tool::new(1, ToolKind::BallEndmill, 6.0, 10.0);
+    tool.stickout = Some(12.0);
+    tool.holder = vec![HolderSection { diameter: 30.0, length: 30.0 }];
+    assert!(holder_collisions(&cyl, &tool, &around(rc), 1.0, 1.0).unwrap().is_empty());
+    // Tilted 70° off radial about the ball's centre, the holder's rim comes down onto the
+    // cylinder: its face's centre 9 up the axis from the ball's centre, 23 off the cylinder's
+    // axis, puts the rim's nearest point 18.1 off it.
+    let tilt = |p: Pose| {
+        let a = rotate(p.axis, Vec3::new(1.0, 0.0, 0.0), deg(70.0));
+        Pose::new(p.up(r) - a * r, a)
+    };
+    let leant = Toolpath5 {
+        moves: around(rc).moves.iter().map(|m| if let Move5::Feed { to, feed } = *m { Move5::Feed { to: tilt(to), feed } } else { *m }).collect(),
+    };
+    let hits = holder_collisions(&cyl, &tool, &leant, 1.0, 1.0).unwrap();
+    assert!(!hits.is_empty() && hits.iter().all(|h| h.envelope == Some(1)), "{hits:?}");
+}
+
+/// A floor at z = 0 with two long walls 30 high, at x ≤ −10 and x ≥ 30: a deep pocket.
+fn pocket() -> Surface {
+    let mut tris = Vec::new();
+    for b in [
+        block(Vec3::new(-50.0, -50.0, -20.0), Vec3::new(50.0, 50.0, 0.0)),
+        block(Vec3::new(-20.0, -50.0, 0.0), Vec3::new(-10.0, 50.0, 30.0)),
+        block(Vec3::new(30.0, -50.0, 0.0), Vec3::new(40.0, 50.0, 30.0)),
+    ] {
+        tris.extend_from_slice(b.triangles());
+    }
+    Surface::new(tris).unwrap()
+}
+
+/// A 6 mm ball 25 mm out of a 30 mm holder.
+fn short_tool() -> Tool {
+    let mut t = Tool::new(1, ToolKind::BallEndmill, 6.0, 10.0);
+    t.stickout = Some(25.0);
+    t.holder = vec![HolderSection { diameter: 30.0, length: 40.0 }];
+    t
+}
+
+/// Down into the pocket 4 mm from the left wall, along it, and out.
+fn along_the_wall(x: f64) -> Toolpath5 {
+    path3(&[(Vec3::new(x, -20.0, 60.0), false), (Vec3::new(x, -20.0, 0.0), true), (Vec3::new(x, 20.0, 0.0), true), (Vec3::new(x, 20.0, 60.0), true)])
+}
+
+fn options(max_tilt: f64) -> TiltOptions {
+    TiltOptions { max_tilt, step: deg(1.0), about: TiltAbout::FeedSide, clearance: 0.5, max_axis_step: deg(2.0), sample_step: 1.0, tolerance: 0.01 }
+}
+
+#[test]
+fn the_holder_hits_the_wall_of_a_deep_pocket() {
+    let s = pocket();
+    let tool = short_tool();
+    let path = along_the_wall(-6.0);
+    let ball = tool.cutter().unwrap();
+    assert!(gouges(&s, &ball, &path, 1e-6, 0.5).unwrap().is_empty(), "the ball itself is clear of the floor and the wall");
+    let hits = holder_collisions(&s, &tool, &path, 0.5, 1.0).unwrap();
+    // The shank (radius 3, 4 from the wall) is clear; the holder (radius 15) crosses the wall.
+    assert!(hits.iter().all(|h| h.envelope == Some(1)), "{hits:?}");
+    let along = hits.iter().find(|h| h.index == 2).unwrap();
+    // The wall is 4 from the axis, the holder's radius 15.
+    close(along.distance, 4.0 - 15.0, 1e-9);
+    assert!(hits.iter().any(|h| h.index == 1) && hits.iter().any(|h| h.index == 3));
+    // In the middle of the pocket, 20 from the left wall and 20 from the right, it is clear:
+    // the holder's flat face is 25 above the floor, so the cylinder (not a capsule) is checked.
+    assert!(holder_collisions(&s, &tool, &along_the_wall(10.0), 0.5, 1.0).unwrap().is_empty());
+}
+
+#[test]
+fn tilting_clears_the_holder() {
+    let s = pocket();
+    let tool = short_tool();
+    let path = along_the_wall(-6.0);
+    for about in [
+        TiltAbout::FeedSide,
+        TiltAbout::TowardPoint { point: Vec3::new(1000.0, 0.0, 80.0) },
+        TiltAbout::AwayFromPoint { point: Vec3::new(-1000.0, 0.0, 0.0) },
+    ] {
+        let opts = TiltOptions { about, ..options(deg(40.0)) };
+        let out = tilt_away(&s, &tool, &path, &opts).unwrap();
+        let h = holder_collisions(&s, &tool, &out, opts.clearance, 0.5).unwrap();
+        assert!(h.is_empty(), "{about:?} {h:?}");
+        assert!(gouges(&s, &tool.cutter().unwrap(), &out, opts.tolerance, 0.5).unwrap().is_empty());
+        verify5(&out, opts.max_axis_step).unwrap();
+        let stats = out.stats();
+        assert!(stats.max_axis_step <= opts.max_axis_step + 1e-9);
+        // The ball turns about its centre: the holder's rim must be 9.5 from the axis's foot
+        // 4 from the wall, 22 up from the centre: 22·sin θ − 15·cos θ > −3.5, so θ ≥ 27° (in
+        // whole degrees), and one degree more is kept in hand.
+        assert!(stats.max_tilt >= deg(28.0) - 1e-9 && stats.max_tilt <= deg(29.5), "{about:?}: {}", stats.max_tilt.to_degrees());
+        for p in out.poses() {
+            assert!(p.axis.x >= -1e-12, "{about:?}: it leans away from the wall, to +X: {p:?}");
+            // The ball's centre stays on the line it followed.
+            close(p.up(3.0).x, -6.0, 1e-9);
+        }
+        // Along the wall, the ball still sits on the floor.
+        let floor: Vec<Pose> = out.poses().filter(|p| p.up(3.0).z.abs() - 3.0 <= 1e-9 && p.up(3.0).y.abs() < 19.0).collect();
+        assert!(!floor.is_empty());
+        for p in &floor {
+            close(p.up(3.0).z, 3.0, 1e-9);
+            assert!(p.axis.z.acos() >= deg(27.0) - 1e-9);
+        }
+    }
+    // A tilt of at most 15° cannot clear it: refused, naming the move.
+    match tilt_away(&s, &tool, &path, &options(deg(15.0))) {
+        Err(CamError::Unsafe(why)) => assert!(why.starts_with("move "), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // Nothing collides: nothing changes but the division into short moves.
+    let clear = tilt_away(&s, &tool, &along_the_wall(10.0), &options(deg(40.0))).unwrap();
+    assert_eq!(clear.stats().max_tilt, 0.0);
+}
+
+#[test]
+fn hostile_collision_inputs_are_refused() {
+    let s = pocket();
+    let tool = short_tool();
+    let ball = tool.cutter().unwrap();
+    let path = along_the_wall(-6.0);
+    for step in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(gouges(&s, &ball, &path, 0.01, step).is_err());
+        assert!(holder_collisions(&s, &tool, &path, 0.5, step).is_err());
+        assert!(tilt_away(&s, &tool, &path, &TiltOptions { sample_step: step, ..options(deg(40.0)) }).is_err());
+    }
+    assert!(gouges(&s, &ball, &path, f64::NAN, 1.0).is_err());
+    assert!(holder_collisions(&s, &tool, &path, f64::NAN, 1.0).is_err());
+    let bad = Toolpath5 { moves: vec![Move5::Rapid { to: Pose::new(Vec3::new(f64::NAN, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)) }] };
+    assert!(gouges(&s, &ball, &bad, 0.01, 1.0).is_err());
+    let unnormal = Toolpath5 { moves: vec![Move5::Rapid { to: Pose::new(Vec3::ZERO, Vec3::new(0.0, 0.0, 2.0)) }] };
+    assert!(holder_collisions(&s, &tool, &unnormal, 0.5, 1.0).is_err());
+    for o in [
+        TiltOptions { max_tilt: f64::NAN, ..options(deg(40.0)) },
+        TiltOptions { max_tilt: deg(100.0), ..options(deg(40.0)) },
+        TiltOptions { step: 0.0, ..options(deg(40.0)) },
+        TiltOptions { max_axis_step: 0.0, ..options(deg(40.0)) },
+        TiltOptions { clearance: -1.0, ..options(deg(40.0)) },
+        TiltOptions { about: TiltAbout::TowardPoint { point: Vec3::new(f64::NAN, 0.0, 0.0) }, ..options(deg(40.0)) },
+    ] {
+        assert!(tilt_away(&s, &tool, &path, &o).is_err(), "{o:?}");
+    }
+    assert!(tilt_away(&s, &Tool::new(1, ToolKind::Drill, 6.0, 30.0), &path, &options(deg(40.0))).is_err());
+    // A tool too long a way round to sample is refused, not looped over.
+    let far = path3(&[(Vec3::ZERO, false), (Vec3::new(1.0e6, 0.0, 0.0), true)]);
+    assert!(matches!(gouges(&s, &ball, &far, 0.01, 1e-3), Err(CamError::TooLarge(_))));
+    // An empty surface has nothing to hit.
+    let empty = Surface::new(vec![]).unwrap();
+    assert!(gouges(&empty, &ball, &path, 0.01, 1.0).unwrap().is_empty());
+    assert!(holder_collisions(&empty, &tool, &path, 0.5, 1.0).unwrap().is_empty());
+    let json = serde_json::to_string(&options(0.5)).unwrap();
+    assert_eq!(serde_json::from_str::<TiltOptions>(&json).unwrap(), options(0.5));
+}
+
+/// A floor at z = 0 and, from x = 10 on, a block 60 high: a wall facing −X.
+fn step_wall() -> Surface {
+    let mut tris = Vec::new();
+    for b in [block(Vec3::new(-40.0, -40.0, -10.0), Vec3::new(40.0, 40.0, 0.0)), block(Vec3::new(10.0, -40.0, 0.0), Vec3::new(40.0, 40.0, 60.0))] {
+        tris.extend_from_slice(b.triangles());
+    }
+    Surface::new(tris).unwrap()
+}
+
+/// A 6 mm cutter 20 mm out of a 30 mm holder.
+fn holder_tool(kind: ToolKind) -> Tool {
+    let mut t = Tool::new(1, kind, 6.0, 10.0);
+    if kind == ToolKind::BullNose {
+        t.corner_radius = Some(1.0);
+    }
+    t.stickout = Some(20.0);
+    t.holder = vec![HolderSection { diameter: 30.0, length: 40.0 }];
+    t
+}
+
+/// Down beside the wall, along it on the floor and up again, as a 3-axis finish writes it.
+fn beside_the_wall(x: f64) -> Toolpath5 {
+    let p = |y: f64, z: f64| Pose::vertical(Vec3::new(x, y, z));
+    Toolpath5 {
+        moves: vec![
+            Move5::Rapid { to: p(-20.0, 80.0) },
+            Move5::Rapid { to: p(-20.0, 62.0) },
+            Move5::Feed { to: p(-20.0, 0.0), feed: 100.0 },
+            Move5::Feed { to: p(20.0, 0.0), feed: 500.0 },
+            Move5::Rapid { to: p(20.0, 80.0) },
+            Move5::Rapid { to: Pose::vertical(Vec3::new(-30.0, 20.0, 80.0)) },
+        ],
+    }
+}
+
+/// The path with its rapids (but the first move) made cutting moves, so that the checks of
+/// cutting moves look at them too.
+fn rapids_as_feeds(path: &Toolpath5) -> Toolpath5 {
+    let moves = path
+        .moves
+        .iter()
+        .enumerate()
+        .map(|(i, m)| if let (Move5::Rapid { to }, true) = (*m, i > 0) { Move5::Feed { to, feed: 1.0 } } else { *m })
+        .collect();
+    Toolpath5 { moves }
+}
+
+#[test]
+fn tilting_keeps_the_rapids_clear() {
+    // Leant away from the wall along the floor, the tool must not swing back upright on the
+    // rapid out (nor lean over on the rapid in) while its holder is still beside the wall.
+    let s = step_wall();
+    let tool = holder_tool(ToolKind::BallEndmill);
+    let path = beside_the_wall(6.9);
+    let opts = TiltOptions {
+        max_tilt: deg(60.0),
+        step: deg(1.0),
+        about: TiltAbout::AwayFromPoint { point: Vec3::new(1000.0, 0.0, 0.0) },
+        clearance: 1.0,
+        max_axis_step: deg(5.0),
+        sample_step: 0.5,
+        tolerance: 0.01,
+    };
+    assert!(!holder_collisions(&s, &tool, &path, opts.clearance, 0.5).unwrap().is_empty());
+    let out = tilt_away(&s, &tool, &path, &opts).unwrap();
+    assert!(out.stats().max_tilt >= deg(20.0), "{}", out.stats().max_tilt.to_degrees());
+    let all = rapids_as_feeds(&out);
+    let h = holder_collisions(&s, &tool, &all, opts.clearance, 0.5).unwrap();
+    assert!(h.is_empty(), "{h:?}");
+    let g = gouges(&s, &tool.cutter().unwrap(), &all, opts.tolerance, 0.5).unwrap();
+    assert!(g.is_empty(), "{g:?}");
+    verify5(&out, opts.max_axis_step).unwrap();
+}
+
+#[test]
+fn a_flat_end_is_not_leant_onto_the_top_of_the_wall() {
+    // Leaning a flat or bull end towards the wall makes its endless side meet the wall, and
+    // pushing it out along the axis then lifts it onto the top of the wall, 60 up: that lean
+    // must not count as clear. Leant away, it stays on the floor.
+    let s = step_wall();
+    for kind in [ToolKind::FlatEndmill, ToolKind::BullNose] {
+        let tool = holder_tool(kind);
+        let c = tool.cutter().unwrap();
+        let opts = TiltOptions { clearance: 0.5, ..options(deg(45.0)) };
+        let out = tilt_away(&s, &tool, &beside_the_wall(6.9), &opts).unwrap();
+        let mut on_floor = 0;
+        for m in &out.moves {
+            let Move5::Feed { to, .. } = *m else { continue };
+            // The lowest point of the end: its corner's centre circle, less the corner.
+            let lowest = to.tip.z - c.corner * (1.0 - to.axis.z) - c.flat_radius() * (1.0 - to.axis.z * to.axis.z).max(0.0).sqrt();
+            assert!(lowest >= -1e-6, "{kind:?}: {to:?} cuts into the floor");
+            assert!(to.axis.x <= 1e-12, "{kind:?}: it leans away from the wall: {to:?}");
+            // Along the floor (past the plunge at y = −20) it cuts the floor.
+            if to.tip.y > -20.0 + 1e-9 {
+                assert!(lowest <= 1e-6, "{kind:?}: {to:?} is off the floor");
+                on_floor += 1;
+            }
+        }
+        assert!(on_floor >= 30, "{kind:?}: {on_floor}");
+        assert!(gouges(&s, &c, &rapids_as_feeds(&out), opts.tolerance, 0.5).unwrap().is_empty());
+        assert!(holder_collisions(&s, &tool, &rapids_as_feeds(&out), opts.clearance, 0.5).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_tool_touching_a_wall_does_not_gouge_it() {
+    // The ball's side exactly on the left wall of the pocket, a hair off it either way, and a
+    // micron into it: within the tolerance, not a gouge the height of the wall.
+    let s = pocket();
+    let ball = Cutter::ball(3.0).unwrap();
+    for x in [-7.0, -7.0 + 1e-13, -7.0 - 1e-13, -7.001] {
+        let g = gouges(&s, &ball, &along_the_wall(x), 0.01, 0.5).unwrap();
+        assert!(g.is_empty(), "{x}: {g:?}");
+    }
+    // Half a millimetre into the wall is a gouge.
+    assert!(!gouges(&s, &ball, &along_the_wall(-7.5), 0.01, 0.5).unwrap().is_empty());
+    // Into the floor, as deep as it cuts in.
+    let low = path3(&[(Vec3::new(0.0, -20.0, 20.0), false), (Vec3::new(0.0, -20.0, -0.5), true), (Vec3::new(0.0, 20.0, -0.5), true)]);
+    let g = gouges(&s, &ball, &low, 0.01, 0.5).unwrap();
+    assert!(!g.is_empty() && g.iter().all(|h| (h.distance - 0.5).abs() <= 1e-9), "{g:?}");
+    // A wall pass touching the wall is tilted clear of the holder, not refused as a gouge.
+    let tool = short_tool();
+    let out = tilt_away(&s, &tool, &along_the_wall(-7.0), &options(deg(40.0))).unwrap();
+    assert!(holder_collisions(&s, &tool, &out, 0.5, 0.5).unwrap().is_empty());
+}

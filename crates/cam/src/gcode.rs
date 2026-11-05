@@ -2,7 +2,8 @@
 //! back (the subset `emit` writes), which is how the output is checked.
 
 use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Vec2, Vec3};
+use solidcore_record::{Vec2, Vec3};
+use solidcraft_geom::prelude::*;
 
 use crate::path::{Move, Toolpath, arc_sweep};
 use crate::post::{CommentStyle, Post, Values, fill};
@@ -10,11 +11,27 @@ use crate::tool::Tool;
 use crate::{CamError, Result, invalid};
 
 /// Most operations in one program.
-const MAX_OPERATIONS: usize = 10_000;
+pub(crate) const MAX_OPERATIONS: usize = 10_000;
 /// Most lines [`parse`] reads.
-const MAX_LINES: usize = 5_000_000;
+pub(crate) const MAX_LINES: usize = 5_000_000;
 /// Longest comment written.
 const MAX_COMMENT: usize = 80;
+/// Slowest and fastest feed written (mm/min).
+pub(crate) const MIN_FEED: f64 = 1.0e-3;
+pub(crate) const MAX_FEED: f64 = 1.0e6;
+/// Largest feed word written (in the post's units a minute, or degrees a minute).
+pub(crate) const MAX_FEED_WORD: f64 = 1.0e7;
+
+/// Whether `feed` (mm/min) is one a program may be written with: [`MIN_FEED`] to [`MAX_FEED`].
+pub(crate) fn feed_in_range(feed: f64) -> bool {
+    (MIN_FEED..=MAX_FEED).contains(&feed)
+}
+
+/// Whether a written `F` value reads back as a usable feed: above zero (not rounded away to
+/// `F0`) and at most [`MAX_FEED_WORD`] when `per_minute`.
+pub(crate) fn feed_word_ok(word: &str, per_minute: bool) -> bool {
+    word.trim_end_matches('.').parse::<f64>().is_ok_and(|v| v > 0.0 && (!per_minute || v <= MAX_FEED_WORD))
+}
 
 /// One operation of a program: a tool, how it turns, and where it goes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -45,7 +62,7 @@ pub fn work_offset_code(n: u8) -> Result<String> {
 }
 
 /// `v` with at most `decimals` decimals and no trailing zeros.
-fn number(v: f64, decimals: u8) -> String {
+pub(crate) fn number(v: f64, decimals: u8) -> String {
     let mut s = format!("{:.*}", usize::from(decimals), v);
     if s.contains('.') {
         while s.ends_with('0') {
@@ -59,7 +76,7 @@ fn number(v: f64, decimals: u8) -> String {
 }
 
 /// Text that is safe inside any comment style.
-fn plain(text: &str) -> String {
+pub(crate) fn plain(text: &str) -> String {
     text.chars().filter(|c| c.is_ascii_alphanumeric() || " ._-+/:=,#".contains(*c)).take(MAX_COMMENT).collect::<String>().trim().to_string()
 }
 
@@ -72,6 +89,8 @@ struct Writer<'a> {
     y: Option<String>,
     z: Option<String>,
     pos: Option<Vec3>,
+    /// The tool's height, when known (it may be while X and Y are not).
+    height: Option<f64>,
     feed: Option<String>,
 }
 
@@ -112,17 +131,18 @@ impl Writer<'_> {
         self.value(mm / self.post.units.mm(), self.post.decimals)
     }
 
-    /// Forget where the tool is: the next move states every axis.
-    fn reset(&mut self) {
-        (self.x, self.y, self.z, self.pos, self.feed) = (None, None, None, None, None);
+    /// Forget where the tool is (after a tool change, which may move it): the next move states
+    /// every axis, and the next rapid rises before it moves across.
+    fn forget(&mut self) {
+        (self.x, self.y, self.z, self.pos, self.height, self.feed) = (None, None, None, None, None, None);
     }
 
-    /// A `G0`/`G1` block for the axes among `xy` and `z` that change; nothing if none does.
     /// The word of motion code `n` (0–3): `G1`, or `G01` for a post that pads its codes.
     fn motion(&self, n: u8) -> String {
         if self.post.two_digit_codes { format!("G{n:02}") } else { format!("G{n}") }
     }
 
+    /// A `G0`/`G1` block for the axes among `xy` and `z` that change; nothing if none does.
     fn linear(&mut self, code: u8, to: Vec3, xy: bool, z: bool, feed: Option<f64>) {
         let (nx, ny, nz) = (self.coord(to.x), self.coord(to.y), self.coord(to.z));
         let mut words = String::new();
@@ -157,21 +177,32 @@ impl Writer<'_> {
         format!(" F{f}")
     }
 
-    fn rapid(&mut self, to: Vec3) {
-        // Never a diagonal rapid: up first when rising, across first when descending.
-        if self.pos.is_some_and(|p| to.z > p.z) {
+    /// A rapid, never a diagonal: up first when rising, across first when descending. Where the
+    /// tool's height is not known (the program's start, after a tool change) it first rises to
+    /// `rise` (or the rapid's own height, if higher), so it never moves across at a height it
+    /// does not know.
+    fn rapid(&mut self, to: Vec3, rise: Option<f64>) {
+        let height = match self.height {
+            Some(z) => z,
+            None => {
+                let up = rise.map_or(to.z, |r| r.max(to.z));
+                self.linear(0, Vec3::new(to.x, to.y, up), false, true, None);
+                up
+            }
+        };
+        if to.z > height {
             self.linear(0, to, false, true, None);
             self.linear(0, to, true, false, None);
         } else {
             self.linear(0, to, true, false, None);
             self.linear(0, to, false, true, None);
         }
-        self.pos = Some(to);
+        (self.pos, self.height) = (Some(to), Some(to.z));
     }
 
     fn feed(&mut self, to: Vec3, feed: f64) {
         self.linear(1, to, true, true, Some(feed));
-        self.pos = Some(to);
+        (self.pos, self.height) = (Some(to), Some(to.z));
     }
 
     fn arc(&mut self, to: Vec3, center: Vec2, ccw: bool, feed: f64) -> Result<()> {
@@ -205,7 +236,7 @@ impl Writer<'_> {
         }
         words.push_str(&format!(" I{} J{}", self.coord(center.x - from.x), self.coord(center.y - from.y)));
         words.push_str(&self.feed_word(Some(feed)));
-        (self.x, self.y, self.z, self.pos) = (Some(nx), Some(ny), Some(nz), Some(to));
+        (self.x, self.y, self.z, self.pos, self.height) = (Some(nx), Some(ny), Some(nz), Some(to), Some(to.z));
         self.block(&words);
         Ok(())
     }
@@ -220,7 +251,8 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
     if program.operations.len() > MAX_OPERATIONS {
         return Err(CamError::TooLarge(format!("more than {MAX_OPERATIONS} operations")));
     }
-    let mut w = Writer { post, out: String::new(), line: post.line_numbers.map(|n| n.start), x: None, y: None, z: None, pos: None, feed: None };
+    let mut w =
+        Writer { post, out: String::new(), line: post.line_numbers.map(|n| n.start), x: None, y: None, z: None, pos: None, height: None, feed: None };
     let offset = program.work_offset.unwrap_or(1);
     // A post that leaves the offset to the operator can only mean the first one.
     if offset != 1 && !post.writes_work_offset() {
@@ -234,6 +266,16 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
         Values { program: plain(&program.name), units: post.units.code().into(), work_offset: work_offset_code(offset)?, ..Values::default() };
     w.comment(&program.name);
     w.template(&post.header, &values)?;
+    // Where the tool's height is not known, the first rapid rises to the program's highest.
+    let rise = program
+        .operations
+        .iter()
+        .flat_map(|op| &op.path.moves)
+        .filter_map(|m| match m {
+            Move::Rapid { to } if to.z.is_finite() => Some(to.z),
+            _ => None,
+        })
+        .reduce(f64::max);
     let mut tool: Option<u32> = None;
     let mut rpm: Option<String> = None;
     let mut coolant = false;
@@ -249,11 +291,17 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
         w.comment(&format!("{}: T{} D{} {}", op.name, op.tool.number, number(op.tool.diameter, 3), op.tool.kind.label()));
         if tool != Some(op.tool.number) {
             if tool.is_some() || post.tool_change_first {
+                // Coolant off while the tool is changed; the operation turns it back on.
+                if coolant {
+                    w.template(&post.coolant_off, &values)?;
+                    coolant = false;
+                }
                 w.template(&post.tool_change, &values)?;
             }
-            // A tool change stops the spindle.
+            // A tool change stops the spindle and may move the tool anywhere.
             rpm = None;
             tool = Some(op.tool.number);
+            w.forget();
         }
         if rpm.as_ref() != Some(&speed) {
             w.template(&post.spindle_on, &values)?;
@@ -263,16 +311,23 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
             w.template(if op.coolant { &post.coolant_on } else { &post.coolant_off }, &values)?;
             coolant = op.coolant;
         }
-        w.reset();
+        // With the same tool the tool is still where the last operation left it; only the feed
+        // is stated again.
+        w.feed = None;
         for m in &op.path.moves {
             if m.target().is_some_and(|to| !to.is_finite()) {
                 return Err(CamError::Unsafe(format!("operation `{}` has a coordinate that is not a finite number", plain(&op.name))));
             }
             match *m {
-                Move::Rapid { to } => w.rapid(to),
-                Move::Feed { to, feed } | Move::Arc { to, feed, .. } if !(feed > 0.0) || !feed.is_finite() => {
+                Move::Rapid { to } => w.rapid(to, rise),
+                Move::Feed { to, feed } | Move::Arc { to, feed, .. }
+                    if !feed_in_range(feed) || !feed_word_ok(&w.value(feed / post.units.mm(), post.feed_decimals), true) =>
+                {
                     let _ = to;
-                    return Err(CamError::Unsafe(format!("operation `{}` has a feed that is not above 0", plain(&op.name))));
+                    return Err(CamError::Unsafe(format!(
+                        "operation `{}` has a feed that is not {MIN_FEED} to {MAX_FEED} mm/min or that would be written as F0",
+                        plain(&op.name)
+                    )));
                 }
                 Move::Feed { to, feed } => w.feed(to, feed),
                 Move::Arc { to, center, ccw, feed } => w.arc(to, center, ccw, feed)?,
@@ -297,7 +352,7 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
 }
 
 /// The words of one line: `(letter, value)`.
-fn words(line: &str, n: usize) -> Result<Vec<(char, f64)>> {
+pub(crate) fn words(line: &str, n: usize) -> Result<Vec<(char, f64)>> {
     let mut out = Vec::new();
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
@@ -330,8 +385,9 @@ fn words(line: &str, n: usize) -> Result<Vec<(char, f64)>> {
 }
 
 /// Reads the motion of a G-code program in absolute coordinates: `G0`–`G3` with `X Y Z I J F`,
-/// `G4 P`, `G20`/`G21`. Everything else (spindle, tools, coolant, offsets) is skipped. The
-/// result is in millimetres and mm/min.
+/// `G4 P`, `G20`/`G21`, arc centres `I J` from the arc's start (`G91.1`; `G90.1` is refused).
+/// Everything else (spindle, tools, coolant, offsets) is skipped. The result is in millimetres
+/// and mm/min.
 pub fn parse(text: &str) -> Result<Vec<Move>> {
     let mut units = 1.0;
     let mut mode: Option<u8> = None;
@@ -359,6 +415,7 @@ pub fn parse(text: &str) -> Result<Vec<Move>> {
                 200 => units = 25.4,
                 210 => units = 1.0,
                 910 => return Err(CamError::Parse(n, "not supported yet: incremental coordinates (G91)".into())),
+                901 => return Err(CamError::Parse(n, "not supported yet: absolute arc centres (G90.1)".into())),
                 _ => {}
             }
         }
