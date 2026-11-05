@@ -7,7 +7,7 @@ use solidcraft_geom::prelude::*;
 
 use crate::path::{Move, Toolpath, arc_sweep};
 use crate::post::{CommentStyle, Post, Values, fill};
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolKind};
 use crate::{CamError, Result, invalid};
 
 /// Most operations in one program.
@@ -15,7 +15,7 @@ pub(crate) const MAX_OPERATIONS: usize = 10_000;
 /// Most lines [`parse`] reads.
 pub(crate) const MAX_LINES: usize = 5_000_000;
 /// Longest comment written.
-const MAX_COMMENT: usize = 80;
+pub(crate) const MAX_COMMENT: usize = 80;
 /// Slowest and fastest feed written (mm/min).
 pub(crate) const MIN_FEED: f64 = 1.0e-3;
 pub(crate) const MAX_FEED: f64 = 1.0e6;
@@ -80,6 +80,57 @@ pub(crate) fn plain(text: &str) -> String {
     text.chars().filter(|c| c.is_ascii_alphanumeric() || " ._-+/:=,#".contains(*c)).take(MAX_COMMENT).collect::<String>().trim().to_string()
 }
 
+/// A number as `post` wants it: at most `decimals` decimals, with a decimal point even when
+/// whole if the post says so.
+pub(crate) fn post_number(post: &Post, v: f64, decimals: u8) -> String {
+    let s = number(v, decimals);
+    if post.trailing_decimal && !s.contains('.') { format!("{s}.") } else { s }
+}
+
+/// The words of a block joined by single spaces, empty words left out.
+pub(crate) fn join(words: &[String]) -> String {
+    words.iter().flat_map(|w| w.split_whitespace()).collect::<Vec<_>>().join(" ")
+}
+
+/// The tool list line of [`Post::tool_list`] for `tool`, whose operations go down to `zmin`
+/// (mm; `None` to leave it out).
+pub(crate) fn tool_list_line(post: &Post, tool: &Tool, zmin: Option<f64>) -> String {
+    let mm = post.units.mm();
+    let corner = match tool.kind {
+        ToolKind::BallEndmill => tool.diameter / 2.0,
+        _ => tool.corner_radius.unwrap_or(0.0),
+    };
+    let mut line =
+        format!("T{} D={} CR={}", tool.number, post_number(post, tool.diameter / mm, post.decimals), post_number(post, corner / mm, post.decimals));
+    if let Some(z) = zmin.filter(|z| z.is_finite()) {
+        line.push_str(&format!(" - ZMIN={}", post_number(post, z / mm, post.decimals)));
+    }
+    line.push_str(&format!(" - {}", tool.kind.label()));
+    line
+}
+
+/// The comment of an operation: its name, and unless the post wants the name alone, its tool.
+pub(crate) fn operation_comment(post: &Post, name: &str, tool: &Tool) -> String {
+    if post.operation_name_only {
+        name.to_string()
+    } else {
+        format!("{}: T{} D{} {}", name, tool.number, number(tool.diameter, 3), tool.kind.label())
+    }
+}
+
+/// Each tool in the order it is first used, with the lowest Z of its operations.
+fn tools_used(program: &Program) -> Vec<(&Tool, Option<f64>)> {
+    let mut out: Vec<(&Tool, Option<f64>)> = Vec::new();
+    for op in &program.operations {
+        let low = op.path.moves.iter().filter_map(Move::target).map(|p| p.z).filter(|z| z.is_finite()).reduce(f64::min);
+        match out.iter_mut().find(|(t, _)| t.number == op.tool.number) {
+            Some((_, z)) => *z = (*z).into_iter().chain(low).reduce(f64::min),
+            None => out.push((&op.tool, low)),
+        }
+    }
+    out
+}
+
 struct Writer<'a> {
     post: &'a Post,
     out: String,
@@ -91,7 +142,15 @@ struct Writer<'a> {
     pos: Option<Vec3>,
     /// The tool's height, when known (it may be while X and Y are not).
     height: Option<f64>,
+    /// Whether the tool is at the machine's top after the post's safe retract, nothing moved since.
+    top: bool,
     feed: Option<String>,
+    /// The motion mode in force as written (`G0` to `G3`), when known.
+    mode: Option<u8>,
+    /// The tool whose length offset goes with the next Z word ([`Post::tool_length_on_first_z`]).
+    length_offset: Option<u32>,
+    /// The tool in the spindle.
+    tool: Option<u32>,
 }
 
 impl Writer<'_> {
@@ -105,11 +164,18 @@ impl Writer<'_> {
     }
 
     fn comment(&mut self, text: &str) {
-        let text = plain(text);
+        let text = self.post.comment_text(text);
         match self.post.comments {
             CommentStyle::Parentheses => self.out.push_str(&format!("({text})\n")),
             CommentStyle::Semicolon => self.out.push_str(&format!("; {text}\n")),
             CommentStyle::None => {}
+        }
+    }
+
+    /// A blank line, if the post spaces its operations out.
+    fn blank(&mut self) {
+        if self.post.blank_lines {
+            self.out.push('\n');
         }
     }
 
@@ -118,13 +184,32 @@ impl Writer<'_> {
             let text = fill(line, values)?;
             self.block(&text);
         }
+        // A template may hold any motion code: the next motion states its own.
+        if !lines.is_empty() {
+            self.mode = None;
+        }
+        Ok(())
+    }
+
+    /// The post's safe retract: afterwards the tool is at the machine's top, and the next Z
+    /// move sets the tool length offset again if the post sets it with the first Z. Not
+    /// written again while the tool is still up there.
+    fn safe_retract(&mut self, lines: &[String], values: &Values) -> Result<()> {
+        if self.top {
+            return Ok(());
+        }
+        self.template(lines, values)?;
+        self.forget();
+        self.top = true;
+        if self.post.tool_length_on_first_z {
+            self.length_offset = self.tool;
+        }
         Ok(())
     }
 
     /// A number as the controller wants it: with a decimal point even when whole, if the post says so.
     fn value(&self, v: f64, decimals: u8) -> String {
-        let s = number(v, decimals);
-        if self.post.trailing_decimal && !s.contains('.') { format!("{s}.") } else { s }
+        post_number(self.post, v, decimals)
     }
 
     fn coord(&self, mm: f64) -> String {
@@ -134,36 +219,53 @@ impl Writer<'_> {
     /// Forget where the tool is (after a tool change, which may move it): the next move states
     /// every axis, and the next rapid rises before it moves across.
     fn forget(&mut self) {
-        (self.x, self.y, self.z, self.pos, self.height, self.feed) = (None, None, None, None, None, None);
+        (self.x, self.y, self.z, self.pos, self.height, self.feed, self.top) = (None, None, None, None, None, None, false);
     }
 
-    /// The word of motion code `n` (0–3): `G1`, or `G01` for a post that pads its codes.
-    fn motion(&self, n: u8) -> String {
+    /// The word of motion code `n` (0–3): `G1`, or `G01` for a post that pads its codes; nothing
+    /// for a modal post already in that mode.
+    fn motion(&mut self, n: u8) -> String {
+        if self.post.modal_motion && self.mode == Some(n) {
+            return String::new();
+        }
+        self.mode = Some(n);
         if self.post.two_digit_codes { format!("G{n:02}") } else { format!("G{n}") }
     }
 
     /// A `G0`/`G1` block for the axes among `xy` and `z` that change; nothing if none does.
     fn linear(&mut self, code: u8, to: Vec3, xy: bool, z: bool, feed: Option<f64>) {
         let (nx, ny, nz) = (self.coord(to.x), self.coord(to.y), self.coord(to.z));
-        let mut words = String::new();
+        let mut words = Vec::new();
         if xy && self.x.as_ref() != Some(&nx) {
-            words.push_str(&format!(" X{nx}"));
+            words.push(format!("X{nx}"));
             self.x = Some(nx);
         }
         if xy && self.y.as_ref() != Some(&ny) {
-            words.push_str(&format!(" Y{ny}"));
+            words.push(format!("Y{ny}"));
             self.y = Some(ny);
         }
+        let mut offset = None;
         if z && self.z.as_ref() != Some(&nz) {
-            words.push_str(&format!(" Z{nz}"));
+            offset = self.length_offset.take();
+            words.push(format!("Z{nz}"));
             self.z = Some(nz);
         }
         if words.is_empty() {
             return;
         }
+        self.top = false;
         let feed = self.feed_word(feed);
         let code = self.motion(code);
-        self.block(&format!("{code}{words}{feed}"));
+        let mut block = vec![code];
+        if let Some(t) = offset {
+            block.push("G43".into());
+            block.extend(words);
+            block.push(format!("H{t}"));
+        } else {
+            block.extend(words);
+        }
+        block.push(feed);
+        self.block(&join(&block));
     }
 
     /// ` F…` when the feed changes.
@@ -180,17 +282,18 @@ impl Writer<'_> {
     /// A rapid, never a diagonal: up first when rising, across first when descending. Where the
     /// tool's height is not known (the program's start, after a tool change) it first rises to
     /// `rise` (or the rapid's own height, if higher), so it never moves across at a height it
-    /// does not know.
+    /// does not know; at the machine's top it goes across first.
     fn rapid(&mut self, to: Vec3, rise: Option<f64>) {
-        let height = match self.height {
-            Some(z) => z,
+        let up_first = match self.height {
+            Some(z) => to.z > z,
+            None if self.top => false,
             None => {
                 let up = rise.map_or(to.z, |r| r.max(to.z));
                 self.linear(0, Vec3::new(to.x, to.y, up), false, true, None);
-                up
+                false
             }
         };
-        if to.z > height {
+        if up_first {
             self.linear(0, to, false, true, None);
             self.linear(0, to, true, false, None);
         } else {
@@ -230,14 +333,22 @@ impl Writer<'_> {
             return Ok(());
         }
         let nz = self.coord(to.z);
-        let mut words = format!("{} X{nx} Y{ny}", self.motion(if ccw { 3 } else { 2 }));
-        if self.z.as_ref() != Some(&nz) {
-            words.push_str(&format!(" Z{nz}"));
+        let mut words = vec![self.motion(if ccw { 3 } else { 2 })];
+        // A modal post leaves out an end coordinate that does not change.
+        if !self.post.modal_motion || self.x.as_ref() != Some(&nx) {
+            words.push(format!("X{nx}"));
         }
-        words.push_str(&format!(" I{} J{}", self.coord(center.x - from.x), self.coord(center.y - from.y)));
-        words.push_str(&self.feed_word(Some(feed)));
-        (self.x, self.y, self.z, self.pos, self.height) = (Some(nx), Some(ny), Some(nz), Some(to), Some(to.z));
-        self.block(&words);
+        if !self.post.modal_motion || self.y.as_ref() != Some(&ny) {
+            words.push(format!("Y{ny}"));
+        }
+        if self.z.as_ref() != Some(&nz) {
+            words.push(format!("Z{nz}"));
+        }
+        words.push(format!("I{}", self.coord(center.x - from.x)));
+        words.push(format!("J{}", self.coord(center.y - from.y)));
+        words.push(self.feed_word(Some(feed)));
+        (self.x, self.y, self.z, self.pos, self.height, self.top) = (Some(nx), Some(ny), Some(nz), Some(to), Some(to.z), false);
+        self.block(&join(&words));
         Ok(())
     }
 }
@@ -251,8 +362,21 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
     if program.operations.len() > MAX_OPERATIONS {
         return Err(CamError::TooLarge(format!("more than {MAX_OPERATIONS} operations")));
     }
-    let mut w =
-        Writer { post, out: String::new(), line: post.line_numbers.map(|n| n.start), x: None, y: None, z: None, pos: None, height: None, feed: None };
+    let mut w = Writer {
+        post,
+        out: String::new(),
+        line: post.line_numbers.map(|n| n.start),
+        x: None,
+        y: None,
+        z: None,
+        pos: None,
+        height: None,
+        top: false,
+        feed: None,
+        mode: None,
+        length_offset: None,
+        tool: None,
+    };
     let offset = program.work_offset.unwrap_or(1);
     // A post that leaves the offset to the operator can only mean the first one.
     if offset != 1 && !post.writes_work_offset() {
@@ -265,7 +389,15 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
     let mut values =
         Values { program: plain(&program.name), units: post.units.code().into(), work_offset: work_offset_code(offset)?, ..Values::default() };
     w.comment(&program.name);
+    if post.tool_list {
+        for (tool, zmin) in tools_used(program) {
+            w.comment(&tool_list_line(post, tool, zmin));
+        }
+    }
     w.template(&post.header, &values)?;
+    if let Some(lines) = post.safe_retract_at(|r| r.at_start) {
+        w.safe_retract(lines, &values)?;
+    }
     // Where the tool's height is not known, the first rapid rises to the program's highest.
     let rise = program
         .operations
@@ -284,12 +416,22 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
         if !(op.spindle_rpm > 0.0) || !(op.spindle_rpm <= 1.0e6) {
             return invalid(format!("operation `{}`: the spindle speed must be above 0", plain(&op.name)));
         }
+        let new_tool = tool != Some(op.tool.number);
+        // The spindle stops before the tool rises for a later tool change.
+        if new_tool
+            && tool.is_some()
+            && let Some(lines) = post.safe_retract_at(|r| r.at_tool_change)
+        {
+            w.template(&post.spindle_off, &values)?;
+            w.safe_retract(lines, &values)?;
+        }
         let speed = number(op.spindle_rpm, 0);
         values.tool = op.tool.number.to_string();
         values.diameter = number(op.tool.diameter / post.units.mm(), post.decimals);
         values.rpm = speed.clone();
-        w.comment(&format!("{}: T{} D{} {}", op.name, op.tool.number, number(op.tool.diameter, 3), op.tool.kind.label()));
-        if tool != Some(op.tool.number) {
+        w.blank();
+        w.comment(&operation_comment(post, &op.name, &op.tool));
+        if new_tool {
             if tool.is_some() || post.tool_change_first {
                 // Coolant off while the tool is changed; the operation turns it back on.
                 if coolant {
@@ -298,15 +440,23 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
                 }
                 w.template(&post.tool_change, &values)?;
             }
-            // A tool change stops the spindle and may move the tool anywhere.
+            // A tool change stops the spindle and may move the tool anywhere, except that one
+            // made at the machine's top leaves it there.
             rpm = None;
             tool = Some(op.tool.number);
+            let top = w.top;
             w.forget();
+            w.top = top;
+            w.tool = tool;
+            if post.tool_length_on_first_z {
+                w.length_offset = tool;
+            }
         }
         if rpm.as_ref() != Some(&speed) {
             w.template(&post.spindle_on, &values)?;
             rpm = Some(speed);
         }
+        w.template(&post.operation_start, &values)?;
         if op.coolant != coolant {
             w.template(if op.coolant { &post.coolant_on } else { &post.coolant_off }, &values)?;
             coolant = op.coolant;
@@ -342,11 +492,16 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
                 }
             }
         }
+        w.template(&post.operation_end, &values)?;
     }
+    w.blank();
     if coolant {
         w.template(&post.coolant_off, &values)?;
     }
     w.template(&post.spindle_off, &values)?;
+    if let Some(lines) = post.safe_retract_at(|r| r.at_end) {
+        w.safe_retract(lines, &values)?;
+    }
     w.template(&post.footer, &values)?;
     Ok(w.out)
 }
@@ -386,12 +541,15 @@ pub(crate) fn words(line: &str, n: usize) -> Result<Vec<(char, f64)>> {
 
 /// Reads the motion of a G-code program in absolute coordinates: `G0`–`G3` with `X Y Z I J F`,
 /// `G4 P`, `G20`/`G21`, arc centres `I J` from the arc's start (`G91.1`; `G90.1` is refused).
-/// Everything else (spindle, tools, coolant, offsets) is skipped. The result is in millimetres
-/// and mm/min.
+/// A return to the machine's home (`G28`/`G30`, as in `G28 G91 Z0.`) makes the axes it names
+/// unknown until they are written again; any other move in incremental coordinates (`G91`) is
+/// refused. Everything else (spindle, tools, coolant, offsets) is skipped. The result is in
+/// millimetres and mm/min.
 pub fn parse(text: &str) -> Result<Vec<Move>> {
     let mut units = 1.0;
     let mut mode: Option<u8> = None;
     let mut feed: Option<f64> = None;
+    let mut incremental = false;
     let (mut x, mut y, mut z): (Option<f64>, Option<f64>, Option<f64>) = (None, None, None);
     let mut pos: Option<Vec3> = None;
     let mut moves = Vec::new();
@@ -401,7 +559,7 @@ pub fn parse(text: &str) -> Result<Vec<Move>> {
             return Err(CamError::TooLarge(format!("more than {MAX_LINES} lines")));
         }
         let ws = words(line, n)?;
-        let mut dwell = false;
+        let (mut dwell, mut home, mut g91) = (false, false, false);
         for &(c, v) in &ws {
             if c != 'G' {
                 continue;
@@ -414,12 +572,29 @@ pub fn parse(text: &str) -> Result<Vec<Move>> {
                 40 => dwell = true,
                 200 => units = 25.4,
                 210 => units = 1.0,
-                910 => return Err(CamError::Parse(n, "not supported yet: incremental coordinates (G91)".into())),
+                280 | 300 => home = true,
+                900 => incremental = false,
+                910 => (incremental, g91) = (true, true),
                 901 => return Err(CamError::Parse(n, "not supported yet: absolute arc centres (G90.1)".into())),
                 _ => {}
             }
         }
+        if g91 && !home {
+            return Err(CamError::Parse(n, "not supported yet: incremental coordinates (G91) other than for a return home (G28 G91)".into()));
+        }
         let word = |letter: char| ws.iter().find(|(c, _)| *c == letter).map(|(_, v)| *v);
+        if home {
+            for (slot, letter) in [(&mut x, 'X'), (&mut y, 'Y'), (&mut z, 'Z')] {
+                if word(letter).is_some() {
+                    *slot = None;
+                }
+            }
+            pos = None;
+            continue;
+        }
+        if incremental && ['X', 'Y', 'Z', 'I', 'J'].into_iter().any(|l| word(l).is_some()) {
+            return Err(CamError::Parse(n, "not supported yet: incremental coordinates (G91)".into()));
+        }
         if dwell {
             // `G4 P` in seconds as this crate's own posts write it, or `G04 X` in seconds.
             moves.push(Move::Dwell { seconds: word('X').or(word('P')).unwrap_or(0.0).max(0.0) });

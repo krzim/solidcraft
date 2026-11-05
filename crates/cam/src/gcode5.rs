@@ -30,18 +30,29 @@
 //! stays in force over the blocks between operations (tool change, spindle, coolant), and every
 //! `F` is checked to be written as a feed the controller can run (never `F0`).
 //!
+//! The base post's layout switches ([`Post`]: tool list, comments, blank lines, per-operation
+//! lines, the safe retract to the machine's top, the tool length offset on the first Z, modal
+//! motion codes) are written the same way as by [`crate::emit`]; after a safe retract or a turn
+//! of the rotaries the next move states its motion code again. With [`Post5::safe_rotate_first`]
+//! an operation that starts by turning the rotaries takes the `safe_rotate` lines before its
+//! comment. A rotary with limits that has room for a whole turn can take a continuous cut past
+//! them with [`Rewind`]s.
+//!
 //! [`parse5`] reads the motion back (the subset these write), which is how the output is
 //! checked: see [`crate::readback5`].
 
-use std::f64::consts::{FRAC_PI_4, PI};
+use std::f64::consts::{FRAC_PI_4, PI, TAU};
 
 use serde::{Deserialize, Serialize};
 use solidcore_record::{Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
-use crate::gcode::{MAX_FEED, MAX_LINES, MAX_OPERATIONS, MIN_FEED, feed_in_range, feed_word_ok, number, plain, words, work_offset_code};
+use crate::gcode::{
+    MAX_FEED, MAX_LINES, MAX_OPERATIONS, MIN_FEED, feed_in_range, feed_word_ok, join, number, operation_comment, plain, post_number, tool_list_line,
+    words, work_offset_code,
+};
 use crate::indexed::{IndexedOperation, frame_for_index, head_upright};
-use crate::kinematics::{AxisLetter, JointMove, Joints, Machine, check_limits, solve_from};
+use crate::kinematics::{AxisLetter, Carrier, JointMove, Joints, Machine, check_limits, forward, nearest_turn, solve_from};
 use crate::multiaxis::{Operation5, Program5, verify5};
 use crate::path::{MAX_MOVES, Move, arc_sweep};
 use crate::post::{CommentStyle, Post, Values, check_template, fill};
@@ -85,6 +96,10 @@ pub struct Post5 {
     /// linear axis, across first and down last.
     #[serde(default)]
     pub safe_rotate: Vec<String>,
+    /// Whether an operation that starts by turning the rotaries takes the `safe_rotate` lines
+    /// before its comment and tool change, rather than right before the turn.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub safe_rotate_first: bool,
     /// Whether a rapid that turns a rotary first rises to the clearance height (`G0 Z…` in the
     /// program's coordinates, after `safe_rotate`), so the part never turns into the tool. The
     /// height is `clearance`, or else the highest rapid of the operation, which is where its
@@ -102,6 +117,48 @@ pub struct Post5 {
     pub tolerance: f64,
     /// Largest angle of the tool axis from its planned turn in machine-coordinate output (radians).
     pub angle_tolerance: f64,
+    /// Decimals of every inverse-time `F` (at most [`MAX_INVERSE_DECIMALS`]); `None` for as many
+    /// as keep about five significant digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inverse_time_decimals: Option<u8>,
+    /// How a continuous cut carries on past the limits of a rotary that has room for a whole
+    /// turn; `None` to refuse such a cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewind: Option<Rewind>,
+}
+
+/// Rewinds: a continuous cut that would turn a table rotary past its limits (a long wrapped
+/// helix on an axis that cannot turn without end) stops where it reaches the limit, draws the
+/// tool straight up out of the cut by `distance` at `retract_feed`, takes the post's
+/// `safe_rotate` lines (and the rise to the clearance height, with `clearance_retract`), turns
+/// the axis back by whole turns (the same position of the part, as far from the limit as the
+/// limits allow), comes back above the cut at rapid and plunges back to it at `plunge_feed`,
+/// then goes on. Only for machine-coordinate output on machines whose rotaries all turn the
+/// table; elsewhere the limits stay as they are.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Rewind {
+    /// How far the tool is drawn out of the cut before the turn (mm).
+    pub distance: f64,
+    /// Feed of the draw out (mm/min).
+    pub retract_feed: f64,
+    /// Feed of the plunge back into the cut (mm/min).
+    pub plunge_feed: f64,
+}
+
+impl Rewind {
+    fn validate(&self) -> Result<()> {
+        if !(self.distance > 0.0) || !(self.distance <= 1000.0) {
+            return invalid("the rewind distance must be above 0 mm and at most 1000 mm");
+        }
+        if !feed_in_range(self.retract_feed) || !feed_in_range(self.plunge_feed) {
+            return invalid(format!("the rewind feeds must be {MIN_FEED} to {MAX_FEED} mm/min"));
+        }
+        Ok(())
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn lines(l: &[&str]) -> Vec<String> {
@@ -119,10 +176,13 @@ impl Post5 {
             inverse_time: true,
             angle_decimals: 4,
             safe_rotate: Vec::new(),
+            safe_rotate_first: false,
             clearance_retract: true,
             clearance: None,
             tolerance: 0.005,
             angle_tolerance: 0.1f64.to_radians(),
+            inverse_time_decimals: None,
+            rewind: None,
         }
     }
 
@@ -232,6 +292,15 @@ impl Post5 {
         if self.clearance.is_some_and(|c| !(c.abs() <= 1.0e6)) {
             return invalid("the clearance height must be a finite number");
         }
+        if self.inverse_time_decimals.is_some_and(|d| d > MAX_INVERSE_DECIMALS) {
+            return invalid(format!("a post writes at most {MAX_INVERSE_DECIMALS} decimals for inverse-time feeds"));
+        }
+        if let Some(r) = &self.rewind {
+            if self.tcp.is_some() {
+                return invalid("rewinds are for output in machine coordinates, not with tool centre point control");
+            }
+            r.validate()?;
+        }
         self.solve_options().validate()
     }
 }
@@ -293,6 +362,8 @@ enum Height {
 struct Writer5<'a> {
     post: &'a Post,
     angle_decimals: u8,
+    /// Fixed decimals of an inverse-time `F` ([`Post5::inverse_time_decimals`]).
+    inverse_decimals: Option<u8>,
     out: String,
     line: Option<u32>,
     /// The linear words as written, and the position they say.
@@ -306,6 +377,12 @@ struct Writer5<'a> {
     order: Vec<(usize, char)>,
     feed: Option<String>,
     inverse: bool,
+    /// The motion mode in force as written (`G0` to `G3`), when known.
+    mode: Option<u8>,
+    /// The tool whose length offset goes with the next Z word ([`Post::tool_length_on_first_z`]).
+    length_offset: Option<u32>,
+    /// The tool in the spindle.
+    tool: Option<u32>,
 }
 
 impl Writer5<'_> {
@@ -319,7 +396,7 @@ impl Writer5<'_> {
     }
 
     fn comment(&mut self, text: &str) {
-        let text = plain(text);
+        let text = self.post.comment_text(text);
         match self.post.comments {
             CommentStyle::Parentheses => self.out.push_str(&format!("({text})\n")),
             CommentStyle::Semicolon => self.out.push_str(&format!("; {text}\n")),
@@ -327,17 +404,46 @@ impl Writer5<'_> {
         }
     }
 
+    /// A blank line, if the post spaces its operations out.
+    fn blank(&mut self) {
+        if self.post.blank_lines {
+            self.out.push('\n');
+        }
+    }
+
+    /// The lines of a template. A template may hold any motion code, so the next motion states
+    /// its own; one that sets feed per minute (`G94`) ends inverse time.
     fn template(&mut self, lines: &[String], values: &Values) -> Result<()> {
         for line in lines {
             let text = fill(line, values)?;
+            if words(&text, 0).is_ok_and(|ws| ws.iter().any(|&(c, v)| c == 'G' && (v * 10.0).round() as i64 == 940)) {
+                (self.inverse, self.feed) = (false, None);
+            }
             self.block(&text);
+        }
+        if !lines.is_empty() {
+            self.mode = None;
+        }
+        Ok(())
+    }
+
+    /// Safe lines (the post's safe retract or `safe_rotate`) unless the tool is still at the
+    /// machine's top from the last: afterwards it is, every linear axis is stated again, and
+    /// the next Z move sets the tool length offset again if the post sets it with the first Z.
+    fn safe_lines(&mut self, lines: &[String], values: &Values) -> Result<()> {
+        if lines.is_empty() || self.height == Height::Top {
+            return Ok(());
+        }
+        self.template(lines, values)?;
+        (self.lin, self.pos, self.height) = ([None, None, None], None, Height::Top);
+        if self.post.tool_length_on_first_z {
+            self.length_offset = self.tool;
         }
         Ok(())
     }
 
     fn value(&self, v: f64, decimals: u8) -> String {
-        let s = number(v, decimals);
-        if self.post.trailing_decimal && !s.contains('.') { format!("{s}.") } else { s }
+        post_number(self.post, v, decimals)
     }
 
     fn coord(&self, mm: f64) -> String {
@@ -348,7 +454,12 @@ impl Writer5<'_> {
         self.value(radians.to_degrees(), self.angle_decimals)
     }
 
-    fn motion(&self, n: u8) -> String {
+    /// The word of motion code `n`; nothing for a modal post already in that mode.
+    fn motion(&mut self, n: u8) -> String {
+        if self.post.modal_motion && self.mode == Some(n) {
+            return String::new();
+        }
+        self.mode = Some(n);
         if self.post.two_digit_codes { format!("G{n:02}") } else { format!("G{n}") }
     }
 
@@ -373,8 +484,8 @@ impl Writer5<'_> {
     }
 
     /// The rotary words that change, noted as written.
-    fn rotary_words(&mut self, rot: &[f64]) -> String {
-        let mut words = String::new();
+    fn rotary_words(&mut self, rot: &[f64]) -> Vec<String> {
+        let mut words = Vec::new();
         for k in 0..self.order.len() {
             let Some(&(i, c)) = self.order.get(k) else { continue };
             let Some(&a) = rot.get(i) else { continue };
@@ -382,26 +493,35 @@ impl Writer5<'_> {
             if let Some(slot) = self.rot.get_mut(i)
                 && slot.as_ref() != Some(&s)
             {
-                words.push_str(&format!(" {c}{s}"));
+                words.push(format!("{c}{s}"));
                 *slot = Some(s);
             }
         }
         words
     }
 
-    /// The linear words among `xy` and `z` that change, noted as written.
-    fn linear_words(&mut self, to: Vec3, xy: bool, z: bool) -> String {
+    /// The linear words among `xy` and `z` that change, noted as written; with the tool length
+    /// offset (`G43 … H`) around the Z word if it is due.
+    fn linear_words(&mut self, to: Vec3, xy: bool, z: bool) -> Vec<String> {
         let new = [self.coord(to.x), self.coord(to.y), self.coord(to.z)];
-        let mut words = String::new();
+        let mut words = Vec::new();
+        let mut offset = None;
         for (k, (letter, s)) in ['X', 'Y', 'Z'].into_iter().zip(new).enumerate() {
             let wanted = if k < 2 { xy } else { z };
             if let Some(slot) = self.lin.get_mut(k)
                 && wanted
                 && slot.as_ref() != Some(&s)
             {
-                words.push_str(&format!(" {letter}{s}"));
+                if k == 2 {
+                    offset = self.length_offset.take();
+                }
+                words.push(format!("{letter}{s}"));
                 *slot = Some(s);
             }
+        }
+        if let Some(t) = offset {
+            words.insert(0, "G43".into());
+            words.push(format!("H{t}"));
         }
         words
     }
@@ -409,8 +529,9 @@ impl Writer5<'_> {
     fn rapid_block(&mut self, to: Vec3, xy: bool, z: bool) {
         let words = self.linear_words(to, xy, z);
         if !words.is_empty() {
-            let code = self.motion(0);
-            self.block(&format!("{code}{words}"));
+            let mut block = vec![self.motion(0)];
+            block.extend(words);
+            self.block(&join(&block));
         }
     }
 
@@ -423,10 +544,7 @@ impl Writer5<'_> {
         if !self.turns(rot) {
             return Ok(());
         }
-        self.template(safe, values)?;
-        if !safe.is_empty() {
-            (self.lin, self.pos, self.height) = ([None, None, None], None, Height::Top);
-        }
+        self.safe_lines(safe, values)?;
         let rise = match self.height {
             Height::Top => None,
             Height::Unknown => clearance.into_iter().chain(top).reduce(f64::max),
@@ -438,9 +556,13 @@ impl Writer5<'_> {
             self.pos = self.pos.map(|_| at);
             self.height = Height::At(h);
         }
-        let words = self.rotary_words(rot);
-        let code = self.motion(0);
-        self.block(&format!("{code}{words}"));
+        // The turn states its motion code, alone on its block as it is, and so does the move
+        // after it.
+        self.mode = None;
+        let mut block = vec![self.motion(0)];
+        block.extend(self.rotary_words(rot));
+        self.block(&join(&block));
+        self.mode = None;
         Ok(())
     }
 
@@ -473,17 +595,17 @@ impl Writer5<'_> {
             return String::new();
         }
         self.feed = Some(f.clone());
-        format!(" F{f}")
+        format!("F{f}")
     }
 
-    /// `G93 `/`G94 ` when the feed mode changes to `inverse`.
+    /// `G93`/`G94` when the feed mode changes to `inverse`.
     fn feed_mode(&mut self, inverse: bool) -> &'static str {
         if inverse == self.inverse {
             return "";
         }
         self.inverse = inverse;
         self.feed = None;
-        if inverse { "G93 " } else { "G94 " }
+        if inverse { "G93" } else { "G94" }
     }
 
     /// The ` F…` of a cut; refused when it would be written as `F0` or as an absurd rate.
@@ -491,30 +613,34 @@ impl Writer5<'_> {
         let (f, per_minute) = match rate {
             Rate::Linear(mm) => (self.value(mm / self.post.units.mm(), self.post.feed_decimals), true),
             Rate::Degrees(deg) => (self.value(deg, self.post.feed_decimals), true),
-            // Inverse time wants its F on every block, with enough digits to keep about five
-            // significant ones, so a long, slow cut is never written as F0.
+            // Inverse time wants its F on every block, with the post's decimals or enough digits
+            // to keep about five significant ones, so a long, slow cut is never written as F0.
             Rate::Inverse(v) => {
-                let digits = (4.0 - v.log10().floor()).clamp(f64::from(self.post.feed_decimals), f64::from(MAX_INVERSE_DECIMALS)) as u8;
+                let digits = self
+                    .inverse_decimals
+                    .unwrap_or_else(|| (4.0 - v.log10().floor()).clamp(f64::from(self.post.feed_decimals), f64::from(MAX_INVERSE_DECIMALS)) as u8);
                 (self.value(v, digits), false)
             }
         };
         if !feed_word_ok(&f, per_minute) {
             return Err(CamError::Unsafe(format!("a cut would be written with the feed F{f}, which the controller cannot run")));
         }
-        Ok(if per_minute { self.feed_word(f) } else { format!(" F{f}") })
+        Ok(if per_minute { self.feed_word(f) } else { format!("F{f}") })
     }
 
     fn feed(&mut self, to: Vec3, rot: &[f64], rate: Rate) -> Result<()> {
         let mut words = self.linear_words(to, true, true);
-        words.push_str(&self.rotary_words(rot));
+        words.extend(self.rotary_words(rot));
         (self.pos, self.height) = (Some(to), Height::At(to.z));
         if words.is_empty() {
             return Ok(());
         }
-        let mode = self.feed_mode(matches!(rate, Rate::Inverse(_)));
+        let mode = self.feed_mode(matches!(rate, Rate::Inverse(_))).to_string();
         let f = self.rate_word(rate)?;
-        let code = self.motion(1);
-        self.block(&format!("{mode}{code}{words}{f}"));
+        let mut block = vec![mode, self.motion(1)];
+        block.extend(words);
+        block.push(f);
+        self.block(&join(&block));
         Ok(())
     }
 
@@ -543,17 +669,25 @@ impl Writer5<'_> {
             }
             return self.feed(to, rot, Rate::Linear(feed));
         }
-        let mode = self.feed_mode(false);
-        let mut words = format!("{mode}{} X{nx} Y{ny}", self.motion(if ccw { 3 } else { 2 }));
-        if helix {
-            words.push_str(&format!(" Z{nz}"));
+        let mode = self.feed_mode(false).to_string();
+        let mut words = vec![mode, self.motion(if ccw { 3 } else { 2 })];
+        // A modal post leaves out an end coordinate that does not change.
+        if !self.post.modal_motion || !same_x {
+            words.push(format!("X{nx}"));
         }
-        words.push_str(&format!(" I{} J{}", self.coord(center.x - from.x), self.coord(center.y - from.y)));
+        if !self.post.modal_motion || !same_y {
+            words.push(format!("Y{ny}"));
+        }
+        if helix {
+            words.push(format!("Z{nz}"));
+        }
+        words.push(format!("I{}", self.coord(center.x - from.x)));
+        words.push(format!("J{}", self.coord(center.y - from.y)));
         let f = self.rate_word(Rate::Linear(feed))?;
-        words.push_str(&f);
+        words.push(f);
         self.lin = [Some(nx), Some(ny), Some(nz)];
         (self.pos, self.height) = (Some(to), Height::At(to.z));
-        self.block(&words);
+        self.block(&join(&words));
         Ok(())
     }
 
@@ -567,6 +701,24 @@ impl Writer5<'_> {
         self.block(&dwell);
         Ok(())
     }
+
+    /// A rewind at `from` (see [`Rewind`]): out of the cut along the machine's Z, the safe
+    /// lines and the turn back to `back`, rapid above the cut, and the plunge back into it.
+    fn rewind(&mut self, from: &Joints, back: &[f64], rewind: &Rewind, turn: &Turn<'_>, values: &Values) -> Result<()> {
+        let above = from.linear + Vec3::Z * rewind.distance;
+        self.feed(above, &from.rotary, Rate::Linear(rewind.retract_feed))?;
+        self.turn(back, turn.safe, turn.clearance, turn.top, values)?;
+        self.rapid(above, turn.top);
+        self.feed(from.linear, back, Rate::Linear(rewind.plunge_feed))
+    }
+}
+
+/// How the rotaries turn at rapid in an operation: the safe lines, the clearance height and the
+/// program's highest clearance (see [`Writer5::turn`]).
+struct Turn<'a> {
+    safe: &'a [String],
+    clearance: Option<f64>,
+    top: Option<f64>,
 }
 
 /// Writes `program` for `machine` through `post`.
@@ -599,8 +751,16 @@ enum Op<'a> {
 
 /// The motion of one operation, ready to write.
 enum Motion {
-    Joints(Vec<JointMove>),
-    Indexed { rotary: Vec<f64>, path: Vec<Move> },
+    /// Machine moves, and the rewinds among them: `(index of the move a rewind comes before,
+    /// the angles the rotaries turn back to)`.
+    Joints {
+        moves: Vec<JointMove>,
+        rewinds: Vec<(usize, Vec<f64>)>,
+    },
+    Indexed {
+        rotary: Vec<f64>,
+        path: Vec<Move>,
+    },
 }
 
 fn in_op(name: &str) -> impl Fn(CamError) -> CamError + '_ {
@@ -657,6 +817,156 @@ struct Planned<'a> {
     /// The highest rapid (the program's coordinates: the tip with tool centre point control,
     /// otherwise the machine's Z), where the operation's toolpaths retract to.
     top: Option<f64>,
+    /// The lowest Z of the operation, in the same coordinates.
+    low: Option<f64>,
+    /// Whether any rotary is away from zero in it.
+    turned: bool,
+}
+
+/// The angles the rotaries turn to at an operation's first rapid.
+fn first_turn(motion: &Motion) -> Option<&[f64]> {
+    match motion {
+        Motion::Indexed { rotary, path } => (!path.is_empty()).then_some(rotary.as_slice()),
+        Motion::Joints { moves, .. } => moves.iter().find_map(|m| match m {
+            JointMove::Rapid { to, .. } => Some(to.rotary.as_slice()),
+            _ => None,
+        }),
+    }
+}
+
+/// Slack (radians) of an angle against a limit.
+const LIMIT_SLACK: f64 = 1e-9;
+/// Most rewinds within one machine move.
+const MAX_REWINDS_PER_MOVE: usize = 64;
+
+/// `machine` with the limits left off its table rotaries that have room for a whole turn (every
+/// angle has an equal one within them), to solve continuous operations on for a post that
+/// rewinds; `None` if there are none, or if a rotary turns the head (the draw out of the cut
+/// would then not be along Z).
+fn turning_freely(machine: &Machine) -> Option<Machine> {
+    if machine.rotaries.iter().any(|r| r.carrier == Carrier::Head) {
+        return None;
+    }
+    let mut free = machine.clone();
+    let mut any = false;
+    for r in &mut free.rotaries {
+        if r.limits.is_some_and(|(lo, hi)| hi - lo >= TAU - LIMIT_SLACK) {
+            r.limits = None;
+            any = true;
+        }
+    }
+    any.then_some(free)
+}
+
+/// The rotaries of `j` beyond `machine`'s limits: `(joint, lowest, highest)`.
+fn beyond(machine: &Machine, j: &Joints) -> Vec<(usize, f64, f64)> {
+    machine
+        .rotaries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let (lo, hi) = r.limits?;
+            let a = *j.rotary.get(i)?;
+            (a < lo - LIMIT_SLACK || a > hi + LIMIT_SLACK).then_some((i, lo, hi))
+        })
+        .collect()
+}
+
+/// The moves of a continuous operation solved on [`turning_freely`]'s machine, brought within
+/// `machine`'s limits by whole turns, and the rewinds they need (see [`Motion::Joints`]). A
+/// rapid takes the equal angle within the limits nearest the one before it (it turns the
+/// rotaries anyway); a cut that would go past a limit is split where it reaches it, and the rest
+/// follows a rewind. The axes move evenly through each piece as before, so a split piece takes
+/// its share of the time.
+fn unwind(machine: &Machine, moves: Vec<JointMove>, previous: Option<&Joints>) -> Result<(Vec<JointMove>, Vec<(usize, Vec<f64>)>)> {
+    let mut shift = vec![0.0; machine.rotaries.len()];
+    let mut last: Option<Joints> = previous.cloned();
+    let mut out = Vec::with_capacity(moves.len());
+    let mut rewinds = Vec::new();
+    for m in moves {
+        let source = m.source();
+        let at = |e: CamError| match e {
+            CamError::Unsafe(s) => CamError::Unsafe(format!("move {source}: {s}")),
+            other => other,
+        };
+        match m {
+            JointMove::Dwell { .. } => out.push(m),
+            JointMove::Rapid { mut to, pose, rotary_change, .. } => {
+                for (a, s) in to.rotary.iter_mut().zip(&shift) {
+                    *a += s;
+                }
+                for (i, lo, hi) in beyond(machine, &to) {
+                    let reference = last.as_ref().and_then(|l| l.rotary.get(i).copied()).unwrap_or(0.0);
+                    if let (Some(a), Some(s)) = (to.rotary.get_mut(i), shift.get_mut(i))
+                        && let Some(t) = nearest_turn(*a, reference, Some((lo, hi)))
+                    {
+                        *s += t - *a;
+                        *a = t;
+                    }
+                }
+                check_limits(machine, &to).map_err(at)?;
+                last = Some(to.clone());
+                out.push(JointMove::Rapid { source, to, pose, rotary_change });
+            }
+            JointMove::Feed { mut to, pose, feed, mut minutes, .. } => {
+                for (a, s) in to.rotary.iter_mut().zip(&shift) {
+                    *a += s;
+                }
+                let Some(mut from) = last.clone() else { return Err(at(CamError::Unsafe("a cut before the first positioning move".into()))) };
+                for _ in 0..MAX_REWINDS_PER_MOVE {
+                    let over = beyond(machine, &to);
+                    if over.is_empty() {
+                        break;
+                    }
+                    // Up to where the first axis reaches its limit.
+                    let mut t: f64 = 1.0;
+                    for &(i, lo, hi) in &over {
+                        let (a, b) = (from.rotary.get(i).copied().unwrap_or(0.0), to.rotary.get(i).copied().unwrap_or(0.0));
+                        let limit = if b > hi { hi } else { lo };
+                        if (b - a).abs() > 1e-12 {
+                            t = t.min(((limit - a) / (b - a)).clamp(0.0, 1.0));
+                        }
+                    }
+                    if t > 1e-9 {
+                        let reached = from.lerp(&to, t);
+                        out.push(JointMove::Feed { source, to: reached.clone(), pose: forward(machine, &reached), feed, minutes: minutes * t });
+                        minutes *= 1.0 - t;
+                        from = reached;
+                    }
+                    // Every axis past a limit turns back by whole turns, as far from the limit it
+                    // heads for as the limits let it.
+                    let mut back = from.rotary.clone();
+                    for &(i, lo, hi) in &over {
+                        let (Some(a), Some(b)) = (from.rotary.get(i).copied(), to.rotary.get(i).copied()) else { continue };
+                        let turned =
+                            if b > hi { a - TAU * ((a - lo + LIMIT_SLACK) / TAU).floor() } else { a + TAU * ((hi - a + LIMIT_SLACK) / TAU).floor() };
+                        let delta = turned - a;
+                        if delta.abs() < PI {
+                            let letter = machine.rotaries.get(i).map_or('?', |r| r.letter.char());
+                            return Err(at(CamError::Unsafe(format!(
+                                "{letter} would turn past its limits at {:.3}°, with no room to turn it back a whole turn",
+                                a.to_degrees()
+                            ))));
+                        }
+                        if let (Some(x), Some(s), Some(y)) = (back.get_mut(i), shift.get_mut(i), to.rotary.get_mut(i)) {
+                            *x = turned;
+                            *s += delta;
+                            *y += delta;
+                        }
+                    }
+                    rewinds.push((out.len(), back.clone()));
+                    from.rotary = back;
+                }
+                check_limits(machine, &to).map_err(at)?;
+                last = Some(to.clone());
+                out.push(JointMove::Feed { source, to, pose, feed, minutes });
+            }
+        }
+        if out.len() > MAX_MOVES {
+            return Err(CamError::TooLarge(format!("the machine moves would be more than {MAX_MOVES}")));
+        }
+    }
+    Ok((out, rewinds))
 }
 
 /// The motion of an indexed operation with tool centre point control: its poses solved from
@@ -700,6 +1010,9 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
     }
     let opts = post.solve_options();
     let tcp = post.tcp.as_ref();
+    // With rewinds, continuous operations are solved as if the rotaries with room for a whole
+    // turn turned without end, then brought back within their limits.
+    let free = if post.rewind.is_some() && tcp.is_none() { turning_freely(machine) } else { None };
 
     // Every operation solved first, so the program's highest clearance is known before the
     // first rotary turns.
@@ -727,45 +1040,60 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
                 check_indexed(o, machine).map_err(in_op(&label))?;
                 Motion::Indexed { rotary: o.rotary.clone(), path: o.path.moves.clone() }
             }
-            Op::Indexed(o) => Motion::Joints(indexed_with_tcp(o, machine, post, chain.as_ref()).map_err(in_op(&label))?),
+            Op::Indexed(o) => {
+                Motion::Joints { moves: indexed_with_tcp(o, machine, post, chain.as_ref()).map_err(in_op(&label))?, rewinds: Vec::new() }
+            }
             Op::Continuous(o) => {
                 verify5(&o.path, PI).map_err(in_op(&label))?;
-                Motion::Joints(solve_from(machine, &o.path, &opts, chain.as_ref()).map_err(in_op(&label))?)
+                match &free {
+                    Some(f) => {
+                        let moves = solve_from(f, &o.path, &opts, chain.as_ref()).map_err(in_op(&label))?;
+                        let (moves, rewinds) = unwind(machine, moves, chain.as_ref()).map_err(in_op(&label))?;
+                        Motion::Joints { moves, rewinds }
+                    }
+                    None => {
+                        Motion::Joints { moves: solve_from(machine, &o.path, &opts, chain.as_ref()).map_err(in_op(&label))?, rewinds: Vec::new() }
+                    }
+                }
             }
         };
         total = total.saturating_add(match &motion {
-            Motion::Joints(m) => m.len(),
+            Motion::Joints { moves, .. } => moves.len(),
             Motion::Indexed { path, .. } => path.len(),
         });
         if total > MAX_MOVES {
             return Err(CamError::TooLarge(format!("the program would have more than {MAX_MOVES} moves")));
         }
-        let top = match &motion {
-            Motion::Joints(moves) => {
+        let (top, low, turned) = match &motion {
+            Motion::Joints { moves, .. } => {
                 if let Some(j) = moves.iter().rev().find_map(JointMove::joints) {
                     chain = Some(j.clone());
                 }
-                moves
-                    .iter()
-                    .filter_map(|m| match m {
-                        JointMove::Rapid { to, pose, .. } => Some(if tcp.is_some() { pose.tip.z } else { to.linear.z }),
-                        _ => None,
-                    })
-                    .reduce(f64::max)
+                let height = |m: &JointMove| match m {
+                    JointMove::Rapid { to, pose, .. } | JointMove::Feed { to, pose, .. } => {
+                        Some(if tcp.is_some() { pose.tip.z } else { to.linear.z })
+                    }
+                    JointMove::Dwell { .. } => None,
+                };
+                let top = moves.iter().filter(|m| matches!(m, JointMove::Rapid { .. })).filter_map(height).reduce(f64::max);
+                let turned = moves.iter().filter_map(JointMove::joints).any(|j| j.rotary.iter().any(|a| a.abs() > 1e-12));
+                (top, moves.iter().filter_map(height).reduce(f64::min), turned)
             }
             Motion::Indexed { rotary, path } => {
                 if let Some(to) = path.iter().rev().find_map(Move::target) {
                     chain = Some(Joints { linear: to, rotary: rotary.clone() });
                 }
-                path.iter()
+                let top = path
+                    .iter()
                     .filter_map(|m| match m {
                         Move::Rapid { to } => Some(to.z),
                         _ => None,
                     })
-                    .reduce(f64::max)
+                    .reduce(f64::max);
+                (top, path.iter().filter_map(Move::target).map(|p| p.z).reduce(f64::min), rotary.iter().any(|a| a.abs() > 1e-12))
             }
         };
-        planned.push(Planned { name: op_name, tool: op_tool, rpm: op_rpm, coolant: op_coolant, motion, top });
+        planned.push(Planned { name: op_name, tool: op_tool, rpm: op_rpm, coolant: op_coolant, motion, top, low, turned });
     }
     // Where the tool's height is not known, it rises to the highest clearance of the program
     // (the post's, or any operation's highest rapid above it) before it moves across or a
@@ -777,6 +1105,7 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
     let mut w = Writer5 {
         post: base,
         angle_decimals: post.angle_decimals,
+        inverse_decimals: post.inverse_time_decimals,
         out: String::new(),
         line: base.line_numbers.map(|n| n.start),
         lin: [None, None, None],
@@ -786,10 +1115,30 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
         order,
         feed: None,
         inverse: false,
+        mode: None,
+        length_offset: None,
+        tool: None,
     };
     let mut values = Values { program: plain(name), units: base.units.code().into(), work_offset: work_offset_code(offset)?, ..Values::default() };
     w.comment(name);
+    if base.tool_list {
+        // The lowest Z means something only while no rotary turns.
+        let flat = planned.iter().all(|p| !p.turned);
+        let mut tools: Vec<(&Tool, Option<f64>)> = Vec::new();
+        for p in &planned {
+            match tools.iter_mut().find(|(t, _)| t.number == p.tool.number) {
+                Some((_, z)) => *z = (*z).into_iter().chain(p.low).reduce(f64::min),
+                None => tools.push((p.tool, p.low)),
+            }
+        }
+        for (t, z) in tools {
+            w.comment(&tool_list_line(base, t, z.filter(|_| flat)));
+        }
+    }
     w.template(&base.header, &values)?;
+    if let Some(lines) = base.safe_retract_at(|r| r.at_start) {
+        w.safe_lines(lines, &values)?;
+    }
     let mut tool: Option<u32> = None;
     let mut rpm: Option<String> = None;
     let mut coolant = false;
@@ -797,15 +1146,36 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
     let mut joints: Option<Joints> = None;
     for p in planned {
         let speed = number(p.rpm, 0);
-        values.tool = p.tool.number.to_string();
-        values.diameter = number(p.tool.diameter / base.units.mm(), base.decimals);
-        values.rpm = speed.clone();
         let new_tool = tool != Some(p.tool.number);
         // The blocks before the motion read any F per minute.
         if new_tool || rpm.as_ref() != Some(&speed) || p.coolant != coolant || (tcp.is_some() && !tcp_on) {
             w.per_minute();
         }
-        w.comment(&format!("{}: T{} D{} {}", p.name, p.tool.number, number(p.tool.diameter, 3), p.tool.kind.label()));
+        // The spindle stops before the tool rises for a later tool change.
+        if new_tool
+            && tool.is_some()
+            && let Some(lines) = base.safe_retract_at(|r| r.at_tool_change)
+        {
+            if let Some(t) = tcp
+                && tcp_on
+            {
+                w.template(&t.off, &values)?;
+                tcp_on = false;
+            }
+            w.template(&base.spindle_off, &values)?;
+            w.safe_lines(lines, &values)?;
+        }
+        if post.safe_rotate_first
+            && let Some(rot) = first_turn(&p.motion)
+            && w.turns(rot)
+        {
+            w.safe_lines(&post.safe_rotate, &values)?;
+        }
+        values.tool = p.tool.number.to_string();
+        values.diameter = number(p.tool.diameter / base.units.mm(), base.decimals);
+        values.rpm = speed.clone();
+        w.blank();
+        w.comment(&operation_comment(base, p.name, p.tool));
         if new_tool {
             if let Some(t) = tcp
                 && tcp_on
@@ -821,15 +1191,25 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
                 }
                 w.template(&base.tool_change, &values)?;
             }
-            // A tool change stops the spindle and may leave the tool anywhere.
+            // A tool change stops the spindle and may leave the tool anywhere, except that one
+            // made at the machine's top leaves it there.
             rpm = None;
             tool = Some(p.tool.number);
+            let at_top = w.height == Height::Top;
             w.forget();
+            if at_top {
+                w.height = Height::Top;
+            }
+            w.tool = tool;
+            if base.tool_length_on_first_z {
+                w.length_offset = tool;
+            }
         }
         if rpm.as_ref() != Some(&speed) {
             w.template(&base.spindle_on, &values)?;
             rpm = Some(speed);
         }
+        w.template(&base.operation_start, &values)?;
         if p.coolant != coolant {
             w.template(if p.coolant { &base.coolant_on } else { &base.coolant_off }, &values)?;
             coolant = p.coolant;
@@ -846,9 +1226,18 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
         // feed is stated again.
         w.feed = None;
         let clearance = if post.clearance_retract { post.clearance.or(p.top) } else { None };
+        let turning = Turn { safe: &post.safe_rotate, clearance, top };
         match p.motion {
-            Motion::Joints(moves) => {
-                for m in &moves {
+            Motion::Joints { moves, rewinds } => {
+                let mut rewinds = rewinds.iter().peekable();
+                for (k, m) in moves.iter().enumerate() {
+                    while let Some((_, back)) = rewinds.next_if(|(at, _)| *at == k) {
+                        let (Some(rewind), Some(from)) = (post.rewind.as_ref(), joints.clone()) else {
+                            return Err(CamError::Unsafe(format!("operation `{}`: a rewind before the first positioning move", plain(p.name))));
+                        };
+                        w.rewind(&from, back, rewind, &turning, &values)?;
+                        joints = Some(Joints { linear: from.linear, rotary: back.clone() });
+                    }
                     match m {
                         JointMove::Rapid { to, pose, .. } => {
                             let lin = if tcp.is_some() { pose.tip } else { to.linear };
@@ -897,6 +1286,7 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
                 }
             }
         }
+        w.template(&base.operation_end, &values)?;
     }
     w.per_minute();
     if let Some(t) = tcp
@@ -904,10 +1294,14 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
     {
         w.template(&t.off, &values)?;
     }
+    w.blank();
     if coolant {
         w.template(&base.coolant_off, &values)?;
     }
     w.template(&base.spindle_off, &values)?;
+    if let Some(lines) = base.safe_retract_at(|r| r.at_end) {
+        w.safe_lines(lines, &values)?;
+    }
     w.template(&base.footer, &values)?;
     Ok(w.out)
 }
@@ -956,14 +1350,16 @@ pub enum JointWords {
 /// Reads the motion of a multi-axis program in absolute coordinates: `G0`–`G3` with `X Y Z`,
 /// `I J` (arcs, the rotaries held), the rotary words `letters` (degrees) and `F`, `G93`/`G94`,
 /// `G20`/`G21`, `G4`, `G91.1` (arc centres from the arc's start; `G90.1` is refused), and
-/// `G43.4`/`G49` for tool centre point control on and off. A `G53`
-/// block moves in machine coordinates, so the axes it names are unknown until written again.
-/// Incremental coordinates are refused; everything else (spindle, tools, coolant, offsets) is
-/// skipped, and so are blocks before every axis is known.
+/// `G43.4`/`G49` for tool centre point control on and off. A `G53` block moves in machine
+/// coordinates and a `G28`/`G30` block (as in `G28 G91 Z0.`) to the machine's home, so the axes
+/// they name are unknown until written again. Any other move in incremental coordinates (`G91`)
+/// is refused; everything else (spindle, tools, coolant, offsets) is skipped, and so are blocks
+/// before every axis is known.
 pub fn parse5(text: &str, letters: &[AxisLetter]) -> Result<Vec<JointWords>> {
     let mut units = 1.0;
     let mut mode: Option<u8> = None;
     let mut inverse = false;
+    let mut incremental = false;
     let mut tcp = false;
     let mut feed: Option<f64> = None;
     let mut lin: [Option<f64>; 3] = [None, None, None];
@@ -975,7 +1371,7 @@ pub fn parse5(text: &str, letters: &[AxisLetter]) -> Result<Vec<JointWords>> {
             return Err(CamError::TooLarge(format!("more than {MAX_LINES} lines")));
         }
         let ws = words(line, n)?;
-        let (mut dwell, mut machine_coords) = (false, false);
+        let (mut dwell, mut machine_coords, mut home, mut g91) = (false, false, false, false);
         for &(c, v) in &ws {
             if c != 'G' {
                 continue;
@@ -988,15 +1384,20 @@ pub fn parse5(text: &str, letters: &[AxisLetter]) -> Result<Vec<JointWords>> {
                 40 => dwell = true,
                 200 => units = 25.4,
                 210 => units = 1.0,
+                280 | 300 => (machine_coords, home) = (true, true),
+                530 => machine_coords = true,
                 434 => tcp = true,
                 490 => tcp = false,
-                530 => machine_coords = true,
-                910 => return Err(CamError::Parse(n, "not supported yet: incremental coordinates (G91)".into())),
+                900 => incremental = false,
+                910 => (incremental, g91) = (true, true),
                 901 => return Err(CamError::Parse(n, "not supported yet: absolute arc centres (G90.1)".into())),
                 930 => (inverse, feed) = (true, None),
                 940 => (inverse, feed) = (false, None),
                 _ => {}
             }
+        }
+        if g91 && !home {
+            return Err(CamError::Parse(n, "not supported yet: incremental coordinates (G91) other than for a return home (G28 G91)".into()));
         }
         let word = |letter: char| ws.iter().find(|(c, _)| *c == letter).map(|(_, v)| *v);
         if dwell {
@@ -1031,6 +1432,9 @@ pub fn parse5(text: &str, letters: &[AxisLetter]) -> Result<Vec<JointWords>> {
             continue;
         }
         let (ti, tj) = (word('I'), word('J'));
+        if incremental && !linear_words.iter().chain(&rotary_words).chain([&ti, &tj]).all(Option::is_none) {
+            return Err(CamError::Parse(n, "not supported yet: incremental coordinates (G91)".into()));
+        }
         if linear_words.iter().chain(&rotary_words).chain([&ti, &tj]).all(Option::is_none) {
             continue;
         }

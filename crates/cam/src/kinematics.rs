@@ -519,7 +519,7 @@ fn candidates(m: &Machine, a: Vec3, reference: &[f64]) -> Result<Vec<Vec<f64>>> 
 }
 
 /// The angle equal to `theta` (modulo a turn) nearest `reference` that is within `limits`.
-fn nearest_turn(theta: f64, reference: f64, limits: Option<(f64, f64)>) -> Option<f64> {
+pub(crate) fn nearest_turn(theta: f64, reference: f64, limits: Option<(f64, f64)>) -> Option<f64> {
     let k = ((reference - theta) / TAU).round();
     match limits {
         None => Some(theta + TAU * k),

@@ -9,6 +9,10 @@
 //! are compared both ways round with the planned cutting moves: the tip with the planned line,
 //! the axis with the planned turn of the nearest one. Rounding to the post's decimals, the
 //! pieces the cuts were broken into, and anything lost between the two show up as deviation.
+//! The draw out of the cut and the plunge back of a post's rewinds are not in the toolpaths:
+//! of a move that may be one, only its end in the cut is held against them (the planned moves
+//! are still all looked for in what was written), and it counts in the cut length and time as
+//! written like any other feed.
 
 use std::collections::HashMap;
 use std::f64::consts::{PI, TAU};
@@ -18,7 +22,7 @@ use solidcore_record::{Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
 use crate::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, parse5};
-use crate::kinematics::{Joints, Machine, arc_distance, forward, tool_axis};
+use crate::kinematics::{Carrier, Joints, Machine, arc_distance, forward, tool_axis};
 use crate::multiaxis::{Move5, Pose, Program5, Toolpath5, slerp};
 use crate::path::arc_sweep;
 use crate::{CamError, Result};
@@ -106,6 +110,26 @@ struct State {
     tcp: bool,
 }
 
+/// Whether a cut from `from` to `to` at `feed` (mm/min) is the draw out of the cut or the plunge
+/// back of one of the post's rewinds ([`crate::gcode5::Rewind`]): in machine coordinates on a
+/// machine whose rotaries all turn the table (so the tool is along Z), straight along Z by at
+/// most the rewind's distance with every other axis held, at the rewind's retract or plunge
+/// feed as written. Such a move only passes through the room the tool leaves above a point of
+/// the cut, so that point is all that is checked of it against the toolpaths.
+fn rewind_move(post: &Post5, machine: &Machine, from: &State, to: &State, feed: f64) -> bool {
+    let Some(rewind) = post.rewind else { return false };
+    if from.tcp || to.tcp || machine.rotaries.iter().any(|r| r.carrier == Carrier::Head) {
+        return false;
+    }
+    let digit = 0.5 * 10f64.powi(-i32::from(post.base.decimals)) * post.base.units.mm();
+    let feed_digit = 0.5 * 10f64.powi(-i32::from(post.base.feed_decimals)) * post.base.units.mm() + 1e-9;
+    from.rotary == to.rotary
+        && from.linear.x == to.linear.x
+        && from.linear.y == to.linear.y
+        && (to.linear.z - from.linear.z).abs() <= rewind.distance + 2.0 * digit
+        && [rewind.retract_feed, rewind.plunge_feed].iter().any(|r| (feed - r).abs() <= feed_digit)
+}
+
 fn pose_at(machine: &Machine, linear: Vec3, rotary: &[f64], tcp: bool) -> Pose {
     if tcp { Pose { tip: linear, axis: tool_axis(machine, rotary) } } else { forward(machine, &Joints { linear, rotary: rotary.to_vec() }) }
 }
@@ -130,6 +154,13 @@ pub fn readback_program(text: &str, program: &MachineProgram, post: &Post5, mach
             JointWords::Feed { linear, rotary, tcp, f, inverse_time, mm_per_unit, .. } => {
                 let to = State { linear: *linear, rotary: rotary.clone(), tcp: *tcp };
                 if let Some(from) = state.as_ref().filter(|s| s.tcp == *tcp) {
+                    // Of a move that may be a rewind's, only its end in the cut is held
+                    // against the toolpaths.
+                    let rewind = !*inverse_time && rewind_move(post, machine, from, &to, *f * *mm_per_unit);
+                    if rewind {
+                        let low = if from.linear.z <= to.linear.z { from } else { &to };
+                        samples.push(pose_at(machine, low.linear, &low.rotary, false));
+                    }
                     let a = Joints { linear: from.linear, rotary: from.rotary.clone() };
                     let b = Joints { linear: to.linear, rotary: to.rotary.clone() };
                     let turn = a.rotary_change(&b);
@@ -148,7 +179,9 @@ pub fn readback_program(text: &str, program: &MachineProgram, post: &Post5, mach
                         let p = pose_at(machine, j.linear, &j.rotary, *tcp);
                         cut_length += prev.tip.dist(p.tip);
                         written_segments.push((prev, p));
-                        samples.push(p);
+                        if !rewind {
+                            samples.push(p);
+                        }
                         prev = p;
                     }
                 }

@@ -51,7 +51,7 @@ pub use multiaxis::{Move5, Operation5, PathStats5, Pose, Program5, Toolpath5, sl
 pub use offset::offset_regions;
 pub use ops::{ContourParams, Cut, Feeds, Heights, PocketParams, Side, contour, pocket};
 pub use path::{Move, PathStats, Toolpath, arc_sweep};
-pub use post::{CommentStyle, LineNumbers, Post, Units};
+pub use post::{CommentStyle, LineNumbers, Post, SafeRetract, Units};
 pub use readback::{Readback, allowed_deviation, readback};
 pub use rotary::{
     DEFAULT_MAX_ANGLE_STEP, RotaryParams, RotaryPattern, RotaryRoughingParams, radial, rotary_finish, rotary_pose, rotary_roughing, wrap,

@@ -748,3 +748,388 @@ fn a_large_diagonal_raster_reads_back() {
     let rb = readback5(&text, &program, &post, &machine).unwrap();
     assert!(rb.within(), "{rb:?}");
 }
+
+/// A post that writes, as data alone, the conventions of a Mach3 program from a common
+/// commercial CAM post: a tool list, capital comments from a few characters, a blank line and
+/// the operation's name before each operation, `S… M3`, `G17 G90 G94` and the work offset at
+/// every operation, the tool length offset on the first Z, modal motion codes, three decimals
+/// with a point on whole numbers and whole feeds, a `G28 G91 Z0.` retract before every tool
+/// change, every turn of A and the end, inverse time with four decimals, and rewinds.
+fn dialect() -> Post5 {
+    let retract = vec!["G28 G91 Z0.".to_string(), "G90".to_string()];
+    let lines = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    Post5 {
+        base: Post {
+            name: "mach3-dialect".into(),
+            extension: "tap".into(),
+            decimals: 3,
+            feed_decimals: 0,
+            trailing_decimal: true,
+            header: lines(&["G90 G94 G91.1 G40 G49 G17", "{units}"]),
+            tool_change: lines(&["T{tool} M6"]),
+            tool_change_first: true,
+            spindle_on: lines(&["S{rpm} M3"]),
+            footer: lines(&["G28 G91 X0. Y0.", "G90", "M30"]),
+            upper_case_comments: true,
+            comment_chars: Some(" .,=_-".into()),
+            tool_list: true,
+            operation_name_only: true,
+            blank_lines: true,
+            operation_start: lines(&["G17 G90 G94", "{work_offset}"]),
+            safe_retract: Some(SafeRetract { lines: retract.clone(), at_start: true, at_tool_change: true, at_end: true }),
+            tool_length_on_first_z: true,
+            modal_motion: true,
+            ..Post::rs274()
+        },
+        safe_rotate: retract,
+        safe_rotate_first: true,
+        angle_decimals: 3,
+        inverse_time_decimals: Some(4),
+        rewind: Some(Rewind { distance: 25.0, retract_feed: 500.0, plunge_feed: 250.0 }),
+        ..Post5::mach3_4axis()
+    }
+}
+
+/// Two 3-axis operations with two tools: a contour with a flat end mill, then a pocket with a
+/// ball end mill, both with coolant.
+fn dialect_job() -> Program {
+    let flat = Tool::new(1, ToolKind::FlatEndmill, 6.0, 20.0);
+    let ball = Tool::new(2, ToolKind::BallEndmill, 4.0, 20.0);
+    let cut = |bottom: f64| Cut {
+        heights: Heights { clearance: 15.0, retract: 5.0, top: 0.0, bottom },
+        feeds: Feeds { cut: 1600.0, plunge: 50.0 },
+        stepdown: 1.0,
+    };
+    let contour_params = ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+    let pocket_params = PocketParams { stepover: 1.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+    let outline = contour(&[rect(0.0, 0.0, 40.0, 20.0)], &flat, &contour_params, &cut(-2.0)).unwrap();
+    let hollow = pocket(&[rect(10.0, 5.0, 30.0, 15.0)], &ball, &pocket_params, &cut(-1.25)).unwrap();
+    Program {
+        name: "part-1".into(),
+        operations: vec![
+            Operation { name: "Contour #1 (outer)".into(), tool: flat, spindle_rpm: 18000.0, coolant: true, path: outline },
+            Operation { name: "Pocket1".into(), tool: ball, spindle_rpm: 24000.0, coolant: true, path: hollow },
+        ],
+        work_offset: None,
+    }
+}
+
+/// A wrapped helix of `turns` turns round the X axis at radius 20, 10 mm along X a turn.
+fn helix_of(turns: usize) -> Toolpath5 {
+    let n = 120 * turns;
+    let pose = |k: usize| {
+        let th = TAU * k as f64 / 120.0;
+        Pose::new(Vec3::new(10.0 * k as f64 / 120.0, 0.0, 0.0) + radial(th) * 20.0, radial(th))
+    };
+    let mut moves = vec![Move5::Rapid { to: Pose::new(pose(0).up(10.0), radial(0.0)) }, Move5::Feed { to: pose(0), feed: 200.0 }];
+    moves.extend((1..=n).map(|k| Move5::Feed { to: pose(k), feed: 300.0 }));
+    moves.push(Move5::Feed { to: Pose::new(pose(n).up(10.0), pose(n).axis), feed: 1000.0 });
+    Toolpath5 { moves }
+}
+
+/// A 4th axis that turns at most a turn either way, its centreline on the work's X axis.
+fn limited_a() -> Machine {
+    Machine::four_axis_a_with(Vec3::ZERO, false, Some((-TAU, TAU)))
+}
+
+/// Checks that a motion code is written only when the mode changes (a template line, a turn
+/// of A or a tool length offset line sets no mode the next block may leave out), that every
+/// number of a motion word has a decimal point, and that every arc states both I and J.
+fn assert_modal_with_points(text: &str) {
+    let mut mode: Option<&str> = None;
+    for line in text.lines() {
+        let words: Vec<&str> = line.split(' ').collect();
+        let code = words.iter().copied().find(|w| ["G0", "G1", "G2", "G3"].contains(w));
+        let motion = words.iter().any(|w| w.len() > 1 && "XYZIJAF".contains(&w[..1]) && w[1..].parse::<f64>().is_ok());
+        if !motion || line.starts_with("G28") {
+            mode = None;
+            continue;
+        }
+        for w in &words {
+            if w.len() > 1 && "XYZIJAF".contains(&w[..1]) && w[1..].parse::<f64>().is_ok() {
+                assert!(w.contains('.'), "`{w}` without a decimal point in `{line}`");
+            }
+        }
+        match code {
+            Some(c) => {
+                assert!(mode != Some(c) || words.iter().any(|w| w.starts_with('A')), "`{c}` written again in `{line}`");
+                mode = Some(c);
+            }
+            None => assert!(mode.is_some() || line.starts_with("G43"), "no motion mode for `{line}`"),
+        }
+        if matches!(mode, Some("G2" | "G3")) && code.is_some() {
+            assert!(line.contains(" I") && line.contains(" J"), "an arc without both I and J: `{line}`");
+        }
+        if line.starts_with("G0 A") {
+            mode = None;
+        }
+    }
+}
+
+#[test]
+fn a_dialect_post_writes_its_conventions_as_data() {
+    let post = dialect();
+    post.validate().unwrap();
+    let program = dialect_job();
+    let text = emit(&program, &post.base).unwrap();
+    let start = "\
+(PART-1)
+(T1 D=6. CR=0. - ZMIN=-2. - FLAT END MILL)
+(T2 D=4. CR=2. - ZMIN=-1.25 - BALL END MILL)
+G90 G94 G91.1 G40 G49 G17
+G21
+G28 G91 Z0.
+G90
+
+(CONTOUR 1 OUTER)
+T1 M6
+S18000 M3
+G17 G90 G94
+G54
+M8
+G0 X0. Y-3.
+G43 Z15. H1
+Z5.
+G1 Z0. F50.
+Z-1.
+G2 X-3. Y0. I0. J3. F1600.
+G1 Y20.
+";
+    assert!(text.starts_with(start), "{text}");
+    // The spindle stops and the tool rises before the next tool; coolant goes off for the change.
+    let change = "\
+G0 Z15.
+M5
+G28 G91 Z0.
+G90
+
+(POCKET1)
+M9
+T2 M6
+S24000 M3
+G17 G90 G94
+G54
+M8
+G0 X13.5 Y8.5
+G43 Z15. H2
+Z5.
+G1 Z0. F50.
+";
+    assert!(text.contains(change), "{text}");
+    let end = "\
+G0 Z15.
+
+M9
+M5
+G28 G91 Z0.
+G90
+G28 G91 X0. Y0.
+G90
+M30
+";
+    assert!(text.ends_with(end), "{text}");
+    assert_modal_with_points(&text);
+    // Feeds after a cut in the same mode leave the code out.
+    assert!(text.lines().any(|l| l == "Z-1."), "{text}");
+    assert!(readback(&text, &program, &post.base).unwrap().within());
+
+    // The multi-axis writer writes the very same program for a 3-axis machine.
+    let indexed = MachineProgram {
+        name: program.name.clone(),
+        operations: program
+            .operations
+            .iter()
+            .map(|o| {
+                MachineOperation::Indexed(IndexedOperation {
+                    name: o.name.clone(),
+                    tool: o.tool.clone(),
+                    spindle_rpm: o.spindle_rpm,
+                    coolant: o.coolant,
+                    rotary: vec![],
+                    path: o.path.clone(),
+                })
+            })
+            .collect(),
+        work_offset: None,
+    };
+    let machine = Machine::three_axis();
+    let text5 = emit_program(&indexed, &post, &machine).unwrap();
+    assert_eq!(text5, text);
+    assert!(readback_program(&text5, &indexed, &post, &machine).unwrap().within());
+
+    // The work offset is written at every operation.
+    let mut offset = program.clone();
+    offset.work_offset = Some(2);
+    let text = emit(&offset, &post.base).unwrap();
+    assert_eq!(lines_with(&text, "G55").len(), 2);
+    assert!(lines_with(&text, "G54").is_empty());
+    // An arc leaves out the end coordinate that does not change.
+    let half = Toolpath {
+        moves: vec![
+            Move::Rapid { to: Vec3::new(1.0, 0.0, 5.0) },
+            Move::Feed { to: Vec3::new(1.0, 0.0, 0.0), feed: 100.0 },
+            Move::Arc { to: Vec3::new(-1.0, 0.0, -0.5), center: Vec2::ZERO, ccw: true, feed: 100.0 },
+        ],
+    };
+    let mut arc = program.clone();
+    arc.operations.truncate(1);
+    arc.operations[0].path = half;
+    let text = emit(&arc, &post.base).unwrap();
+    assert!(text.contains("\nG3 X-1. Z-0.5 I-1. J0.\n"), "{text}");
+    assert!(readback(&text, &arc, &post.base).unwrap().within());
+    // Lines after every operation's motion.
+    let closing = Post { operation_end: vec!["G17".into()], ..post.base.clone() };
+    let text = emit(&program, &closing).unwrap();
+    assert!(text.contains("G0 Z15.\nG17\nM5\n") && text.contains("G0 Z15.\nG17\n\nM9\n"), "{text}");
+}
+
+#[test]
+fn a_dialect_post_retracts_before_every_turn_of_a() {
+    let post = dialect();
+    let machine = Machine::four_axis_a();
+    let side = |name: &str, a: f64| indexed_op(name, 3, vec![deg(a)], contour_path().moves);
+    let program = MachineProgram {
+        name: "wrap".into(),
+        operations: vec![side("side 0", 0.0), side("side 90", 90.0), MachineOperation::Continuous(op5("helix", helix_of(1)))],
+        work_offset: None,
+    };
+    let text = emit_program(&program, &post, &machine).unwrap();
+    // No lowest Z where A turns.
+    assert!(text.starts_with("(WRAP)\n(T3 D=6. CR=0. - FLAT END MILL)\n"), "{text}");
+    // The first index turns A after the start's retract; the next one retracts before its
+    // comment, then A turns alone and the tool comes back across and down with its offset.
+    assert!(text.contains("\n(SIDE 0)\nT3 M6\nS9000 M3\nG17 G90 G94\nG54\nG0 A0.\nG0 X0. Y-3.\nG43 Z10. H3\nZ2.\n"), "{text}");
+    assert!(text.contains("\nG0 Z10.\nG28 G91 Z0.\nG90\n\n(SIDE 90)\nG17 G90 G94\nG54\nG0 A90.\nG0 X0. Y-3.\nG43 Z10. H3\nZ2.\n"), "{text}");
+    assert_modal_with_points(&text);
+    // Inverse time: F with at most four decimals on every block that turns A, G94 before the
+    // next cut that does not.
+    let mut inverse = false;
+    let mut timed = 0;
+    for line in text.lines() {
+        if line.contains("G93") {
+            inverse = true;
+        }
+        if line.contains("G94") {
+            inverse = false;
+        }
+        if inverse && line.contains(" A") {
+            let f = line.split(' ').find_map(|w| w.strip_prefix('F')).unwrap_or_else(|| panic!("no F in `{line}`"));
+            assert!(f.split('.').nth(1).is_some_and(|d| d.len() <= 4), "`F{f}` in `{line}`");
+            timed += 1;
+        }
+        if let Some(a) = line.split(' ').find_map(|w| w.strip_prefix('A')) {
+            assert!(a.split('.').nth(1).is_some_and(|d| d.len() <= 3), "`A{a}` in `{line}`");
+        }
+        if !inverse && line.starts_with('X') {
+            assert!(!line.contains(" A"), "a turn of A per minute: `{line}`");
+        }
+    }
+    assert!(timed >= 120, "{timed}");
+    assert!(text.contains("G94 Z30. F1000.\n\nM9\nM5\nG28 G91 Z0.\nG90\n"), "{text}");
+    let rb = readback_program(&text, &program, &post, &machine).unwrap();
+    assert!(rb.within(), "{rb:?}");
+}
+
+/// The lines of the rewinds in `text`: from the draw out of the cut to the first block after
+/// the plunge back.
+fn rewinds_in(text: &str) -> Vec<Vec<&str>> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines.iter().enumerate().filter(|(_, l)| l.starts_with("G94 Z") && l.ends_with(" F500.")).map(|(i, _)| lines[i..i + 8].to_vec()).collect()
+}
+
+#[test]
+fn a_long_helix_rewinds_within_the_limits_of_a() {
+    let post = dialect();
+    // The first plunge at the rewinds' plunge feed: a planned move like a rewind's is still
+    // looked for in what is written.
+    let mut path = helix_of(5);
+    if let Some(Move5::Feed { feed, .. }) = path.moves.get_mut(1) {
+        *feed = 250.0;
+    }
+    let program = program5(path);
+    // An A that turns one turn either way could not cut five turns in one go.
+    assert!(emit5(&program, &Post5 { rewind: None, ..post.clone() }, &limited_a()).is_err());
+    let text = emit5(&program, &post, &limited_a()).unwrap();
+    let angles: Vec<f64> = text.lines().filter_map(|l| l.split(' ').find_map(|w| w.strip_prefix('A'))).map(|a| a.parse().unwrap()).collect();
+    assert!(angles.iter().all(|a| a.abs() <= 360.0), "{text}");
+    // Up to 360°, back to -360° (the same position), on to 360° again, back, on to 1800° - 1440°.
+    assert_eq!(angles.last(), Some(&360.0));
+    let rewinds = rewinds_in(&text);
+    assert_eq!(rewinds.len(), 2, "{text}");
+    assert_eq!(
+        rewinds[0],
+        ["G94 Z45. F500.", "G28 G91 Z0.", "G90", "G0 A-360.", "G0 X10. Y0.", "G43 Z45. H3", "G1 Z20. F250.", "G93 X10.042 Z19.993 A-358.5 F571.2171"]
+    );
+    assert!(rewinds[1][0..7].join("\n").starts_with("G94 Z45. F500.\nG28 G91 Z0.\nG90\nG0 A-360.\nG0 X30. Y0.\nG43 Z45. H3\nG1 Z20. F250."));
+    let rb = readback5(&text, &program, &post, &limited_a()).unwrap();
+    assert!(rb.within(), "{rb:?}");
+    // Each rewind draws out 25 mm and plunges 25 mm back at feed.
+    close(rb.cut_length, rb.planned_cut_length + 2.0 * 50.0, 1e-3 * rb.planned_cut_length);
+    let gone = Program5 { operations: vec![op5("op", helix_of(4))], ..program.clone() };
+    assert!(!readback5(&text, &gone, &post, &limited_a()).unwrap().within());
+
+    // Limits that a cut reaches part way through a piece: the piece is split there, each part
+    // timed for its share.
+    let tight = Machine::four_axis_a_with(Vec3::ZERO, false, Some((-TAU + 0.05, TAU - 0.05)));
+    let text = emit5(&program, &post, &tight).unwrap();
+    let limit = (TAU - 0.05).to_degrees();
+    for a in text.lines().filter_map(|l| l.split(' ').find_map(|w| w.strip_prefix('A'))) {
+        assert!(a.parse::<f64>().unwrap().abs() <= limit + 1e-3, "A{a}");
+    }
+    // Under two turns between the limits: one turn back each time.
+    assert_eq!(rewinds_in(&text).len(), 5, "{text}");
+    let rb = readback5(&text, &program, &post, &tight).unwrap();
+    assert!(rb.within(), "{rb:?}");
+    close(rb.cut_minutes, rb.planned_cut_minutes + 5.0 * (25.0 / 500.0 + 25.0 / 250.0), 2e-3 * rb.planned_cut_minutes);
+
+    // Without limits the helix still adds up its turns.
+    let text = emit5(&program, &post, &Machine::four_axis_a()).unwrap();
+    assert!(rewinds_in(&text).is_empty() && text.contains(" A1800."), "{text}");
+    // A rewind needs room for a whole turn.
+    let narrow = Machine::four_axis_a_with(Vec3::ZERO, false, Some((-deg(170.0), deg(170.0))));
+    assert!(emit5(&program, &post, &narrow).is_err());
+}
+
+#[test]
+fn dialect_switches_validate_and_default_to_the_old_output() {
+    let post = dialect();
+    let text = serde_json::to_string(&post).unwrap();
+    assert_eq!(serde_json::from_str::<Post5>(&text).unwrap(), post);
+    // Posts without the switches write none of them, and read back as they were.
+    let old = serde_json::to_string(&Post::rs274()).unwrap();
+    for key in ["tool_list", "safe_retract", "modal_motion", "blank_lines", "comment_chars", "operation_start"] {
+        assert!(!old.contains(key), "{old}");
+    }
+    let old5 = serde_json::to_string(&Post5::mach3_4axis()).unwrap();
+    assert!(!old5.contains("rewind") && !old5.contains("inverse_time_decimals") && !old5.contains("safe_rotate_first"), "{old5}");
+    let broken = |f: &dyn Fn(&mut Post5)| {
+        let mut p = dialect();
+        f(&mut p);
+        p.validate().is_err()
+    };
+    assert!(broken(&|p| p.base.comment_chars = Some("()".into())));
+    assert!(broken(&|p| p.base.comment_chars = Some("x".repeat(100))));
+    assert!(broken(&|p| p.base.safe_retract = Some(SafeRetract { lines: vec![], at_start: true, at_tool_change: false, at_end: false })));
+    assert!(broken(&|p| p.base.operation_start = vec!["G93".into()]));
+    assert!(broken(&|p| p.base.operation_end = vec!["G0 {nope}".into()]));
+    assert!(broken(&|p| p.inverse_time_decimals = Some(13)));
+    assert!(broken(&|p| p.rewind = Some(Rewind { distance: f64::NAN, retract_feed: 500.0, plunge_feed: 250.0 })));
+    assert!(broken(&|p| p.rewind = Some(Rewind { distance: 25.0, retract_feed: 0.0, plunge_feed: 250.0 })));
+    assert!(broken(&|p| {
+        p.tcp = Some(Tcp { on: vec!["G43.4 H{tool}".into()], off: vec!["G49".into()] });
+        p.inverse_time = false;
+    }));
+
+    // A return home makes the axes it names unknown; other incremental moves are refused.
+    let back = parse("G0 X1 Y1 Z1\nG28 G91 Z0.\nG90\nG0 X2 Y2\nG43 Z5. H1").unwrap();
+    assert_eq!(back, vec![Move::Rapid { to: Vec3::new(1.0, 1.0, 1.0) }, Move::Rapid { to: Vec3::new(2.0, 2.0, 5.0) }]);
+    assert!(parse("G28 G91 Z0.\nG0 X1 Y1 Z1").is_err());
+    assert!(parse("G91 G0 X1").is_err());
+    let a = [AxisLetter::A];
+    let w = parse5("G0 X1 Y1 Z1 A0\nG28 G91 Z0.\nG90\nG0 A90.\nG0 X2 Y2\nG43 Z5. H1", &a).unwrap();
+    assert_eq!(w.len(), 2);
+    let JointWords::Rapid { linear, rotary, .. } = &w[1] else { panic!("{w:?}") };
+    close3(*linear, Vec3::new(2.0, 2.0, 5.0), 1e-12);
+    close(rotary[0], deg(90.0), 1e-12);
+    assert!(parse5("G28 G91 Z0.\nG0 X1 Y1 Z1 A0", &a).is_err());
+}
