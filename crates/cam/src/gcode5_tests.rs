@@ -27,7 +27,7 @@ fn tool() -> Tool {
 }
 
 fn op5(name: &str, path: Toolpath5) -> Operation5 {
-    Operation5 { name: name.into(), tool: tool(), spindle_rpm: 12000.0, coolant: true, path }
+    Operation5 { name: name.into(), tool: tool(), spindle_rpm: 12000.0, coolant: true, path, plunge_feed: None }
 }
 
 fn program5(path: Toolpath5) -> Program5 {
@@ -131,6 +131,7 @@ fn three_axis_programs_match_the_3axis_emitter() {
             spindle_rpm: 9000.0,
             coolant: false,
             path: Toolpath5::from_3axis(&lines_only, 0.001).unwrap(),
+            plunge_feed: None,
         }],
         work_offset: None,
     };
@@ -573,7 +574,7 @@ fn turning_cut(name: &str, number: u32) -> MachineOperation {
             Move5::Rapid { to: Pose::new(radial(deg(20.0)) * 30.0, radial(deg(20.0))) },
         ],
     };
-    MachineOperation::Continuous(Operation5 { name: name.into(), tool, spindle_rpm: 12000.0, coolant: true, path })
+    MachineOperation::Continuous(Operation5 { name: name.into(), tool, spindle_rpm: 12000.0, coolant: true, path, plunge_feed: None })
 }
 
 #[test]
@@ -1030,11 +1031,19 @@ fn a_dialect_post_retracts_before_every_turn_of_a() {
     assert!(rb.within(), "{rb:?}");
 }
 
-/// The lines of the rewinds in `text`: from the draw out of the cut to the first block after
-/// the plunge back.
+/// The lines of the rewinds in `text`: from the draw out of the cut to the first cut in
+/// inverse time after the way back in.
 fn rewinds_in(text: &str) -> Vec<Vec<&str>> {
     let lines: Vec<&str> = text.lines().collect();
-    lines.iter().enumerate().filter(|(_, l)| l.starts_with("G94 Z") && l.ends_with(" F500.")).map(|(i, _)| lines[i..i + 8].to_vec()).collect()
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("G94 Z") && l.ends_with(" F500."))
+        .map(|(i, _)| {
+            let end = lines[i..].iter().position(|l| l.starts_with("G93")).map_or(lines.len(), |k| i + k + 1);
+            lines[i..end].to_vec()
+        })
+        .collect()
 }
 
 #[test]
@@ -1056,15 +1065,37 @@ fn a_long_helix_rewinds_within_the_limits_of_a() {
     assert_eq!(angles.last(), Some(&360.0));
     let rewinds = rewinds_in(&text);
     assert_eq!(rewinds.len(), 2, "{text}");
+    // Fed 1 mm out of the cut, up at rapid, the turn after the safe retract, back at rapid to
+    // 1 mm above the cut and fed the rest of the way in at the plunge feed.
     assert_eq!(
         rewinds[0],
-        ["G94 Z45. F500.", "G28 G91 Z0.", "G90", "G0 A-360.", "G0 X10. Y0.", "G43 Z45. H3", "G1 Z20. F250.", "G93 X10.042 Z19.993 A-358.5 F571.2171"]
+        [
+            "G94 Z21. F500.",
+            "G0 Z45.",
+            "G28 G91 Z0.",
+            "G90",
+            "G0 A-360.",
+            "G0 X10. Y0.",
+            "G43 Z21. H3",
+            "G1 Z20. F250.",
+            "G93 X10.042 Z19.993 A-358.5 F571.2171"
+        ]
     );
-    assert!(rewinds[1][0..7].join("\n").starts_with("G94 Z45. F500.\nG28 G91 Z0.\nG90\nG0 A-360.\nG0 X30. Y0.\nG43 Z45. H3\nG1 Z20. F250."));
+    assert!(rewinds[1].join("\n").starts_with("G94 Z21. F500.\nG0 Z45.\nG28 G91 Z0.\nG90\nG0 A-360.\nG0 X30. Y0.\nG43 Z21. H3\nG1 Z20. F250."));
     let rb = readback5(&text, &program, &post, &limited_a()).unwrap();
     assert!(rb.within(), "{rb:?}");
-    // Each rewind draws out 25 mm and plunges 25 mm back at feed.
-    close(rb.cut_length, rb.planned_cut_length + 2.0 * 50.0, 1e-3 * rb.planned_cut_length);
+    // Each rewind feeds 1 mm out and 1 mm back in.
+    close(rb.cut_length, rb.planned_cut_length + 2.0 * 2.0, 1e-3 * rb.planned_cut_length);
+    // The way back in takes the operation's plunge feed, else its tool's.
+    let mut own = program.clone();
+    own.operations[0].plunge_feed = Some(120.0);
+    let text = emit5(&own, &post, &limited_a()).unwrap();
+    assert!(!rewinds_in(&text).is_empty() && rewinds_in(&text).iter().all(|r| r.contains(&"G1 Z20. F120.")), "{text}");
+    assert!(readback5(&text, &own, &post, &limited_a()).unwrap().within());
+    let mut tool_feed = program.clone();
+    tool_feed.operations[0].tool.plunge_feed = Some(90.0);
+    let text = emit5(&tool_feed, &post, &limited_a()).unwrap();
+    assert!(!rewinds_in(&text).is_empty() && rewinds_in(&text).iter().all(|r| r.contains(&"G1 Z20. F90.")), "{text}");
     let gone = Program5 { operations: vec![op5("op", helix_of(4))], ..program.clone() };
     assert!(!readback5(&text, &gone, &post, &limited_a()).unwrap().within());
 
@@ -1080,7 +1111,14 @@ fn a_long_helix_rewinds_within_the_limits_of_a() {
     assert_eq!(rewinds_in(&text).len(), 5, "{text}");
     let rb = readback5(&text, &program, &post, &tight).unwrap();
     assert!(rb.within(), "{rb:?}");
-    close(rb.cut_minutes, rb.planned_cut_minutes + 5.0 * (25.0 / 500.0 + 25.0 / 250.0), 2e-3 * rb.planned_cut_minutes);
+    close(rb.cut_minutes, rb.planned_cut_minutes + 5.0 * (1.0 / 500.0 + 1.0 / 250.0), 2e-3 * rb.planned_cut_minutes);
+    // The writer says what the rewinds add, so the operation's minutes add up to the program's.
+    let (again, written) = emit_program_report(&MachineProgram::from(&program), &post, &tight).unwrap();
+    assert_eq!(again, text);
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].rewinds, 5);
+    close(written[0].rewind_minutes, 5.0 * (1.0 / 500.0 + 1.0 / 250.0), 1e-9);
+    close(rb.planned_cut_minutes + written[0].rewind_minutes, rb.cut_minutes, 2e-3 * rb.cut_minutes);
 
     // Without limits the helix still adds up its turns.
     let text = emit5(&program, &post, &Machine::four_axis_a()).unwrap();
@@ -1132,4 +1170,196 @@ fn dialect_switches_validate_and_default_to_the_old_output() {
     close3(*linear, Vec3::new(2.0, 2.0, 5.0), 1e-12);
     close(rotary[0], deg(90.0), 1e-12);
     assert!(parse5("G28 G91 Z0.\nG0 X1 Y1 Z1 A0", &a).is_err());
+}
+
+#[test]
+fn tool_centre_point_control_is_never_turned_off_by_a_length_offset() {
+    let machine = Machine::table_table_ac_at(Vec3::new(0.0, 0.0, -50.0), Vec3::new(10.0, 5.0, -50.0)).with_work_origin(Vec3::new(20.0, -10.0, 30.0));
+    let tcp = Post5::tcp_g43_4();
+    let with = |f: &dyn Fn(&mut Post5)| {
+        let mut p = tcp.clone();
+        f(&mut p);
+        p
+    };
+    // A G43 with the first Z would come after G43.4 and turn it off: refused, never written.
+    let first_z = with(&|p| p.base.tool_length_on_first_z = true);
+    assert!(first_z.validate().is_err());
+    assert!(emit5(&program5(wander()), &first_z, &machine).is_err());
+    // So are lines written while it is on that cancel it.
+    assert!(with(&|p| p.base.operation_start = vec!["G43 H{tool}".into()]).validate().is_err());
+    assert!(with(&|p| p.base.spindle_on = vec!["M3 S{rpm}".into(), "G43.1 Z0".into()]).validate().is_err());
+    assert!(with(&|p| p.safe_rotate = vec!["G49".into(), "G53 G0 Z0".into()]).validate().is_err());
+    // A tool change comes before it is switched on, and may set a length offset.
+    let change = with(&|p| p.base.tool_change = vec!["M5".into(), "T{tool} M6".into(), "G43 H{tool}".into()]);
+    change.validate().unwrap();
+    let program = program5(wander());
+    let text = emit5(&program, &change, &machine).unwrap();
+    let after = &text[text.find("G43.4 H3\n").unwrap()..];
+    let off = after.find("\nG49\n").unwrap();
+    assert!(!after[..off].lines().skip(1).any(|l| l.split(' ').any(|w| w.starts_with("G43") || w == "G49")), "{text}");
+    assert!(readback5(&text, &program, &change, &machine).unwrap().within());
+    // The reader takes a G43 (or a G43.x other than G43.4) as turning it off, as a controller
+    // does, so a length offset slipped in after G43.4 fails the read-back.
+    let a = machine.letters();
+    let w = parse5("G43.4 H1\nG0 X0 Y0 Z5 A0 C0\nG43 Z6 H1\nG0 X1\nG43.4 H1\nG0 X2\nG43.1 Z0\nG0 X3", &a).unwrap();
+    let tcp_of: Vec<bool> = w
+        .iter()
+        .filter_map(|w| match w {
+            JointWords::Rapid { tcp, .. } => Some(*tcp),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tcp_of, [true, false, false, true, false, false]);
+    let slipped = text.replacen("G43.4 H3\n", "G43.4 H3\nG43 H3\n", 1);
+    assert!(!readback5(&slipped, &program, &change, &machine).unwrap().within());
+}
+
+/// Fails at the first rapid (`G0`, a return home or a move in machine coordinates) written
+/// while inverse time (`G93`) is in force.
+fn assert_no_rapid_in_inverse_time(text: &str) {
+    let mut inverse = false;
+    for line in text.lines() {
+        let ws: Vec<&str> = line.split(' ').collect();
+        if ws.contains(&"G93") {
+            inverse = true;
+        }
+        if ws.contains(&"G94") {
+            inverse = false;
+        }
+        assert!(!inverse || !ws.iter().any(|w| ["G0", "G00", "G28", "G30", "G53"].contains(w)), "a rapid in inverse time: `{line}`\n{text}");
+    }
+}
+
+#[test]
+fn feed_per_minute_comes_back_before_every_rapid() {
+    let machine = Machine::four_axis_a();
+    for post in [Post5::mach3_4axis(), Post5::linuxcnc_4axis(), Post5::grblhal_4axis(), Post5::rs274_5axis(), dialect()] {
+        for path in [helix(), helix_of(1), radial_drops(), linked_cuts()] {
+            let program = program5(path);
+            let text = emit5(&program, &post, &machine).unwrap();
+            assert_no_rapid_in_inverse_time(&text);
+            assert!(readback5(&text, &program, &post, &machine).unwrap().within(), "{}", post.base.name);
+        }
+    }
+    // At the end of a wrapped cut: G94, then the rapid up.
+    let mut up = helix_of(1);
+    up.moves.pop();
+    up.moves.push(Move5::Rapid { to: Pose::new(Vec3::new(10.0, 0.0, 0.0) + radial(0.0) * 30.0, radial(0.0)) });
+    let text = emit5(&program5(up), &dialect(), &machine).unwrap();
+    assert!(text.contains("\nG94\nG0 Z30.\n"), "{text}");
+    // Rewinds too.
+    let text = emit5(&program5(helix_of(5)), &dialect(), &limited_a()).unwrap();
+    assert!(!rewinds_in(&text).is_empty());
+    assert_no_rapid_in_inverse_time(&text);
+}
+
+#[test]
+fn a_rewind_stays_within_the_z_travel() {
+    let post = dialect();
+    let program = program5(helix_of(3));
+    let travel = |top: f64| Machine { linear_limits: Some((Vec3::new(-100.0, -100.0, -100.0), Vec3::new(100.0, 100.0, top))), ..limited_a() };
+    let text = emit5(&program, &post, &travel(100.0)).unwrap();
+    assert!(rewinds_in(&text).first().is_some_and(|r| r.contains(&"G0 Z45.")), "{text}");
+    // Less room above the cut: the draw out stops at the top of the travel, still above the
+    // operation's clearance (its rapids at Z30), and so does every block.
+    let text = emit5(&program, &post, &travel(35.0)).unwrap();
+    let rewinds = rewinds_in(&text);
+    assert!(!rewinds.is_empty() && rewinds.iter().all(|r| r.contains(&"G0 Z35.")), "{text}");
+    for z in text.lines().filter_map(|l| l.split(' ').find_map(|w| w.strip_prefix('Z'))) {
+        assert!(z.parse::<f64>().unwrap() <= 35.0, "Z{z}\n{text}");
+    }
+    assert!(readback5(&text, &program, &post, &travel(35.0)).unwrap().within());
+    // A clearance above the travel: refused, naming the operation, the Z it needs and the travel.
+    let high = Post5 { clearance: Some(40.0), ..post.clone() };
+    let e = emit5(&program, &high, &travel(35.0)).unwrap_err().to_string();
+    assert!(e.contains("`op`") && e.contains("Z up to 40.000") && e.contains("-100.000 to 35.000"), "{e}");
+}
+
+/// A wrapped helix of `turns` turns at radius 20 in steps of 30°, 1 mm along X a turn.
+fn coarse_helix(turns: usize) -> Toolpath5 {
+    let n = 12 * turns;
+    let pose = |k: usize| {
+        let th = TAU * k as f64 / 12.0;
+        Pose::new(Vec3::new(k as f64 / 12.0, 0.0, 0.0) + radial(th) * 20.0, radial(th))
+    };
+    let mut moves = vec![Move5::Rapid { to: Pose::new(pose(0).up(10.0), radial(0.0)) }, Move5::Feed { to: pose(0), feed: 200.0 }];
+    moves.extend((1..=n).map(|k| Move5::Feed { to: pose(k), feed: 300.0 }));
+    moves.push(Move5::Feed { to: Pose::new(pose(n).up(10.0), pose(n).axis), feed: 1000.0 });
+    Toolpath5 { moves }
+}
+
+#[test]
+fn a_long_helix_keeps_its_angles_bounded_and_narrow_limits_say_so() {
+    // 1700 turns add up to more than 10 000 radians of A.
+    let post = Post5 { tolerance: 1.0, ..dialect() };
+    let program = program5(coarse_helix(1700));
+    let text = emit5(&program, &Post5 { rewind: None, ..post.clone() }, &Machine::four_axis_a()).unwrap();
+    assert!(text.contains(" A612000. "), "the turns add up without end");
+    let (text, written) = emit_program_report(&MachineProgram::from(&program), &post, &limited_a()).unwrap();
+    for a in text.lines().filter_map(|l| l.split(' ').find_map(|w| w.strip_prefix('A'))) {
+        assert!(a.parse::<f64>().unwrap().abs() <= 360.0, "A{a}");
+    }
+    assert_eq!(written[0].rewinds, rewinds_in(&text).len());
+    assert!((845..=851).contains(&written[0].rewinds), "{written:?}");
+    // Limits narrower than a turn: the cut would have to go on past them, and that is what the
+    // refusal says (not a solution flip).
+    let short = Machine::four_axis_a_with(Vec3::ZERO, false, Some((0.0, deg(359.0))));
+    let e = emit5(&program5(helix_of(1)), &dialect(), &short).unwrap_err().to_string();
+    assert!(e.contains("beyond its limits") && e.contains("less than a whole turn") && !e.contains("flip"), "{e}");
+}
+
+#[test]
+fn an_operation_starts_at_the_turn_that_needs_the_fewest_rewinds() {
+    // The first helix ends at A360, the upper limit; the second starts at the same angle of the
+    // part, so it starts at A0 rather than at the limit and runs to 360° with no rewind.
+    let post = dialect();
+    let program = Program5 { name: "p".into(), operations: vec![op5("first", helix_of(1)), op5("second", helix_of(1))], work_offset: None };
+    let (text, written) = emit_program_report(&MachineProgram::from(&program), &post, &limited_a()).unwrap();
+    assert_eq!(written.iter().map(|w| w.rewinds).collect::<Vec<_>>(), [0, 0], "{text}");
+    let second = &text[text.find("(SECOND)").unwrap()..];
+    assert!(second.contains("\nG0 A0.\n"), "{second}");
+    assert!(readback5(&text, &program, &post, &limited_a()).unwrap().within());
+    // Three turns within ±360°: one rewind.
+    let (text, written) = emit_program_report(&MachineProgram::from(&program5(helix_of(3))), &post, &limited_a()).unwrap();
+    assert_eq!(written[0].rewinds, 1, "{text}");
+}
+
+/// Two cuts along X at A = 0° and A = 40°, joined by a link at the clearance radius that turns
+/// A 2° a rapid while it moves back along X, as a rotary toolpath's links do.
+fn linked_cuts() -> Toolpath5 {
+    let at = |x: f64, th: f64, r: f64| Pose::new(Vec3::new(x, 0.0, 0.0) + radial(th) * r, radial(th));
+    let mut moves = vec![
+        Move5::Rapid { to: at(0.0, 0.0, 30.0) },
+        Move5::Feed { to: at(0.0, 0.0, 20.0), feed: 200.0 },
+        Move5::Feed { to: at(20.0, 0.0, 20.0), feed: 400.0 },
+        Move5::Rapid { to: at(20.0, 0.0, 30.0) },
+    ];
+    moves.extend((1..=20).map(|k| Move5::Rapid { to: at(20.0 - k as f64, deg(2.0 * k as f64), 30.0) }));
+    moves.extend([
+        Move5::Feed { to: at(0.0, deg(40.0), 20.0), feed: 200.0 },
+        Move5::Feed { to: at(20.0, deg(40.0), 20.0), feed: 400.0 },
+        Move5::Rapid { to: at(20.0, deg(40.0), 30.0) },
+    ]);
+    Toolpath5 { moves }
+}
+
+#[test]
+fn a_link_that_only_turns_a_is_one_retract_and_one_turn() {
+    let machine = Machine::four_axis_a();
+    let program = program5(linked_cuts());
+    for post in [dialect(), Post5::mach3_4axis(), Post5::rs274_5axis()] {
+        let text = emit5(&program, &post, &machine).unwrap();
+        let turns: Vec<&str> = lines_with(&text, "G0 A");
+        let expected = if post.base.trailing_decimal { ["G0 A0.", "G0 A40."] } else { ["G0 A0", "G0 A40"] };
+        assert_eq!(turns, expected, "{text}");
+        if let Some(first) = post.safe_rotate.first() {
+            // One before each turn of A at most (the program's start, the link) and the end's.
+            assert!(text.lines().filter(|l| l == first).count() <= 3, "{text}");
+        }
+        assert!(readback5(&text, &program, &post, &machine).unwrap().within(), "{}", post.base.name);
+    }
+    // Where the rotaries turn wherever the tool is, the link is followed as planned.
+    let bare = Post5 { clearance_retract: false, safe_rotate: Vec::new(), ..Post5::mach3_4axis() };
+    let text = emit5(&program, &bare, &machine).unwrap();
+    assert_eq!(lines_with(&text, "G0 A").len(), 21, "{text}");
 }

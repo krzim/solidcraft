@@ -251,6 +251,10 @@ pub struct Operation5 {
     pub spindle_rpm: f64,
     pub coolant: bool,
     pub path: Toolpath5,
+    /// The feed of its plunges (mm/min), which the way back into the cut after a rewind takes
+    /// ([`crate::gcode5::Rewind`]); left out, the tool's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plunge_feed: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

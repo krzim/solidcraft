@@ -9,10 +9,11 @@
 //! are compared both ways round with the planned cutting moves: the tip with the planned line,
 //! the axis with the planned turn of the nearest one. Rounding to the post's decimals, the
 //! pieces the cuts were broken into, and anything lost between the two show up as deviation.
-//! The draw out of the cut and the plunge back of a post's rewinds are not in the toolpaths:
-//! of a move that may be one, only its end in the cut is held against them (the planned moves
-//! are still all looked for in what was written), and it counts in the cut length and time as
-//! written like any other feed.
+//! The draw out of the cut and the way back in of a post's rewinds are not in the toolpaths:
+//! of a move that may be one (straight along Z at the rewind's retract feed or a plunge feed of
+//! the program), only its end in the cut is held against them (the planned moves are still all
+//! looked for in what was written), and it counts in the cut length and time as written like
+//! any other feed.
 
 use std::collections::HashMap;
 use std::f64::consts::{PI, TAU};
@@ -110,13 +111,14 @@ struct State {
     tcp: bool,
 }
 
-/// Whether a cut from `from` to `to` at `feed` (mm/min) is the draw out of the cut or the plunge
-/// back of one of the post's rewinds ([`crate::gcode5::Rewind`]): in machine coordinates on a
-/// machine whose rotaries all turn the table (so the tool is along Z), straight along Z by at
-/// most the rewind's distance with every other axis held, at the rewind's retract or plunge
-/// feed as written. Such a move only passes through the room the tool leaves above a point of
-/// the cut, so that point is all that is checked of it against the toolpaths.
-fn rewind_move(post: &Post5, machine: &Machine, from: &State, to: &State, feed: f64) -> bool {
+/// Whether a cut from `from` to `to` at `feed` (mm/min) is the draw out of the cut or the way
+/// back in of one of the post's rewinds ([`crate::gcode5::Rewind`]): in machine coordinates on
+/// a machine whose rotaries all turn the table (so the tool is along Z), straight along Z by at
+/// most the rewind's distance with every other axis held, at one of `feeds` (the rewind's and
+/// the operations' plunge feeds) as written. Such a move only passes through the room the tool
+/// leaves above a point of the cut, so that point is all that is checked of it against the
+/// toolpaths.
+fn rewind_move(post: &Post5, machine: &Machine, from: &State, to: &State, feed: f64, feeds: &[f64]) -> bool {
     let Some(rewind) = post.rewind else { return false };
     if from.tcp || to.tcp || machine.rotaries.iter().any(|r| r.carrier == Carrier::Head) {
         return false;
@@ -127,7 +129,7 @@ fn rewind_move(post: &Post5, machine: &Machine, from: &State, to: &State, feed: 
         && from.linear.x == to.linear.x
         && from.linear.y == to.linear.y
         && (to.linear.z - from.linear.z).abs() <= rewind.distance + 2.0 * digit
-        && [rewind.retract_feed, rewind.plunge_feed].iter().any(|r| (feed - r).abs() <= feed_digit)
+        && feeds.iter().any(|r| (feed - r).abs() <= feed_digit)
 }
 
 fn pose_at(machine: &Machine, linear: Vec3, rotary: &[f64], tcp: bool) -> Pose {
@@ -142,6 +144,17 @@ pub fn readback_program(text: &str, program: &MachineProgram, post: &Post5, mach
     let written = parse5(text, &machine.letters())?;
     let (allowed_tip, allowed_axis) = allowance5(post, machine, program)?;
     let reach = (allowed_tip * 10.0).max(1.0);
+    // The feeds a rewind's moves are written at.
+    let rewind_feeds: Vec<f64> = match post.rewind {
+        Some(r) => [r.retract_feed, r.plunge_feed]
+            .into_iter()
+            .chain(program.operations.iter().filter_map(|op| match op {
+                MachineOperation::Continuous(o) => o.plunge_feed.or(o.tool.plunge_feed),
+                MachineOperation::Indexed(_) => None,
+            }))
+            .collect(),
+        None => Vec::new(),
+    };
 
     // The written cutting moves, followed point by point.
     let mut samples: Vec<Pose> = Vec::new();
@@ -156,7 +169,7 @@ pub fn readback_program(text: &str, program: &MachineProgram, post: &Post5, mach
                 if let Some(from) = state.as_ref().filter(|s| s.tcp == *tcp) {
                     // Of a move that may be a rewind's, only its end in the cut is held
                     // against the toolpaths.
-                    let rewind = !*inverse_time && rewind_move(post, machine, from, &to, *f * *mm_per_unit);
+                    let rewind = !*inverse_time && rewind_move(post, machine, from, &to, *f * *mm_per_unit, &rewind_feeds);
                     if rewind {
                         let low = if from.linear.z <= to.linear.z { from } else { &to };
                         samples.push(pose_at(machine, low.linear, &low.rotary, false));

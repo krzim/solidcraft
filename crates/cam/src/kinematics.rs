@@ -770,6 +770,10 @@ pub fn solve(machine: &Machine, path: &Toolpath5, opts: &SolveOptions) -> Result
 /// angle tolerance of its turn all along the piece (see [`piece_within`]; `TooLarge` past
 /// [`MAX_PIECES`]). Every position is checked against the machine's limits (`Unsafe`, naming
 /// the move and axis), and every feed must be [`MIN_FEED`] to [`MAX_FEED`] mm/min.
+///
+/// A rotary without limits is followed within a turn of zero and its whole turns are kept
+/// apart, so a long helix adds up its angles without end (they are written unwound) and never
+/// reaches angles the solver refuses.
 pub fn solve_from(machine: &Machine, path: &Toolpath5, opts: &SolveOptions, previous: Option<&Joints>) -> Result<Vec<JointMove>> {
     machine.validate()?;
     opts.validate()?;
@@ -785,7 +789,29 @@ pub fn solve_from(machine: &Machine, path: &Toolpath5, opts: &SolveOptions, prev
         }
     };
     let mut out = Vec::new();
+    // `joints` is where the axes are with the whole turns of the rotaries without limits taken
+    // out (`turns`, a count per joint); `lift` puts them back.
+    let mut turns = vec![0.0f64; machine.rotaries.len()];
+    let rebase = |j: &mut Joints, turns: &mut [f64]| {
+        for ((r, a), k) in machine.rotaries.iter().zip(j.rotary.iter_mut()).zip(turns.iter_mut()) {
+            let whole = (*a / TAU).round();
+            if r.limits.is_none() && whole != 0.0 && whole.is_finite() {
+                *a -= whole * TAU;
+                *k += whole;
+            }
+        }
+    };
+    let lift = |j: &Joints, turns: &[f64]| Joints { linear: j.linear, rotary: j.rotary.iter().zip(turns).map(|(a, k)| a + k * TAU).collect() };
     let mut joints: Option<Joints> = previous.cloned();
+    if let Some(j) = joints.as_mut() {
+        if j.rotary.len() != machine.rotaries.len() {
+            return invalid(format!("the previous position has {} rotary angles; the machine has {}", j.rotary.len(), machine.rotaries.len()));
+        }
+        if j.rotary.iter().any(|a| !a.is_finite()) {
+            return invalid("the previous rotary angles must be finite");
+        }
+        rebase(j, &mut turns);
+    }
     let mut pose: Option<Pose> = None;
     for (i, m) in path.moves.iter().enumerate() {
         match *m {
@@ -793,10 +819,11 @@ pub fn solve_from(machine: &Machine, path: &Toolpath5, opts: &SolveOptions, prev
                 if !to.is_valid() {
                     return Err(CamError::Unsafe(format!("move {i}: a pose is not finite or its tool axis is not a unit direction")));
                 }
-                let j = inverse(machine, &to, joints.as_ref()).map_err(at(i))?;
+                let mut j = inverse(machine, &to, joints.as_ref()).map_err(at(i))?;
                 check_limits(machine, &j).map_err(at(i))?;
                 let rotary_change = joints.as_ref().map_or(0.0, |p| p.rotary_change(&j));
-                out.push(JointMove::Rapid { source: i, to: j.clone(), pose: to, rotary_change });
+                out.push(JointMove::Rapid { source: i, to: lift(&j, &turns), pose: to, rotary_change });
+                rebase(&mut j, &mut turns);
                 joints = Some(j);
                 pose = Some(to);
             }
@@ -816,9 +843,12 @@ pub fn solve_from(machine: &Machine, path: &Toolpath5, opts: &SolveOptions, prev
                 for (tb, j) in pieces {
                     check_limits(machine, &j).map_err(at(i))?;
                     let (pa, pb) = (planned(&from, &to, ta), planned(&from, &to, tb));
-                    out.push(JointMove::Feed { source: i, to: j.clone(), pose: pb, feed, minutes: piece_length(&pa, &pb) / feed });
+                    out.push(JointMove::Feed { source: i, to: lift(&j, &turns), pose: pb, feed, minutes: piece_length(&pa, &pb) / feed });
                     joints = Some(j);
                     ta = tb;
+                }
+                if let Some(j) = joints.as_mut() {
+                    rebase(j, &mut turns);
                 }
                 pose = Some(to);
             }
@@ -847,6 +877,29 @@ fn follow(machine: &Machine, from: &Pose, to: &Pose, j0: &Joints, opts: &SolveOp
         let j = inverse(machine, &p, Some(&last))?;
         for (r, (a, b)) in machine.rotaries.iter().zip(last.rotary.iter().zip(&j.rotary)) {
             if (b - a).abs() > opts.flip_threshold {
+                // A swing of about a whole turn is the axis wrapping round inside limits that
+                // leave no room to carry on: say so rather than call it a flip.
+                let on = b + TAU * ((a - b) / TAU).round();
+                if let Some((lo, hi)) = r.limits
+                    && (on - a).abs() <= opts.flip_threshold
+                    && (on < lo - 1e-9 || on > hi + 1e-9)
+                {
+                    let narrow = if hi - lo < TAU - 1e-9 {
+                        format!(
+                            " ({:.3}° between them, less than a whole turn, so it cannot be turned back a turn to carry on)",
+                            (hi - lo).to_degrees()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    return Err(CamError::Unsafe(format!(
+                        "the cut needs {} to turn on to {:.3}°, beyond its limits {:.3}° to {:.3}°{narrow}; widen the limits or keep the cut within them",
+                        r.letter.char(),
+                        on.to_degrees(),
+                        lo.to_degrees(),
+                        hi.to_degrees()
+                    )));
+                }
                 return Err(CamError::Unsafe(format!(
                     "{} would swing {:.1}° while the tool axis turns at most 1° (a solution flip near a direction where an angle stops mattering); the cut is refused rather than swinging the tool through the part",
                     r.letter.char(),

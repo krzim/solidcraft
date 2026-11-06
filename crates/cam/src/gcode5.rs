@@ -27,8 +27,11 @@
 //! across first when descending. Where the tool's height is not known (the program's start,
 //! after a tool change) it first rises to the program's highest clearance. With the same tool,
 //! an operation starts from where the last one left the tool. Inverse time (`G93`) never
-//! stays in force over the blocks between operations (tool change, spindle, coolant), and every
-//! `F` is checked to be written as a feed the controller can run (never `F0`).
+//! stays in force over a rapid or the blocks between operations (tool change, spindle,
+//! coolant), and every `F` is checked to be written as a feed the controller can run (never
+//! `F0`). Where every turn is made clear of the work (`safe_rotate` or `clearance_retract`), a
+//! run of rapids that each turn the rotaries (a link at clearance) is written as its last one:
+//! one retract and one turn.
 //!
 //! The base post's layout switches ([`Post`]: tool list, comments, blank lines, per-operation
 //! lines, the safe retract to the machine's top, the tool length offset on the first Z, modal
@@ -129,21 +132,30 @@ pub struct Post5 {
 
 /// Rewinds: a continuous cut that would turn a table rotary past its limits (a long wrapped
 /// helix on an axis that cannot turn without end) stops where it reaches the limit, draws the
-/// tool straight up out of the cut by `distance` at `retract_feed`, takes the post's
-/// `safe_rotate` lines (and the rise to the clearance height, with `clearance_retract`), turns
-/// the axis back by whole turns (the same position of the part, as far from the limit as the
-/// limits allow), comes back above the cut at rapid and plunges back to it at `plunge_feed`,
-/// then goes on. Only for machine-coordinate output on machines whose rotaries all turn the
-/// table; elsewhere the limits stay as they are.
+/// tool straight up out of the cut by `distance` (the first [`REWIND_EASE`] at `retract_feed`,
+/// the rest at rapid, the tool then clear of the cut it made), takes the post's `safe_rotate`
+/// lines (and the rise to the clearance height, with `clearance_retract`), turns the axis back
+/// by whole turns (the same position of the part, as far from the limit as the limits allow),
+/// comes back at rapid to [`REWIND_EASE`] above the cut (down the room the tool left as it came
+/// out) and feeds the rest of the way in at the operation's plunge feed, then goes on. The draw
+/// out is shortened to the machine's Z travel, never below the operation's clearance. Only for
+/// machine-coordinate output on machines whose rotaries all turn the table; elsewhere the
+/// limits stay as they are.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rewind {
     /// How far the tool is drawn out of the cut before the turn (mm).
     pub distance: f64,
-    /// Feed of the draw out (mm/min).
+    /// Feed of the start of the draw out (mm/min).
     pub retract_feed: f64,
-    /// Feed of the plunge back into the cut (mm/min).
+    /// Feed of the end of the way back into the cut for an operation without a plunge feed of
+    /// its own ([`Operation5::plunge_feed`], else its tool's) (mm/min).
     pub plunge_feed: f64,
 }
+
+/// How far a rewind feeds the tool out of the cut before it rises at rapid, and how far above
+/// the cut it comes back at rapid before it feeds the rest of the way in (mm; at most the
+/// rewind's distance).
+pub const REWIND_EASE: f64 = 1.0;
 
 impl Rewind {
     fn validate(&self) -> Result<()> {
@@ -159,6 +171,32 @@ impl Rewind {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Whether a `G` code (its value times ten, rounded) turns tool centre point control off: a
+/// plain tool length offset (`G43`), any `G43.x` other than `G43.4`, or the cancel (`G49`).
+fn tcp_off_code(code: i64) -> bool {
+    ((430..=439).contains(&code) && code != 434) || code == 490
+}
+
+/// Whether any line of a template turns tool centre point control off ([`tcp_off_code`]).
+fn turns_tcp_off(lines: &[String]) -> bool {
+    let sample = Values {
+        program: "P".into(),
+        units: "G21".into(),
+        work_offset: "G54".into(),
+        tool: "1".into(),
+        diameter: "1".into(),
+        rpm: "1".into(),
+        seconds: "1".into(),
+        milliseconds: "1".into(),
+    };
+    lines.iter().any(|line| {
+        fill(line, &sample)
+            .ok()
+            .and_then(|text| words(&text, 0).ok())
+            .is_some_and(|ws| ws.iter().any(|&(c, v)| c == 'G' && tcp_off_code((v * 10.0).round() as i64)))
+    })
 }
 
 fn lines(l: &[&str]) -> Vec<String> {
@@ -287,6 +325,31 @@ impl Post5 {
             }
             check_template(&tcp.on)?;
             check_template(&tcp.off)?;
+            // A plain tool length offset (G43 … H) or a cancel (G49) turns tool centre point
+            // control off, so none may be written while it is on.
+            if self.base.tool_length_on_first_z {
+                return invalid(
+                    "a post with tool centre point control sets the tool length with its `tcp.on` lines (G43.4): \
+                     `tool_length_on_first_z` would write G43 after them, which turns tool centre point control off",
+                );
+            }
+            let b = &self.base;
+            let written_while_on: [(&str, &[String]); 6] = [
+                ("spindle_on", &b.spindle_on),
+                ("operation_start", &b.operation_start),
+                ("operation_end", &b.operation_end),
+                ("coolant_on", &b.coolant_on),
+                ("coolant_off", &b.coolant_off),
+                ("safe_rotate", &self.safe_rotate),
+            ];
+            for (key, lines) in written_while_on {
+                if turns_tcp_off(lines) {
+                    return invalid(format!(
+                        "a post with tool centre point control may not write G43, G43.x other than G43.4 or G49 in `{key}`: \
+                         they come while it is on and would turn it off"
+                    ));
+                }
+            }
         }
         check_template(&self.safe_rotate)?;
         if self.clearance.is_some_and(|c| !(c.abs() <= 1.0e6)) {
@@ -381,6 +444,9 @@ struct Writer5<'a> {
     mode: Option<u8>,
     /// The tool whose length offset goes with the next Z word ([`Post::tool_length_on_first_z`]).
     length_offset: Option<u32>,
+    /// Whether the post sets the tool length offset with the first Z word: never with tool
+    /// centre point control, which a plain `G43` would turn off.
+    length_on_z: bool,
     /// The tool in the spindle.
     tool: Option<u32>,
 }
@@ -434,9 +500,11 @@ impl Writer5<'_> {
         if lines.is_empty() || self.height == Height::Top {
             return Ok(());
         }
+        // A return home is a rapid: feed per minute again first.
+        self.per_minute();
         self.template(lines, values)?;
         (self.lin, self.pos, self.height) = ([None, None, None], None, Height::Top);
-        if self.post.tool_length_on_first_z {
+        if self.length_on_z {
             self.length_offset = self.tool;
         }
         Ok(())
@@ -526,9 +594,12 @@ impl Writer5<'_> {
         words
     }
 
+    /// A rapid of the linear axes named, if that changes a word; `G94` first if inverse time
+    /// is in force, so no rapid is ever written under `G93`.
     fn rapid_block(&mut self, to: Vec3, xy: bool, z: bool) {
         let words = self.linear_words(to, xy, z);
         if !words.is_empty() {
+            self.per_minute();
             let mut block = vec![self.motion(0)];
             block.extend(words);
             self.block(&join(&block));
@@ -544,6 +615,7 @@ impl Writer5<'_> {
         if !self.turns(rot) {
             return Ok(());
         }
+        self.per_minute();
         self.safe_lines(safe, values)?;
         let rise = match self.height {
             Height::Top => None,
@@ -702,15 +774,65 @@ impl Writer5<'_> {
         Ok(())
     }
 
-    /// A rewind at `from` (see [`Rewind`]): out of the cut along the machine's Z, the safe
-    /// lines and the turn back to `back`, rapid above the cut, and the plunge back into it.
-    fn rewind(&mut self, from: &Joints, back: &[f64], rewind: &Rewind, turn: &Turn<'_>, values: &Values) -> Result<()> {
-        let above = from.linear + Vec3::Z * rewind.distance;
-        self.feed(above, &from.rotary, Rate::Linear(rewind.retract_feed))?;
+    /// A rewind at `from` (see [`Rewind`]): out of the cut along the machine's Z (fed clear of
+    /// it, then at rapid, within the Z travel), the safe lines and the turn back to `back`,
+    /// rapid down to just above the cut, and fed back into it. The minutes at feed it adds.
+    fn rewind(&mut self, from: &Joints, back: &[f64], r: &RewindAt<'_>, turn: &Turn<'_>, values: &Values) -> Result<f64> {
+        let ease = REWIND_EASE.min(r.rewind.distance);
+        let z = from.linear.z;
+        let wanted = z + r.rewind.distance;
+        let mut top = wanted;
+        if let Some((lo, hi)) = r.machine.linear_limits {
+            // Shortened to the travel left, never below the operation's clearance.
+            let need = wanted.min(r.floor.unwrap_or(wanted).max(z + ease));
+            if hi.z < need - 1e-9 {
+                let at: Vec<String> =
+                    r.machine.rotaries.iter().zip(&from.rotary).map(|(a, v)| format!("{}{:.3}°", a.letter.char(), v.to_degrees())).collect();
+                return Err(CamError::Unsafe(format!(
+                    "a rewind at {} needs Z up to {need:.3} mm to draw the tool out of the cut{}, beyond the Z travel {:.3} to {:.3} mm",
+                    at.join(" "),
+                    if need < wanted { " to the operation's clearance" } else { "" },
+                    lo.z,
+                    hi.z
+                )));
+            }
+            top = wanted.min(hi.z);
+        }
+        let eased = Vec3::new(from.linear.x, from.linear.y, z + ease);
+        let out = Vec3::new(from.linear.x, from.linear.y, top.max(eased.z));
+        check_limits(r.machine, &Joints { linear: out, rotary: from.rotary.clone() })?;
+        check_limits(r.machine, &Joints { linear: eased, rotary: back.to_vec() })?;
+        self.feed(eased, &from.rotary, Rate::Linear(r.rewind.retract_feed))?;
+        if out.z > eased.z {
+            self.rapid(out, None);
+        }
         self.turn(back, turn.safe, turn.clearance, turn.top, values)?;
-        self.rapid(above, turn.top);
-        self.feed(from.linear, back, Rate::Linear(rewind.plunge_feed))
+        // Down the room the tool left as it came out, at the same X and Y.
+        self.rapid(eased, turn.top);
+        self.feed(from.linear, back, Rate::Linear(r.plunge_feed))?;
+        Ok(ease / r.rewind.retract_feed + ease / r.plunge_feed)
     }
+}
+
+/// How an operation's rewinds draw out and come back (see [`Writer5::rewind`]).
+struct RewindAt<'a> {
+    rewind: &'a Rewind,
+    /// Feed of the end of the way back into the cut (mm/min).
+    plunge_feed: f64,
+    /// The operation's clearance height: a draw out shortened to the machine's Z travel never
+    /// ends below it.
+    floor: Option<f64>,
+    machine: &'a Machine,
+}
+
+/// What the writer tells of one operation as written, beyond its toolpath.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WrittenOperation {
+    /// Rewinds of the rotaries in it ([`Rewind`]).
+    pub rewinds: usize,
+    /// Minutes at feed the rewinds add: the start of each draw out and the end of each way
+    /// back in.
+    pub rewind_minutes: f64,
 }
 
 /// How the rotaries turn at rapid in an operation: the safe lines, the clearance height and the
@@ -724,7 +846,7 @@ struct Turn<'a> {
 /// Writes `program` for `machine` through `post`.
 pub fn emit5(program: &Program5, post: &Post5, machine: &Machine) -> Result<String> {
     let ops: Vec<Op<'_>> = program.operations.iter().map(Op::Continuous).collect();
-    emit_ops(&program.name, program.work_offset, &ops, post, machine)
+    Ok(emit_ops(&program.name, program.work_offset, &ops, post, machine)?.0)
 }
 
 /// Writes `program`, its indexed operations with their arcs kept, for `machine` through `post`.
@@ -732,6 +854,12 @@ pub fn emit5(program: &Program5, post: &Post5, machine: &Machine) -> Result<Stri
 /// with tool centre point control they are written as continuous ones, arcs as lines, the
 /// rotaries held at the operation's own angles (refused if they would have to move).
 pub fn emit_program(program: &MachineProgram, post: &Post5, machine: &Machine) -> Result<String> {
+    Ok(emit_program_report(program, post, machine)?.0)
+}
+
+/// [`emit_program`], and what was written of each operation beyond its toolpath (its rewinds),
+/// in program order.
+pub fn emit_program_report(program: &MachineProgram, post: &Post5, machine: &Machine) -> Result<(String, Vec<WrittenOperation>)> {
     let ops: Vec<Op<'_>> = program
         .operations
         .iter()
@@ -821,6 +949,60 @@ struct Planned<'a> {
     low: Option<f64>,
     /// Whether any rotary is away from zero in it.
     turned: bool,
+    /// The feed of its plunges (mm/min), for the way back into the cut after a rewind.
+    plunge: Option<f64>,
+}
+
+/// Which rapids of `moves` (an operation's machine moves, after `previous`) are left out: in
+/// a run of rapids that each turn a rotary (a link at clearance that turns the part a step at a
+/// time), all but the last, so the link is one safe retract and one turn rather than a
+/// staircase of them. Only where every turn of the rotaries is made clear of the work (the
+/// post's `safe_rotate` lines or its rise to the clearance height), and only when the rotaries
+/// each keep turning one way through the run, so the one turn sweeps the same angles.
+fn link_steps(moves: &[JointMove], previous: Option<&Joints>, post: &Post5) -> Vec<bool> {
+    let mut skip = vec![false; moves.len()];
+    if post.safe_rotate.is_empty() && !post.clearance_retract {
+        return skip;
+    }
+    let turning = |from: Option<&Joints>, to: &Joints| from.is_none_or(|f| f.rotary_change(to) > 1e-12);
+    let way = |d: f64| {
+        if d > 1e-12 {
+            1.0
+        } else if d < -1e-12 {
+            -1.0
+        } else {
+            0.0
+        }
+    };
+    let mut before: Option<&Joints> = previous;
+    // The way each rotary turns through the run of turning rapids the last move is in (0: not
+    // yet), or `None` outside one.
+    let mut run: Option<Vec<f64>> = None;
+    for (k, m) in moves.iter().enumerate() {
+        let next = match m {
+            JointMove::Rapid { to, .. } if turning(before, to) => {
+                let dirs: Vec<f64> = match before {
+                    Some(b) => b.rotary.iter().zip(&to.rotary).map(|(a, c)| way(c - a)).collect(),
+                    None => vec![0.0; to.rotary.len()],
+                };
+                match run.take() {
+                    Some(run_dirs) if run_dirs.iter().zip(&dirs).all(|(r, d)| *r == 0.0 || *d == 0.0 || r == d) => {
+                        if let Some(s) = k.checked_sub(1).and_then(|p| skip.get_mut(p)) {
+                            *s = true;
+                        }
+                        Some(run_dirs.iter().zip(&dirs).map(|(r, d)| if *r == 0.0 { *d } else { *r }).collect())
+                    }
+                    _ => Some(dirs),
+                }
+            }
+            _ => None,
+        };
+        run = next;
+        if let Some(j) = m.joints() {
+            before = Some(j);
+        }
+    }
+    skip
 }
 
 /// The angles the rotaries turn to at an operation's first rapid.
@@ -872,18 +1054,87 @@ fn beyond(machine: &Machine, j: &Joints) -> Vec<(usize, f64, f64)> {
         .collect()
 }
 
+/// Machine moves brought within the limits, and the rewinds among them (see [`Motion::Joints`]).
+type Unwound = (Vec<JointMove>, Vec<(usize, Vec<f64>)>);
+
+/// Most starting turns [`unwind`] tries for one operation.
+const MAX_START_TURNS: usize = 8;
+
+/// The moves of a continuous operation solved on [`turning_freely`]'s machine brought within
+/// `machine`'s limits ([`unwind_from`]), starting at the whole turn that needs the fewest
+/// rewinds: an operation that would start at a limit and run on past it starts a turn or more
+/// away instead, so its range of angles sits inside the limits as far as it can. Of starts with
+/// as few rewinds, the one nearest where the rotaries were (the start the operation was solved
+/// at, if it is within the limits).
+fn unwind(machine: &Machine, moves: &[JointMove], previous: Option<&Joints>) -> Result<Unwound> {
+    let n = machine.rotaries.len();
+    let Some(first) = moves.iter().find_map(|m| match m {
+        JointMove::Rapid { to, .. } => Some(to.rotary.clone()),
+        _ => None,
+    }) else {
+        return unwind_from(machine, moves, previous, vec![0.0; n]);
+    };
+    // Each rotary's whole-turn shifts that bring the first rapid within its limits, nearest the
+    // angle it was solved at first.
+    let mut per_axis: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for (i, r) in machine.rotaries.iter().enumerate() {
+        let a = first.get(i).copied().unwrap_or(0.0);
+        let mut shifts = vec![0.0];
+        if let Some((lo, hi)) = r.limits
+            && a.is_finite()
+        {
+            let kmin = ((lo - LIMIT_SLACK - a) / TAU).ceil();
+            let kmax = ((hi + LIMIT_SLACK - a) / TAU).floor();
+            if kmin <= kmax {
+                // Outward from the turn nearest the one it was solved at.
+                let k0 = 0f64.clamp(kmin, kmax);
+                shifts = (0..2 * MAX_START_TURNS)
+                    .map(|j| k0 + if j % 2 == 0 { (j / 2) as f64 } else { -(j.div_ceil(2) as f64) })
+                    .filter(|k| (kmin..=kmax).contains(k))
+                    .take(MAX_START_TURNS)
+                    .map(|k| k * TAU)
+                    .collect();
+            }
+        }
+        per_axis.push(shifts);
+    }
+    let mut starts: Vec<Vec<f64>> = vec![Vec::new()];
+    for shifts in &per_axis {
+        starts = starts.iter().flat_map(|s| shifts.iter().map(move |&k| [s.as_slice(), &[k]].concat())).take(MAX_START_TURNS).collect();
+    }
+    let mut best: Option<Unwound> = None;
+    let mut first_error: Option<CamError> = None;
+    for start in starts {
+        match unwind_from(machine, moves, previous, start) {
+            Ok(u) => {
+                if best.as_ref().is_none_or(|b| u.1.len() < b.1.len()) {
+                    best = Some(u);
+                }
+            }
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match (best, first_error) {
+        (Some(u), _) => Ok(u),
+        (None, Some(e)) => Err(e),
+        (None, None) => unwind_from(machine, moves, previous, vec![0.0; n]),
+    }
+}
+
 /// The moves of a continuous operation solved on [`turning_freely`]'s machine, brought within
 /// `machine`'s limits by whole turns, and the rewinds they need (see [`Motion::Joints`]). A
 /// rapid takes the equal angle within the limits nearest the one before it (it turns the
 /// rotaries anyway); a cut that would go past a limit is split where it reaches it, and the rest
 /// follows a rewind. The axes move evenly through each piece as before, so a split piece takes
-/// its share of the time.
-fn unwind(machine: &Machine, moves: Vec<JointMove>, previous: Option<&Joints>) -> Result<(Vec<JointMove>, Vec<(usize, Vec<f64>)>)> {
-    let mut shift = vec![0.0; machine.rotaries.len()];
+/// its share of the time. Every angle is first moved by `shift` (whole turns, joint order).
+fn unwind_from(machine: &Machine, moves: &[JointMove], previous: Option<&Joints>, mut shift: Vec<f64>) -> Result<Unwound> {
+    shift.resize(machine.rotaries.len(), 0.0);
     let mut last: Option<Joints> = previous.cloned();
     let mut out = Vec::with_capacity(moves.len());
     let mut rewinds = Vec::new();
-    for m in moves {
+    for m in moves.iter().cloned() {
         let source = m.source();
         let at = |e: CamError| match e {
             CamError::Unsafe(s) => CamError::Unsafe(format!("move {source}: {s}")),
@@ -989,7 +1240,7 @@ fn indexed_with_tcp(o: &IndexedOperation, machine: &Machine, post: &Post5, previ
     Ok(moves)
 }
 
-fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, machine: &Machine) -> Result<String> {
+fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, machine: &Machine) -> Result<(String, Vec<WrittenOperation>)> {
     post.validate()?;
     machine.validate()?;
     let base = &post.base;
@@ -1020,14 +1271,17 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
     let mut chain: Option<Joints> = None;
     let mut total = 0usize;
     for op in ops {
-        let (op_name, op_tool, op_rpm, op_coolant) = match op {
-            Op::Continuous(o) => (o.name.as_str(), &o.tool, o.spindle_rpm, o.coolant),
-            Op::Indexed(o) => (o.name.as_str(), &o.tool, o.spindle_rpm, o.coolant),
+        let (op_name, op_tool, op_rpm, op_coolant, op_plunge) = match op {
+            Op::Continuous(o) => (o.name.as_str(), &o.tool, o.spindle_rpm, o.coolant, o.plunge_feed.or(o.tool.plunge_feed)),
+            Op::Indexed(o) => (o.name.as_str(), &o.tool, o.spindle_rpm, o.coolant, None),
         };
         let label = plain(op_name);
         op_tool.validate()?;
         if !(op_rpm > 0.0) || !(op_rpm <= 1.0e6) {
             return invalid(format!("operation `{label}`: the spindle speed must be above 0"));
+        }
+        if op_plunge.is_some_and(|f| !feed_in_range(f)) {
+            return invalid(format!("operation `{label}`: the plunge feed must be {MIN_FEED} to {MAX_FEED} mm/min"));
         }
         let motion = match op {
             Op::Indexed(o) if tcp.is_none() => {
@@ -1048,7 +1302,7 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
                 match &free {
                     Some(f) => {
                         let moves = solve_from(f, &o.path, &opts, chain.as_ref()).map_err(in_op(&label))?;
-                        let (moves, rewinds) = unwind(machine, moves, chain.as_ref()).map_err(in_op(&label))?;
+                        let (moves, rewinds) = unwind(machine, &moves, chain.as_ref()).map_err(in_op(&label))?;
                         Motion::Joints { moves, rewinds }
                     }
                     None => {
@@ -1093,7 +1347,7 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
                 (top, path.iter().filter_map(Move::target).map(|p| p.z).reduce(f64::min), rotary.iter().any(|a| a.abs() > 1e-12))
             }
         };
-        planned.push(Planned { name: op_name, tool: op_tool, rpm: op_rpm, coolant: op_coolant, motion, top, low, turned });
+        planned.push(Planned { name: op_name, tool: op_tool, rpm: op_rpm, coolant: op_coolant, motion, top, low, turned, plunge: op_plunge });
     }
     // Where the tool's height is not known, it rises to the highest clearance of the program
     // (the post's, or any operation's highest rapid above it) before it moves across or a
@@ -1117,6 +1371,7 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
         inverse: false,
         mode: None,
         length_offset: None,
+        length_on_z: base.tool_length_on_first_z && tcp.is_none(),
         tool: None,
     };
     let mut values = Values { program: plain(name), units: base.units.code().into(), work_offset: work_offset_code(offset)?, ..Values::default() };
@@ -1144,7 +1399,9 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
     let mut coolant = false;
     let mut tcp_on = false;
     let mut joints: Option<Joints> = None;
+    let mut written: Vec<WrittenOperation> = Vec::with_capacity(planned.len());
     for p in planned {
+        let mut report = WrittenOperation::default();
         let speed = number(p.rpm, 0);
         let new_tool = tool != Some(p.tool.number);
         // The blocks before the motion read any F per minute.
@@ -1201,7 +1458,7 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
                 w.height = Height::Top;
             }
             w.tool = tool;
-            if base.tool_length_on_first_z {
+            if w.length_on_z {
                 w.length_offset = tool;
             }
         }
@@ -1229,14 +1486,23 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
         let turning = Turn { safe: &post.safe_rotate, clearance, top };
         match p.motion {
             Motion::Joints { moves, rewinds } => {
+                let skip = link_steps(&moves, joints.as_ref(), post);
                 let mut rewinds = rewinds.iter().peekable();
                 for (k, m) in moves.iter().enumerate() {
                     while let Some((_, back)) = rewinds.next_if(|(at, _)| *at == k) {
                         let (Some(rewind), Some(from)) = (post.rewind.as_ref(), joints.clone()) else {
                             return Err(CamError::Unsafe(format!("operation `{}`: a rewind before the first positioning move", plain(p.name))));
                         };
-                        w.rewind(&from, back, rewind, &turning, &values)?;
+                        let at = RewindAt { rewind, plunge_feed: p.plunge.unwrap_or(rewind.plunge_feed), floor: clearance.or(p.top), machine };
+                        report.rewind_minutes += w.rewind(&from, back, &at, &turning, &values).map_err(in_op(&plain(p.name)))?;
+                        report.rewinds += 1;
                         joints = Some(Joints { linear: from.linear, rotary: back.clone() });
+                    }
+                    if skip.get(k).copied().unwrap_or(false) {
+                        if let Some(j) = m.joints() {
+                            joints = Some(j.clone());
+                        }
+                        continue;
                     }
                     match m {
                         JointMove::Rapid { to, pose, .. } => {
@@ -1287,6 +1553,7 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
             }
         }
         w.template(&base.operation_end, &values)?;
+        written.push(report);
     }
     w.per_minute();
     if let Some(t) = tcp
@@ -1303,7 +1570,7 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
         w.safe_lines(lines, &values)?;
     }
     w.template(&base.footer, &values)?;
-    Ok(w.out)
+    Ok((w.out, written))
 }
 
 /// One motion block of a multi-axis program as read: where every axis is after it (mm and
@@ -1350,7 +1617,8 @@ pub enum JointWords {
 /// Reads the motion of a multi-axis program in absolute coordinates: `G0`–`G3` with `X Y Z`,
 /// `I J` (arcs, the rotaries held), the rotary words `letters` (degrees) and `F`, `G93`/`G94`,
 /// `G20`/`G21`, `G4`, `G91.1` (arc centres from the arc's start; `G90.1` is refused), and
-/// `G43.4`/`G49` for tool centre point control on and off. A `G53` block moves in machine
+/// `G43.4` for tool centre point control on (`G49`, a plain `G43` and any other `G43.x` turn it
+/// off, as a controller does). A `G53` block moves in machine
 /// coordinates and a `G28`/`G30` block (as in `G28 G91 Z0.`) to the machine's home, so the axes
 /// they name are unknown until written again. Any other move in incremental coordinates (`G91`)
 /// is refused; everything else (spindle, tools, coolant, offsets) is skipped, and so are blocks
@@ -1387,7 +1655,8 @@ pub fn parse5(text: &str, letters: &[AxisLetter]) -> Result<Vec<JointWords>> {
                 280 | 300 => (machine_coords, home) = (true, true),
                 530 => machine_coords = true,
                 434 => tcp = true,
-                490 => tcp = false,
+                // A plain tool length offset (G43 … H), any other G43.x and G49 turn it off.
+                c if tcp_off_code(c) => tcp = false,
                 900 => incremental = false,
                 910 => (incremental, g91) = (true, true),
                 901 => return Err(CamError::Parse(n, "not supported yet: absolute arc centres (G90.1)".into())),
