@@ -7,8 +7,9 @@
 //! edge. Corners and faces are worked out directly. Along an edge the height the tip must have
 //! to touch the edge's point at parameter `t` is `z(t) - h(d(t))`, with `z` linear, `d` the
 //! (convex) distance from the axis and `h` the cutter's (convex, rising) height profile, so it
-//! is concave in `t`: a flat end's maximum is at the end of the stretch under the cutter, and
-//! the others' is found by golden-section search to far below any machining tolerance.
+//! is concave in `t`: a flat end's maximum is at the end of the stretch under the cutter, a
+//! ball's and a tapered cutter's are found in closed form, and a bull nose's by golden-section
+//! search to far below any machining tolerance.
 
 use std::cell::Cell;
 
@@ -54,7 +55,22 @@ fn drop_triangle_above(cutter: &Cutter, t: &[Vec3; 3], x: f64, y: f64, above: f6
             n = -n;
         }
         // A face this close to vertical is met at its edges and corners first.
-        if n.z > 1e-9 {
+        if n.z > 1e-9
+            && let Some(cone) = cutter.cone
+        {
+            // The tip height that touches the plane at distance `d` from the axis, towards
+            // where the plane is highest, is linear in `d` on either side of the tip's rim: a
+            // cone meets a plane first at its tip's rim or, on a plane steeper than its side,
+            // at its top rim.
+            let s = n.x.hypot(n.y);
+            let d = if s / n.z > 1.0 / cone.half_angle.tan() { r } else { cone.tip_radius };
+            let (qx, qy) = if s > 1e-12 { (x - d * n.x / s, y - d * n.y / s) } else { (x, y) };
+            let z = t[0].z - (n.x * (qx - t[0].x) + n.y * (qy - t[0].y)) / n.z - cutter.height(d).unwrap_or(0.0);
+            let top = t[0].z.max(t[1].z).max(t[2].z);
+            if inside_xy(t, qx, qy) && z <= top + 1e-9 {
+                keep(&mut best, z);
+            }
+        } else if n.z > 1e-9 {
             let s = n.x.hypot(n.y);
             let a = cutter.flat_radius();
             // The flat bottom's edge (or centre) on the side where the plane is highest.
@@ -135,6 +151,9 @@ fn drop_edge(cutter: &Cutter, p: Vec3, q: Vec3, x: f64, y: f64, r: f64) -> Optio
         let h = cutter.height(d.min(r)).unwrap_or(cutter.corner);
         p.z + ez * t - h
     };
+    if let Some(cone) = cutter.cone {
+        return Some(cone_edge(&f, cone, Vec3::new(ex, ey, ez), (wx, wy), (lo, hi)).max(f(lo)).max(f(hi)));
+    }
     if cutter.corner <= 0.0 {
         return Some(f(lo).max(f(hi)));
     }
@@ -161,6 +180,35 @@ fn drop_edge(cutter: &Cutter, p: Vec3, q: Vec3, x: f64, y: f64, r: f64) -> Optio
         }
     }
     Some(f(0.5 * (a0 + b0)).max(f(lo)).max(f(hi)))
+}
+
+/// The highest of `f`, the tip height touching an edge at its parameter for a cutter tapered as
+/// `cone`, inside the stretch `[lo, hi]` under the cutter, in closed form. `e` is the edge from
+/// its start, `w` its start from the axis seen from above. Along the edge the distance from the
+/// axis is `√(u² + D²)`, `u` the distance along the edge from its point nearest the axis and
+/// `D` the distance of its line from the axis. Over the flat tip `f` is linear, so its highest
+/// there is where the tip's rim crosses the edge; over the side it is `m·u − √(u² + D²) / tan`
+/// and a constant (`m` the edge's slope), highest where `u / √(u² + D²) = m·tan`. `f` is
+/// concave, so the highest of these points, each kept within the stretch, and of the stretch's
+/// ends is its maximum.
+fn cone_edge(f: &impl Fn(f64) -> f64, cone: crate::cutter::Cone, e: Vec3, w: (f64, f64), (lo, hi): (f64, f64)) -> f64 {
+    let a = e.x * e.x + e.y * e.y;
+    let len = a.sqrt();
+    let clamp = |t: f64| if t.is_finite() { t.clamp(lo, hi) } else { lo };
+    let t0 = -(e.x * w.0 + e.y * w.1) / a;
+    let dd = (w.0 + e.x * t0).hypot(w.1 + e.y * t0);
+    let mut best = f64::NEG_INFINITY;
+    let rt = cone.tip_radius;
+    if rt > dd {
+        let u = (rt * rt - dd * dd).max(0.0).sqrt();
+        best = best.max(f(clamp(t0 - u / len))).max(f(clamp(t0 + u / len)));
+    }
+    let k = e.z / len * cone.half_angle.tan();
+    if k.abs() < 1.0 {
+        let u = dd * k / (1.0 - k * k).sqrt();
+        best = best.max(f(clamp(t0 + u / len)));
+    }
+    best
 }
 
 /// Whether `(x, y)` is inside the triangle's outline seen from above (edges included).

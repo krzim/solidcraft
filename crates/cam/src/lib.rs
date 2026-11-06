@@ -7,7 +7,7 @@
 //! kernel; the engine hands it regions and surfaces.
 //!
 //! Beyond 2D: [`Surface`] holds a part's triangles, and the drop-cutter ([`drop_z`],
-//! [`drop_along`]) lowers a flat, ball or bull nose cutter onto them along any axis. 3D
+//! [`drop_along`]) lowers a flat, ball, bull nose or tapered (chamfer) cutter onto them along any axis. 3D
 //! roughing and finishing are built on it, and so are the multi-axis toolpaths ([`Toolpath5`]:
 //! the tip with the tool axis) of indexed (3+2), 4-axis rotary and simultaneous 5-axis
 //! machining, which machine kinematics turn into linear and rotary axis positions.
@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adaptive;
+mod chamfer;
 mod check;
 pub mod collision;
 mod cutter;
@@ -48,8 +49,9 @@ mod surface;
 pub mod surface_ops;
 mod tool;
 
+pub use chamfer::{ChamferGeometry, ChamferParams, DEFAULT_TIP_OFFSET, chamfer, chamfer_geometry};
 pub use check::verify;
-pub use cutter::Cutter;
+pub use cutter::{Cone, Cutter};
 pub use dropcutter::{drop_along, drop_triangle, drop_z};
 pub use frame::{Frame, angle_about, rotate, rotate_about};
 pub use gcode::{Operation, Program, emit, parse, work_offset_code};
@@ -91,6 +93,8 @@ pub(crate) fn invalid<T>(why: impl Into<String>) -> Result<T> {
 
 #[cfg(test)]
 mod adaptive_tests;
+#[cfg(test)]
+mod chamfer_tests;
 #[cfg(test)]
 mod collision_tests;
 #[cfg(test)]

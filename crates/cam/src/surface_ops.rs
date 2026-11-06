@@ -201,7 +201,7 @@ pub(crate) fn check_stepdown(stepdown: f64) -> Result<()> {
 /// The tool's cutting end, refused for a tool that cannot mill.
 pub(crate) fn tool_cutter(tool: &Tool) -> Result<Cutter> {
     tool.validate()?;
-    crate::ops::mills(tool)?;
+    crate::ops::cuts_sideways(tool)?;
     tool.cutter()
 }
 
@@ -895,6 +895,7 @@ impl TipRange {
 /// would visit more than a billion samples between them is refused.
 pub fn roughing(surface: &Surface, tool: &Tool, p: &RoughingParams) -> Result<Toolpath> {
     let cutter = tool_cutter(tool)?;
+    crate::chamfer::roughs(tool, "roughing")?;
     p.heights.validate()?;
     p.feeds.validate()?;
     check_stepdown(p.stepdown)?;

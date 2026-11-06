@@ -22,6 +22,12 @@ pub enum ToolKind {
     /// teeth, any pitch) or multi-form (rows [`Tool::thread_pitch`] apart). It cuts by helical
     /// interpolation round a hole or a boss (`crate::helical::thread_mill`).
     ThreadMill,
+    /// A face mill: a flat end, its inserts' corners rounded by [`Tool::corner_radius`] when it
+    /// is given.
+    FaceMill,
+    /// A chamfer mill: a flat tip of [`Tool::tip_diameter`], then a cone of
+    /// [`Tool::angle_deg`] (the included angle) up to the cutting diameter.
+    Chamfer,
 }
 
 impl ToolKind {
@@ -32,6 +38,8 @@ impl ToolKind {
             ToolKind::BullNose => "bull nose end mill",
             ToolKind::Drill => "drill",
             ToolKind::ThreadMill => "thread mill",
+            ToolKind::FaceMill => "face mill",
+            ToolKind::Chamfer => "chamfer mill",
         }
     }
 }
@@ -62,10 +70,19 @@ pub struct Tool {
     pub stepdown: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stepover: Option<f64>,
-    /// Radius of a bull nose's corners (mm), above 0 and below the tool radius. Ignored by
-    /// other kinds: a flat end mill has none and a ball's is its radius.
+    /// Radius of a bull nose's corners (mm), above 0 and below the tool radius; for a face
+    /// mill, its inserts' corner radius, 0 to below the tool radius (left out: square). Ignored
+    /// by other kinds: a flat end mill and a chamfer mill have none and a ball's is its radius.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corner_radius: Option<f64>,
+    /// A chamfer mill's tip diameter (mm), from 0 (pointed) to below the cutting diameter;
+    /// left out, 0. Only for chamfer mills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_diameter: Option<f64>,
+    /// A chamfer mill's included angle (degrees), 1 to 179: 90 for a 45° chamfer. Required for
+    /// chamfer mills, and only for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle_deg: Option<f64>,
     /// Diameter of the plain shank above the flutes (mm); left out, the cutting diameter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shank_diameter: Option<f64>,
@@ -126,6 +143,8 @@ impl Tool {
             stepdown: None,
             stepover: None,
             corner_radius: None,
+            tip_diameter: None,
+            angle_deg: None,
             shank_diameter: None,
             stickout: None,
             holder: Vec::new(),
@@ -147,6 +166,14 @@ impl Tool {
             ToolKind::BullNose => Cutter::bull(r, self.corner_radius.unwrap_or(0.0)),
             ToolKind::Drill => invalid("a drill cannot mill: it cuts only at its point"),
             ToolKind::ThreadMill => Cutter::flat(r),
+            ToolKind::FaceMill => match self.corner_radius.filter(|c| *c > 0.0) {
+                Some(c) => Cutter::bull(r, c),
+                None => Cutter::flat(r),
+            },
+            ToolKind::Chamfer => {
+                let Some(angle) = self.angle_deg else { return invalid("a chamfer mill needs its included angle (`angle_deg`)") };
+                Cutter::tapered(r, self.tip_diameter.unwrap_or(0.0) * 0.5, angle.to_radians() * 0.5)
+            }
         }
     }
 
@@ -193,6 +220,19 @@ impl Tool {
         }
         if self.kind != ToolKind::ThreadMill && (self.thread_pitch.is_some() || self.tooth_height.is_some()) {
             return invalid("`thread_pitch` and `tooth_height` are for thread mills");
+        }
+        if self.kind == ToolKind::FaceMill && self.corner_radius.is_some_and(|c| !(c >= 0.0) || !(c < self.radius())) {
+            return invalid("a face mill's corner radius must be from 0 to below the tool radius");
+        }
+        if self.kind == ToolKind::Chamfer {
+            if !self.angle_deg.is_some_and(|a| (1.0..=179.0).contains(&a)) {
+                return invalid("a chamfer mill's included angle (`angle_deg`) must be given, from 1 to 179 degrees");
+            }
+            if self.tip_diameter.is_some_and(|t| !(t >= 0.0) || !(t < self.diameter)) {
+                return invalid("a chamfer mill's tip diameter must be from 0 to below its diameter");
+            }
+        } else if self.tip_diameter.is_some() || self.angle_deg.is_some() {
+            return invalid("`tip_diameter` and `angle_deg` are for chamfer mills");
         }
         if self.shank_diameter.is_some_and(|d| !(d > 0.0) || !(d <= MAX_TOOL_DIAMETER)) {
             return invalid("the shank diameter must be above 0 and at most 1000 mm");

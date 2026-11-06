@@ -38,7 +38,7 @@ use crate::ops::{Cut, Feeds, Heights};
 use crate::path::{MAX_MOVES, Move, Toolpath, arc_sweep};
 use crate::surface::Surface;
 use crate::surface_ops::{Boundary, Budget, check_leave, check_stepdown, check_tolerance, descent_feed, levels, tool_cutter};
-use crate::tool::{Tool, ToolKind};
+use crate::tool::Tool;
 use crate::{CamError, Result, invalid};
 
 /// Most cells of one level's material raster.
@@ -163,9 +163,10 @@ impl AdaptiveParams {
     }
 }
 
-fn mills(tool: &Tool) -> Result<()> {
+/// Adaptive clearing mills with the tool's side and enters along a helix of `ramp_angle`.
+fn mills(tool: &Tool, ramp_angle: f64) -> Result<()> {
     tool.validate()?;
-    if tool.kind == ToolKind::Drill { invalid("a drill cannot mill: it cuts only at its point") } else { Ok(()) }
+    crate::ops::mills(tool, ramp_angle)
 }
 
 /// Refuses levels deeper apart than the tool's flutes reach: below them the shank would rub on
@@ -1200,7 +1201,7 @@ fn cutting_samples(path: &Toolpath, spacing: f64) -> Vec<Vec3> {
 /// engagement-limited path, entered with a helix and cleared out to the walls (less the stock to
 /// leave). Refused when the helix has no room.
 pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: &Cut) -> Result<AdaptivePath> {
-    mills(tool)?;
+    mills(tool, params.ramp_angle)?;
     params.validate(tool)?;
     cut.heights.validate()?;
     cut.feeds.validate()?;
@@ -1307,7 +1308,7 @@ fn flat_heights(surface: &Surface, lo: Vec2, hi: Vec2) -> Vec<f64> {
 /// the material is enclosed. Every cutting point is checked with the drop-cutter before the path
 /// is returned.
 pub fn adaptive_roughing(surface: &Surface, tool: &Tool, p: &AdaptiveRoughingParams) -> Result<AdaptivePath> {
-    mills(tool)?;
+    mills(tool, p.adaptive.ramp_angle)?;
     let cutter = tool_cutter(tool)?;
     p.adaptive.validate(tool)?;
     p.heights.validate()?;
@@ -1362,7 +1363,7 @@ pub fn adaptive_roughing(surface: &Surface, tool: &Tool, p: &AdaptiveRoughingPar
     // stock to leave is a level the centre may stand at.
     let grown = {
         let g = cutter.grown(leave)?;
-        let c = Cutter { radius: g.radius + k.margin, corner: g.corner };
+        let c = Cutter { radius: g.radius + k.margin, ..g };
         c.validate()?;
         c
     };

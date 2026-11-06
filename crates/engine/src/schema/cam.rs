@@ -244,6 +244,9 @@ pub struct Common<'a> {
 #[path = "cam_helical.rs"]
 mod helical;
 pub use helical::{BoreOp, HoleSpec, ThreadMillOp};
+#[path = "cam_chamfer.rs"]
+mod chamfer;
+pub use chamfer::{ChamferHeightsSpec, ChamferOp};
 
 operation! {
     /// A 2D contour round closed profiles, in depth passes.
@@ -526,6 +529,7 @@ pub enum Op3Spec {
     Roughing(RoughingOp),
     Waterline(WaterlineOp),
     Drill(DrillOp),
+    Chamfer(ChamferOp),
 }
 
 /// A 3-axis operation run with the A axis held at `a_deg` (3+1): its heights, boundary and
@@ -536,7 +540,7 @@ pub struct IndexedOp {
     /// The A angle, degrees.
     pub a_deg: f64,
     /// The 3-axis operation (`adaptive`, `adaptive_roughing`, `contour`, `pocket`, `parallel`,
-    /// `roughing`, `waterline` or `drill`).
+    /// `roughing`, `waterline`, `drill` or `chamfer`).
     pub operation: Box<Op3Spec>,
 }
 
@@ -559,6 +563,7 @@ pub enum OperationSpec {
     Bore(BoreOp),
     ThreadMill(ThreadMillOp),
     Face(FaceOp),
+    Chamfer(ChamferOp),
 }
 
 /// What `cam.job` returns.

@@ -126,9 +126,10 @@ is; the reply's notes say so.
 
 ### Tools
 
-`number`, `kind` (`flat_endmill`, `ball_endmill`, `bull_nose`, `drill`, `thread_mill`),
-`diameter`, `flute_length`, and optional `description`, `flutes`, `spindle_rpm`, `feed`,
-`plunge_feed`, `stepdown`, `stepover`, `corner_radius` (bull nose), `shank_diameter`,
+`number`, `kind` (`flat_endmill`, `ball_endmill`, `bull_nose`, `drill`, `face_mill`, `chamfer`,
+`thread_mill`), `diameter`, `flute_length`, and optional `description`, `flutes`,
+`spindle_rpm`, `feed`, `plunge_feed`, `stepdown`, `stepover`, `corner_radius` (bull nose; a
+face mill's inserts), `tip_diameter` and `angle_deg` (chamfer mill, below), `shank_diameter`,
 `stickout`, `holder: [{diameter, length}]`, `point_angle_deg` (a drill's point, default 118),
 and for a thread mill `thread_pitch` and `tooth_height` (see
 [Helical bores and thread milling](#helical-bores-and-thread-milling)). An operation without
@@ -151,6 +152,7 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `drill` | `sketch` (circle centres, `circles` (true), filtered by `diameter_range: [min, max]`, and lone points, `sketch_points` (true)) or `points: [[x, y], …]`; `heights` (`retract` is the R height, `top` the hole's top, `bottom` its depth); `cycle`: `simple` \| `dwell` \| `peck` \| `chip_break` (simple); `peck` (tool's stepdown, else its diameter); `peck_clearance` (0.5); `back_off` (0.5); `dwell_seconds` (0.5); `to_full_diameter` (false); `stay_at_retract` (false). See [Drilling](#drilling). |
 | `adaptive` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown` (tool's, else its diameter); `optimal_load` (tool's `stepover`, else 10% of its diameter); `min_engagement_deg`, `max_engagement_deg` (from the load: see [Adaptive clearing](#adaptive-clearing)); `helix_diameter` (80% of the tool's); `ramp_angle_deg` (2); `climb`; `stock_to_leave` (0); `tolerance`; `compare` (true) |
 | `adaptive_roughing` | `heights` (`top` is the stock's top); `stepdown`; `optimal_load`; `min_engagement_deg`, `max_engagement_deg`; `helix_diameter`; `ramp_angle_deg`; `climb`; `boundary` (the stock's extent; the part's extent); `stock_to_leave` (0.25); `flats` (true); `tolerance` |
+| `chamfer` | `sketch` + `profiles?` or `polygon`; `heights: {clearance, retract, top}` (no `bottom`: the depth follows from the width); `width` (across the top); `tip_offset` (0.2); `side`: `outside` \| `inside` (outside); `climb` (true); `tolerance`. A chamfer mill only; see [Chamfers](#chamfers) |
 | `indexed` | `a_deg` and `operation`: any of the 3-axis operations above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
 | `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}` or `{type: "helix", pitch}`; `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
 | `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
@@ -409,3 +411,38 @@ same profiles (stepover 40% of the diameter) measured the same way (`max_engagem
 `full_slot_share`, `cut_length`, `cut_minutes`). A measured engagement more than 3° above
 `limit_deg`, or any full slot outside the entries, is also a warning of the operation. Both
 operations also work inside `indexed`.
+## Chamfers
+
+A face mill (`kind: "face_mill"`) is a flat end, its inserts' corners rounded by
+`corner_radius` when given; its tool-list name is `FACE MILL`. A chamfer mill (`kind:
+"chamfer"`) has `diameter` (the widest the cone cuts), `tip_diameter` (0 for a pointed tip,
+default 0) and `angle_deg`, the included angle (90 for 45° chamfers, 1 to 179, required); its
+tool-list name is `CHAMFER MILL`. Contours and pockets refuse a chamfer mill. The drop-cutter
+and the gouge check know its true shape, a flat tip and a cone, so the finishing operations
+(`parallel`, `waterline`, `rotary_finish`, `wrap`, 5-axis surface finishing) can use one.
+`roughing` and `rotary_roughing` refuse it, since its point leaves ridges between passes that
+the roughing would take as cut, and so does a swarf cut, since its side is tapered.
+
+A face mill's inserts do not cut at its centre, so it never goes straight down into material:
+a `contour` or `pocket` with a face mill needs `ramp_angle_deg` above 0, and `roughing` and
+`rotary_roughing`, which plunge, refuse it.
+
+The `chamfer` operation cuts a chamfer along the top edges of closed profiles in one pass:
+
+```json
+{"name": "deburr", "type": "chamfer", "tool": 7, "sketch": "Outline",
+ "heights": {"clearance": 10, "retract": 2, "top": 0}, "width": 0.5, "side": "outside"}
+```
+
+`width` is the chamfer's leg across the top face; its leg down the wall is `width / tan(angle_deg
+/ 2)` (the same for a 90° tool). The tip runs `tip_offset` below the chamfer so the cone's side,
+not its tip, cuts all of it: `width / tan(angle_deg / 2) + tip_offset` below `top`, its axis
+`tip_diameter / 2 + tip_offset · tan(angle_deg / 2)` out from the edge. A chamfer the cone cannot
+reach, wider than `diameter / 2 − tip_diameter / 2 − tip_offset · tan(angle_deg / 2)`, or deeper
+than the flutes, is refused with the widest it can cut, never cut narrower. `outside` chamfers a
+part's outline, `inside` an opening's; corners of an outside chamfer are rounded by the cone.
+
+The gouge check holds the cone to the model: chamfer edges the model has chamfered (with
+`solid.chamfer` at the tool's angle) and it passes; a chamfer the model does not show cuts into
+it, so a deburr of a sharp-edged model sets `gouge_check: false`. Inside `indexed` a chamfer runs
+in the frame the A angle brings under the tool.

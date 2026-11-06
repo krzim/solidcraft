@@ -267,9 +267,24 @@ fn check_leave(leave: f64) -> Result<()> {
     if leave.is_finite() && (0.0..=MAX_COORD).contains(&leave) { Ok(()) } else { invalid("the stock to leave must be 0 or more") }
 }
 
-/// A milling operation needs a tool that cuts with its side: a drill only cuts at its point,
-/// and a thread mill's teeth only cut threads.
-pub(crate) fn mills(tool: &Tool) -> Result<()> {
+/// A milling operation needs a tool that cuts with a straight side: a drill only cuts at its
+/// point, a thread mill's teeth only cut threads, and a chamfer mill's tapered side cuts
+/// chamfers (see [`crate::chamfer`]). A face mill goes into the material only along a ramp
+/// (`ramp_angle`).
+pub(crate) fn mills(tool: &Tool, ramp_angle: f64) -> Result<()> {
+    cuts_sideways(tool)?;
+    match tool.kind {
+        ToolKind::Chamfer => {
+            invalid("a chamfer mill's side is tapered: it cuts chamfers (the chamfer operation), not contours, pockets, clearing or bores")
+        }
+        _ => crate::chamfer::enters(tool, ramp_angle),
+    }
+}
+
+/// A tool that cuts with its side at all: not a drill (it cuts only at its point) and not a
+/// thread mill (its teeth only cut threads). Surface operations take any other kind; the
+/// stricter [`mills`] is for 2D operations.
+pub(crate) fn cuts_sideways(tool: &Tool) -> Result<()> {
     match tool.kind {
         ToolKind::Drill => invalid("a drill cannot mill: it cuts only at its point"),
         ToolKind::ThreadMill => invalid("a thread mill cuts threads only: use it in a thread milling operation"),
@@ -287,10 +302,10 @@ fn start_near(lp: &[Piece], p: Vec2) -> Vec<Piece> {
 /// down through every depth pass before the next.
 pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &Cut) -> Result<Toolpath> {
     tool.validate()?;
-    mills(tool)?;
     cut.validate()?;
     check_leave(params.stock_to_leave)?;
     check_ramp(params.ramp_angle)?;
+    mills(tool, params.ramp_angle)?;
     let shape = Shape::from_regions(regions, params.tolerance)?;
     let away = tool.radius() + params.stock_to_leave;
     let loops = match params.side {
@@ -325,10 +340,10 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
 /// Clears `regions` (holes are islands) with rings parallel to the boundary, from the inside out.
 pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut) -> Result<Toolpath> {
     tool.validate()?;
-    mills(tool)?;
     cut.validate()?;
     check_leave(params.stock_to_leave)?;
     check_ramp(params.ramp_angle)?;
+    mills(tool, params.ramp_angle)?;
     let r = tool.radius();
     if !(params.stepover > 0.0) || !(params.stepover <= tool.diameter) {
         return invalid("the stepover must be above 0 and at most the tool diameter");

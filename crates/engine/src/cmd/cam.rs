@@ -62,9 +62,9 @@ pub static COMMANDS: &[CommandSpec] = &[
              body), fixtures?: [names] (checked against, never cut), tolerance?: mm (default 0.01; bodies are tessellated at half of it), \
              stock?: {box: {min, max}} | {cylinder: {radius, x_min, x_max}} | {around_part: {margin: [x,y,z]}} (work coordinates; no \
              rapid may pass through it), tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | \
-             roughing | waterline | drill | indexed {a_deg, operation} | rotary_finish | rotary_roughing | wrap | bore | thread_mill | face \
-             {bottom, top?, retract?, clearance?, stepdown?, stepover?, angle_deg?, zigzag?, overhang?, rect?}, tool: number, spindle_rpm?, \
-             feeds?: {cut, plunge}, coolant?, \
+             roughing | waterline | drill | chamfer {heights: {clearance, retract, top}, width, tip_offset?, side?} | indexed {a_deg, \
+             operation} | rotary_finish | rotary_roughing | wrap | bore | thread_mill | face {bottom, top?, retract?, clearance?, stepdown?, \
+             stepover?, angle_deg?, zigzag?, overhang?, rect?}, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
              and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
              operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, warnings}], \
@@ -226,6 +226,8 @@ fn tool_sample() -> Value {
         stepdown: Some(1.0),
         stepover: Some(1.0),
         corner_radius: Some(1.0),
+        tip_diameter: Some(1.0),
+        angle_deg: Some(1.0),
         shank_diameter: Some(1.0),
         stickout: Some(1.0),
         holder: vec![HolderSection { diameter: 1.0, length: 1.0 }],
@@ -730,6 +732,10 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
             let path = roughing(surface, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
             Ok((path, r, "roughing"))
         }
+        Op3Spec::Chamfer(o) => {
+            let (path, r) = chamfer::plan(ctx, o, frame)?;
+            Ok((path, r, "chamfer"))
+        }
         Op3Spec::Waterline(o) => {
             let c = o.common();
             let r = ctx.resolve(&c)?;
@@ -763,6 +769,7 @@ fn common3(op: &Op3Spec) -> Common<'_> {
         Op3Spec::Roughing(o) => o.common(),
         Op3Spec::Waterline(o) => o.common(),
         Op3Spec::Drill(o) => o.common(),
+        Op3Spec::Chamfer(o) => o.common(),
     }
 }
 
@@ -913,6 +920,7 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
         OperationSpec::Roughing(o) => indexed(&Op3Spec::Roughing(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Waterline(o) => indexed(&Op3Spec::Waterline(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Drill(o) => indexed(&Op3Spec::Drill(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::Chamfer(o) => indexed(&Op3Spec::Chamfer(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Indexed(o) => {
             let name = common3(&o.operation).name;
             if rotaries != 1 {
@@ -1425,6 +1433,9 @@ mod cam_stock;
 
 #[path = "cam_adaptive.rs"]
 mod adaptive;
+#[path = "cam_chamfer.rs"]
+mod chamfer;
+
 #[cfg(test)]
 #[path = "cam_tests.rs"]
 mod tests;

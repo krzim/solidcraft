@@ -328,7 +328,9 @@ fn bore_radii(rough: f64, full: f64, tool_radius: f64, stepover: f64, finish: u3
 /// diameters.
 pub fn bore(holes: &[Hole], tool: &Tool, p: &BoreParams) -> Result<HelicalPath> {
     tool.validate()?;
-    mills(tool)?;
+    // A bore always goes down along a helix, never straight down, so the entry rule is met
+    // for every tool that mills (a face mill included); a chamfer mill is refused.
+    mills(tool, std::f64::consts::FRAC_PI_4)?;
     check_heights_and_feeds(&p.heights, &p.feeds)?;
     check_descent(&p.descent, tool)?;
     if holes.is_empty() || holes.len() > MAX_HOLES {

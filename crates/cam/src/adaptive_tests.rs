@@ -23,23 +23,7 @@ const DEG: f64 = PI / 180.0;
 const ENGAGEMENT_TOL: f64 = 3.0;
 
 fn flat(d: f64) -> Tool {
-    Tool {
-        number: 1,
-        kind: ToolKind::FlatEndmill,
-        diameter: d,
-        flute_length: 20.0,
-        description: String::new(),
-        flutes: 3,
-        spindle_rpm: None,
-        feed: None,
-        plunge_feed: None,
-        stepdown: None,
-        stepover: None,
-        corner_radius: None,
-        shank_diameter: None,
-        stickout: None,
-        holder: vec![],
-    }
+    Tool { flutes: 3, ..Tool::new(1, ToolKind::FlatEndmill, d, 20.0) }
 }
 
 fn poly(pts: &[(f64, f64)]) -> Loop2 {
