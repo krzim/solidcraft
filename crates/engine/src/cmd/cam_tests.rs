@@ -509,3 +509,22 @@ fn hostile_simulations_are_refused_without_panics() {
     let e = s.execute("cam.simulate", &json!({"path": gcode, "job": dome_job()})).unwrap_err();
     assert!(e.to_string().contains("tool 9"), "{e}");
 }
+
+/// A 4th-axis program that never writes A has no move the simulation can follow: that is a
+/// failure, not a pass with nothing checked.
+#[test]
+fn a_simulation_that_follows_no_move_does_not_pass() {
+    let mut s = bar();
+    let dir = Dir::new("sim-no-a");
+    let gcode = dir.file("no-a.tap");
+    std::fs::write(&gcode, "G21\nT3 M6\nG0 X0. Y0. Z30.\nG0 Z5.\nG1 X5. F100\nG0 Z30.\n").unwrap();
+    let r = run(&mut s, "cam.simulate", json!({"path": gcode, "job": barrel_job(), "resolution": 0.2}));
+    assert_eq!(r["passed"], false, "{r}");
+    assert!(r["failures"].as_array().unwrap().iter().any(|f| f.as_str().is_some_and(|f| f.contains("no move"))), "{r}");
+    // With the A written, the plunge into the bar is caught.
+    std::fs::write(&gcode, "G21\nT3 M6\nG0 X0. Y0. Z30. A0.\nG0 Z5.\nG1 X5. F100\nG0 Z30.\n").unwrap();
+    let r = run(&mut s, "cam.simulate", json!({"path": gcode, "job": barrel_job(), "resolution": 0.2}));
+    assert_eq!(r["passed"], false, "{r}");
+    assert!(r["rapids_in_material"].as_array().is_some_and(|m| !m.is_empty()), "{r}");
+    assert!(r["gouge"]["worst"].as_f64().is_some_and(|w| w > 4.0), "{r}");
+}

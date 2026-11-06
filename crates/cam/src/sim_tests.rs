@@ -371,6 +371,9 @@ fn derived_stock_and_hostile_input() {
         "G1 X20. Y20. Z-1. F100\nG2 X20. Y20.001 Z-2. I-999999. J0.",
         "G1 X20. Y20. Z-1. F100\nG3 X21. Y20. I999999999. J5.",
         "G1 X20. Y20. Z-1. F100\nG1 X20.0000001 Z1000000. F100",
+        "G1 X20. Y20. Z-1. F100\nG18 G2 X20. Z-1. I999999. K0.",
+        "G1 X20. Y20. Z-1. F100\nG19 G3 Y20. Z-1. J0. K0.\nG17",
+        "G1 X20. Y20. Z-1. F100\nG18 G2 X-999999999. Z5. I0.0000001 K999999999.",
         "T9.5 M6",
         "M6",
     ] {
@@ -378,7 +381,7 @@ fn derived_stock_and_hostile_input() {
     }
     let rotary = Machine::four_axis_a();
     let round = StockShape::Cylinder { x_min: -10.0, x_max: 10.0, radius: 12.0 };
-    for moves in ["G0 X0 Y0 Z20 A0\nG1 A99999. F100", "G0 X0 Y0 Z20 A0\nG1 X1. Y0. Z-60. A5. F100", "G0 X0 Y0 Z20 A0\nG2 X0 Y0.001 I-5 J0 F100"] {
+    for moves in ["G0 X0 Y0 Z20 A0\nG1 A99999. F100", "G0 X0 Y0 Z20 A0\nG1 X1. Y0. Z-60. A5. F100", "G0 X0 Y0 Z20 A0\nG2 X0 Y0.001 I-5 J0 F100", "G0 X0 Y0 Z20 A0\nG18 G2 X0 Z20 I999999 K0 F100", "G0 X0 Y0 Z20 A0\nG19 G3 Y0 Z20 J-5 K0 F100"] {
         let _ = simulate(&format!("T1 M6\n{moves}\n"), &rotary, &t, &round, &cylinder_x(10.0, -15.0, 15.0, 64), &params(0.01, 0.2));
     }
 }
@@ -440,4 +443,84 @@ fn a_fifty_millimetre_part_at_a_twentieth_of_a_millimetre() {
     // The preview mesh is bounded.
     let mesh = r.stock.mesh(256);
     assert!(mesh.positions.len() <= 257 * 257 && mesh.triangles.len() > 1000);
+}
+
+#[test]
+fn an_arc_back_to_its_start_is_a_full_circle() {
+    // The controller runs an arc whose end is its start as a whole turn, level or helical.
+    let part = block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(40.0, 40.0, -5.0));
+    let level = run(&program("G0 X25. Y20.\nG0 Z1.\nG1 Z-2. F200\nG2 X25. Y20. I-5. J0. F800\nG0 Z10."), &flat(4.0), &part, 0.1);
+    for (x, y) in [(15.05, 20.0), (20.0, 24.95), (20.0, 15.05), (24.95, 20.0)] {
+        assert_eq!(height_at(&level, x, y), -2.0, "the ring at {x} {y}");
+    }
+    assert_eq!(height_at(&level, 20.05, 20.05), 0.0, "the middle is left");
+    close(level.removed_volume, std::f64::consts::PI * (7.0f64.powi(2) - 3.0f64.powi(2)) * 2.0, 1.0);
+    // Its time is a whole turn's: 2π·5 mm at 800 mm/min, and the plunge.
+    assert!(level.minutes > std::f64::consts::TAU * 5.0 / 800.0, "{}", level.minutes);
+    // Counter-clockwise, and down a full turn of a helix: half way round is half way down.
+    let helix = run(&program("G0 X25. Y20.\nG0 Z0.\nG3 X25. Y20. Z-4. I-5. J0. F500\nG0 Z10."), &ball(4.0), &part, 0.1);
+    close(height_at(&helix, 15.05, 20.0), -2.0, 0.05);
+    let lowest = cells(&helix).into_iter().map(|c| c.2).fold(f64::INFINITY, f64::min);
+    close(lowest, -4.0, 0.01);
+    // A full circle that goes too deep is a gouge (the part is at -5).
+    let deep = run(&program("G0 X25. Y20.\nG0 Z1.\nG1 Z-4. F200\nG2 X25. Y20. Z-6. I-5. J0. F800\nG0 Z10."), &flat(4.0), &part, 0.1);
+    assert!(deep.gouge_cells > 100, "{}", deep.gouge_cells);
+    close(deep.gouge_worst, 1.0, 0.05);
+}
+
+#[test]
+fn arcs_in_the_xz_and_yz_planes_turn_about_their_own_centres() {
+    // Half circles of radius 3 from (10, 20, 0): in G18 a G2 (clockwise seen from +Y) dips to
+    // Z-3 under X13, a G3 rises over it; in G19 a G3 (counter-clockwise seen from +X) dips to
+    // Z-3 under Y23. A 2 mm ball, so the trench's bottom is the tip's lowest point.
+    let part = block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(40.0, 40.0, -5.0));
+    let tool = ball(2.0);
+    let dip = run(&program("G0 X10. Y20.\nG0 Z1.\nG1 Z0. F200\nG18 G2 X16. Z0. I3. K0. F500\nG17\nG0 Z10."), &tool, &part, 0.1);
+    close(height_at(&dip, 13.0, 20.0), -3.0, 0.01);
+    // Part way round, the ball's envelope: a torus of tube radius 1 about the circle of its
+    // centres (radius 3 about X13 Z1), at the cell's centre (10.85, 20.05).
+    let rho = 3.0 + (1.0f64 - 0.05 * 0.05).sqrt();
+    close(height_at(&dip, 10.85, 20.0), 1.0 - (rho * rho - 2.15 * 2.15).sqrt(), 0.01);
+    assert_eq!(height_at(&dip, 13.0, 21.25), 0.0, "the trench is the ball's width");
+    assert_eq!(dip.gouge_cells, 0);
+    let over = run(&program("G0 X10. Y20.\nG0 Z1.\nG1 Z0. F200\nG18 G3 X16. Z0. I3. K0. F500\nG17\nG0 Z10."), &tool, &part, 0.1);
+    assert_eq!(over.removed_volume, 0.0, "over the top cuts nothing");
+    let side = run(&program("G0 X10. Y20.\nG0 Z1.\nG1 Z0. F200\nG19 G3 Y26. Z0. J3. K0. F500\nG17\nG0 Z10."), &tool, &part, 0.1);
+    close(height_at(&side, 10.0, 23.0), -3.0, 0.01);
+    assert_eq!(height_at(&side, 13.0, 23.0), 0.0);
+    // Its time is the half circle's: π·3 mm at 500 mm/min, the plunge at 200.
+    close(side.minutes, std::f64::consts::PI * 3.0 / 500.0 + 1.0 / 200.0, 1e-6);
+    // Too deep a dip is a gouge.
+    let deep = run(&program("G0 X10. Y20.\nG0 Z1.\nG1 Z-3. F200\nG18 G2 X16. Z-3. I3. K0. F500\nG17\nG0 Z10."), &tool, &part, 0.1);
+    close(deep.gouge_worst, 1.0, 0.02);
+}
+
+#[test]
+fn a_long_three_axis_move_is_not_refused_for_a_fine_tolerance() {
+    // Tool positions are only placed along the blocks on a 4th axis: a 3-axis program with a
+    // drill and a fine tolerance runs whatever its moves' lengths.
+    let stock = StockShape::Box { min: Vec3::new(0.0, 0.0, -10.0), max: Vec3::new(1500.0, 40.0, 0.0) };
+    let part = block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(1500.0, 40.0, -5.0));
+    let text = program("G0 X10. Y20. Z5.\nG1 Z-1. F100\nG0 Z5.\nG0 X1400.\nG1 Z-1. F100\nG0 Z10.");
+    let r = simulate(&text, &Machine::three_axis(), &[drill(6.0)], &stock, &part, &params(0.0001, 1.0)).unwrap();
+    assert!(r.rapids_in_material.is_empty(), "{:?}", r.rapids_in_material);
+    assert_eq!(r.gouge_cells, 0);
+    assert!(r.removed_volume > 0.0);
+}
+
+#[test]
+fn a_program_that_never_writes_the_rotary_is_not_taken_as_checked() {
+    // On a 4th axis a program without an A word has no block whose position is known: the
+    // report says nothing was simulated rather than looking like a clean pass.
+    let part = cylinder_x(10.0, -15.0, 15.0, 64);
+    let stock = StockShape::Cylinder { x_min: -10.0, x_max: 10.0, radius: 12.0 };
+    let text = "G21\nT1 M6\nG0 X0. Y0. Z30.\nG0 Z5.\nG1 X5. F100\nG0 Z30.\n";
+    let r = simulate(text, &Machine::four_axis_a(), &[ball(6.0)], &stock, &part, &params(0.01, 0.2)).unwrap();
+    assert_eq!(r.moves, 0);
+    assert!(r.warnings.iter().any(|w| w.contains("no move")), "{:?}", r.warnings);
+    // With the A written the same program is simulated, and its plunge to 5 is a gouge.
+    let text = "G21\nT1 M6\nG0 X0. Y0. Z30. A0.\nG0 Z5.\nG1 X5. F100\nG0 Z30.\n";
+    let r = simulate(text, &Machine::four_axis_a(), &[ball(6.0)], &stock, &part, &params(0.01, 0.2)).unwrap();
+    assert_eq!(r.moves, 4);
+    assert!(r.gouge_worst > 4.0, "{}", r.gouge_worst);
 }

@@ -196,7 +196,9 @@ into the stock: a crash on the machine), `leftover: {max, mean, cells}` (materia
 part over the cells the program cut), `removed_volume` (mm³), `minutes` (at feed, as the
 controller times it), `slot_moves` (cuts at the tool's full width, also listed in `warnings`:
 keep their depth and feed low on a light machine), `passed` (no gouge and no rapid in material),
-`failures`, `warnings`, `notes` and `stock_stl`. A failed simulation is reported, never refused;
+`failures`, `warnings`, `notes` and `stock_stl`. A program with no move the simulation can
+follow (on a 4th axis, one that never writes A: no block's position is known) fails rather than
+passing with nothing checked. A failed simulation is reported, never refused;
 inside `cam.job` its failures join the job's. When an operation of the job has `gouge_check:
 false` (an engraving), the simulation's gouges are warned about, not failed.
 
@@ -211,7 +213,11 @@ found exactly, not at sampled positions: along a straight move the tool's height
 convex in the position along the move, so its least value is found in closed form (flat end
 mill, ball, drill point at 118°) or by bisection on its slope to rounding (bull nose). A level arc
 is exact as well; an arc that also moves in Z (a helix) is followed as chords at most a quarter
-of the tolerance inside it. The tool is its cutting end with its diameter carried on up, so a cut
+of the tolerance inside it. An arc whose end is written at its start is a whole turn, as the
+controller runs it. An arc in the XZ plane (`G18`, centre from `I K`, `G2` clockwise seen from
++Y) or the YZ plane (`G19`, centre from `J K`, `G2` clockwise seen from +X), as some posts write
+lead-ins, is followed about its own centre, as chords at most a quarter of the tolerance inside
+it. The tool is its cutting end with its diameter carried on up, so a cut
 deeper than the flutes still removes material.
 
 **4th axis (A about X).** The stock is a grid over (x, A) holding how far out the material

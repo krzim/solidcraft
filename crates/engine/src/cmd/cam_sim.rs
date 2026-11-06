@@ -93,6 +93,14 @@ pub(super) fn check_program(
     let report = run_sim(text, machine, tools, &stock, part, &SimParams { tolerance: tol, resolution }).map_err(|e| cam_err(cmd, "simulation", e))?;
     let mut failures = Vec::new();
     let mut warnings = report.warnings.clone();
+    if report.moves == 0 {
+        // Nothing checked is not a pass.
+        failures.push(
+            "simulation: no move of the program could be followed (none comes after every axis of the machine, its rotary included, is \
+             written)"
+                .to_string(),
+        );
+    }
     if report.gouge_cells > 0 {
         let what =
             format!("the program cuts up to {} mm into the part over {} cells of the simulated stock", num(report.gouge_worst), report.gouge_cells);

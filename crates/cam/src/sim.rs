@@ -145,6 +145,9 @@ pub struct SimReport {
     pub cells: usize,
     /// The stock as the program leaves it.
     pub stock: StockGrid,
+    /// Motion blocks simulated (0: the program has none whose position is known, as when a 4th
+    /// axis is never written, so nothing was checked).
+    pub moves: usize,
     /// Every motion block that removed material, in program order.
     pub removals: Vec<BlockRemoval>,
     /// Rapids that cut more than the tolerance deep: a crash on the machine.
@@ -687,6 +690,16 @@ impl Heights {
     }
 }
 
+/// The turn of an arc from `from` to `to` about `center` as the controller runs it (signed,
+/// radians): an arc whose end is written at its start is a whole turn, not none.
+fn arc_turn(from: Vec3, to: Vec3, center: Vec2, ccw: bool) -> f64 {
+    let (a, b) = (Vec2::new(from.x, from.y), Vec2::new(to.x, to.y));
+    if a.dist(b) <= 1e-9 && a.dist(center) > 1e-9 {
+        return if ccw { TAU } else { -TAU };
+    }
+    arc_sweep(from, to, center, ccw)
+}
+
 /// Whether the angle `ang` is on an arc starting at `start` and turning `sweep` (signed).
 fn within_sweep(ang: f64, start: f64, sweep: f64) -> bool {
     if sweep >= 0.0 { (ang - start).rem_euclid(TAU) <= sweep + 1e-12 } else { (start - ang).rem_euclid(TAU) <= -sweep + 1e-12 }
@@ -949,39 +962,65 @@ fn pose_at(machine: &Machine, linear: Vec3, rotary: &[f64], tcp: bool) -> Pose {
     if tcp { Pose { tip: linear, axis: tool_axis(machine, rotary) } } else { forward(machine, &Joints { linear, rotary: rotary.to_vec() }) }
 }
 
-/// The tool loaded at each line (`T` with `M6`), and the lines that lose the position (a
-/// return home or a move in machine coordinates), both in line order.
-fn tool_changes_and_gaps(text: &str) -> Result<(Vec<(usize, u32)>, Vec<usize>)> {
-    let (mut changes, mut gaps) = (Vec::new(), Vec::new());
-    let mut pending: Option<u32> = None;
-    for (i, line) in text.lines().enumerate() {
-        let n = i + 1;
-        let ws = words(line, n)?;
-        let mut m6 = false;
-        for &(c, v) in &ws {
-            match c {
-                'T' => {
-                    if !((0.0..=1.0e6).contains(&v) && v.fract() == 0.0) {
-                        return Err(CamError::Parse(n, "a tool number must be a whole number".into()));
+/// What the simulation reads of a program beside [`parse5`]'s motion.
+#[derive(Default)]
+struct Scan {
+    /// The tool loaded at each line (`T` with `M6`), in line order.
+    changes: Vec<(usize, u32)>,
+    /// The lines that lose the position (a return home or a move in machine coordinates).
+    gaps: Vec<usize>,
+    /// Lines in the XZ or YZ plane (`G18`, `G19`), with their `I J K` words (0 when not
+    /// written, in the program's units), in line order.
+    planes: Vec<(usize, Plane, [f64; 3])>,
+}
+
+impl Scan {
+    fn of(text: &str) -> Result<Scan> {
+        let mut scan = Scan::default();
+        let mut pending: Option<u32> = None;
+        let mut plane = Plane::Xy;
+        for (i, line) in text.lines().enumerate() {
+            let n = i + 1;
+            let ws = words(line, n)?;
+            let mut m6 = false;
+            let mut ijk = [0.0; 3];
+            for &(c, v) in &ws {
+                match c {
+                    'T' => {
+                        if !((0.0..=1.0e6).contains(&v) && v.fract() == 0.0) {
+                            return Err(CamError::Parse(n, "a tool number must be a whole number".into()));
+                        }
+                        pending = Some(v as u32);
                     }
-                    pending = Some(v as u32);
+                    'M' if (v - 6.0).abs() < 1e-9 => m6 = true,
+                    'G' => match (v * 10.0).round() as i64 {
+                        280 | 300 | 530 => scan.gaps.push(n),
+                        170 => plane = Plane::Xy,
+                        180 => plane = Plane::Zx,
+                        190 => plane = Plane::Yz,
+                        _ => {}
+                    },
+                    'I' => ijk[0] = v,
+                    'J' => ijk[1] = v,
+                    'K' => ijk[2] = v,
+                    _ => {}
                 }
-                'M' if (v - 6.0).abs() < 1e-9 => m6 = true,
-                'G' => {
-                    let g = (v * 10.0).round() as i64;
-                    if matches!(g, 280 | 300 | 530) {
-                        gaps.push(n);
-                    }
-                }
-                _ => {}
+            }
+            if plane != Plane::Xy {
+                scan.planes.push((n, plane, ijk));
+            }
+            if m6 {
+                let Some(t) = pending else { return Err(CamError::Parse(n, "a tool change (M6) without a tool number (T)".into())) };
+                scan.changes.push((n, t));
             }
         }
-        if m6 {
-            let Some(t) = pending else { return Err(CamError::Parse(n, "a tool change (M6) without a tool number (T)".into())) };
-            changes.push((n, t));
-        }
+        Ok(scan)
     }
-    Ok((changes, gaps))
+
+    /// The plane and `I J K` of `line`, when it is not XY.
+    fn plane_at(&self, line: usize) -> Option<(Plane, [f64; 3])> {
+        self.planes.binary_search_by_key(&line, |(n, _, _)| *n).ok().and_then(|k| self.planes.get(k)).map(|(_, p, ijk)| (*p, *ijk))
+    }
 }
 
 /// The tool in the spindle at `line`.
@@ -1010,6 +1049,104 @@ enum How {
     /// Round an arc of the linear axes (rotaries held) about `center`, turning `sweep`;
     /// `work_center` is the centre in work coordinates (3-axis).
     Arc { from: Vec3, to: Vec3, center: Vec2, work_center: Vec2, sweep: f64, rotary: Vec<f64>, tcp: bool },
+    /// An arc in the XZ (`G18`) or YZ (`G19`) plane, the rotaries held, as `chords` chords on a
+    /// 3-axis machine.
+    Tilted { arc: PlaneArc, chords: usize, rotary: Vec<f64>, tcp: bool },
+}
+
+/// The plane an arc is in (`G17`, `G18`, `G19`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Plane {
+    Xy,
+    Zx,
+    Yz,
+}
+
+impl Plane {
+    /// The plane's first and second axes and its normal (indices into X, Y, Z): turning from
+    /// the first towards the second is counter-clockwise (`G3`) seen from the normal's +end.
+    fn axes(self) -> (usize, usize, usize) {
+        match self {
+            Plane::Xy => (0, 1, 2),
+            Plane::Zx => (2, 0, 1),
+            Plane::Yz => (1, 2, 0),
+        }
+    }
+}
+
+fn comp(v: Vec3, i: usize) -> f64 {
+    match i {
+        0 => v.x,
+        1 => v.y,
+        _ => v.z,
+    }
+}
+
+fn with(mut v: Vec3, i: usize, value: f64) -> Vec3 {
+    match i {
+        0 => v.x = value,
+        1 => v.y = value,
+        _ => v.z = value,
+    }
+    v
+}
+
+/// An arc of the linear axes in a plane of them, moving evenly along the plane's normal.
+#[derive(Clone, Copy, Debug)]
+struct PlaneArc {
+    from: Vec3,
+    to: Vec3,
+    center: Vec3,
+    plane: Plane,
+    radius: f64,
+    start: f64,
+    sweep: f64,
+}
+
+impl PlaneArc {
+    /// The arc from `from` to `to` about `center` (only its in-plane coordinates count), as
+    /// the controller runs it: an end at the start is a whole turn.
+    fn new(from: Vec3, to: Vec3, center: Vec3, plane: Plane, ccw: bool) -> PlaneArc {
+        let (u, v, _) = plane.axes();
+        let s = Vec2::new(comp(from, u) - comp(center, u), comp(from, v) - comp(center, v));
+        let e = Vec2::new(comp(to, u) - comp(center, u), comp(to, v) - comp(center, v));
+        let sweep = if s.dist(e) <= 1e-9 {
+            if s.len() > 1e-9 { if ccw { TAU } else { -TAU } } else { 0.0 }
+        } else {
+            let delta = (e.angle() - s.angle()).rem_euclid(TAU);
+            let delta = if delta.is_finite() { delta } else { 0.0 };
+            if ccw { delta } else { delta - TAU }
+        };
+        PlaneArc { from, to, center, plane, radius: s.len(), start: s.angle(), sweep }
+    }
+
+    /// The point a fraction `t` of the way along.
+    fn at(&self, t: f64) -> Vec3 {
+        if t >= 1.0 {
+            return self.to;
+        }
+        let (u, v, w) = self.plane.axes();
+        let p = Vec2::from_angle(self.start + self.sweep * t) * self.radius;
+        let q = with(self.from, u, comp(self.center, u) + p.x);
+        let q = with(q, v, comp(self.center, v) + p.y);
+        with(q, w, comp(self.from, w) + (comp(self.to, w) - comp(self.from, w)) * t)
+    }
+
+    fn length(&self) -> f64 {
+        let (_, _, w) = self.plane.axes();
+        (self.radius * self.sweep.abs()).hypot(comp(self.to, w) - comp(self.from, w))
+    }
+
+    /// Chords at most `e` inside the arc.
+    fn chords(&self, e: f64) -> Result<usize> {
+        let e = e.min(self.radius);
+        let step = if self.radius > 1e-9 { 2.0 * (1.0 - e / self.radius).clamp(-1.0, 1.0).acos() } else { TAU };
+        let n = (self.sweep.abs() / step.max(1e-9)).ceil().max(1.0);
+        if !(n <= MAX_BLOCK_POINTS as f64) {
+            return Err(CamError::TooLarge("an arc needs too many chords to simulate".into()));
+        }
+        Ok(n as usize)
+    }
 }
 
 /// One block as the simulation runs it.
@@ -1033,33 +1170,39 @@ struct BandRun {
     cmp: Comparison,
 }
 
-/// The tool positions of `step` on a 4th axis, after its start.
-fn step_poses(machine: &Machine, step: &Step) -> Vec<Pose> {
+/// The tool positions of `step` on a 4th axis, after its start, one at a time (a block may
+/// have up to [`MAX_BLOCK_POINTS`], and every band walks them).
+fn each_pose(machine: &Machine, step: &Step, mut f: impl FnMut(&Pose) -> Result<()>) -> Result<()> {
     let n = step.points.max(1);
     let t = |k: usize| k as f64 / n as f64;
     match &step.how {
-        How::Straight => (0..=n).map(|k| Pose { tip: step.start.tip.lerp(step.end.tip, t(k)), axis: step.end.axis }).collect(),
-        How::Joint { from, to, tcp } => (1..=n)
-            .map(|k| {
+        How::Straight => {
+            for k in 0..=n {
+                f(&Pose { tip: step.start.tip.lerp(step.end.tip, t(k)), axis: step.end.axis })?;
+            }
+        }
+        How::Joint { from, to, tcp } => {
+            for k in 1..=n {
                 let j = from.lerp(to, t(k));
-                pose_at(machine, j.linear, &j.rotary, *tcp)
-            })
-            .collect(),
+                f(&pose_at(machine, j.linear, &j.rotary, *tcp))?;
+            }
+        }
         How::Arc { from, to, center, sweep, rotary, tcp, .. } => {
             let st = Vec2::new(from.x, from.y) - *center;
             let rad = st.len();
-            (1..=n)
-                .map(|k| {
-                    let q = if k == n {
-                        *to
-                    } else {
-                        (*center + Vec2::from_angle(st.angle() + sweep * t(k)) * rad).extend(from.z + (to.z - from.z) * t(k))
-                    };
-                    pose_at(machine, q, rotary, *tcp)
-                })
-                .collect()
+            for k in 1..=n {
+                let q =
+                    if k == n { *to } else { (*center + Vec2::from_angle(st.angle() + sweep * t(k)) * rad).extend(from.z + (to.z - from.z) * t(k)) };
+                f(&pose_at(machine, q, rotary, *tcp))?;
+            }
+        }
+        How::Tilted { arc, rotary, tcp, .. } => {
+            for k in 1..=n {
+                f(&pose_at(machine, arc.at(t(k)), rotary, *tcp))?;
+            }
         }
     }
+    Ok(())
 }
 
 /// Runs every step through one band of the stock, then holds the band against the part.
@@ -1079,13 +1222,24 @@ fn run_band(mut model: Model, steps: &[Step], machine: &Machine, part: &Surface,
         let out = match &mut model {
             Model::Heights(h) => match &step.how {
                 How::Arc { work_center, sweep, .. } => h.sweep_arc(&step.profile, step.start.tip, step.end.tip, *work_center, *sweep, tol)?,
+                How::Tilted { arc, chords, rotary, tcp } => {
+                    let mut out = Removed::default();
+                    let mut prev = step.start.tip;
+                    for k in 1..=*chords {
+                        let tip = pose_at(machine, arc.at(k as f64 / *chords as f64), rotary, *tcp).tip;
+                        out.add(h.sweep_line(&step.profile, prev, tip)?);
+                        prev = tip;
+                    }
+                    out
+                }
                 _ => h.sweep_line(&step.profile, step.start.tip, step.end.tip)?,
             },
             Model::Radii(r) => {
                 let mut out = Removed::default();
-                for pose in step_poses(machine, step) {
-                    out.add(r.stamp(&step.profile, &pose)?);
-                }
+                each_pose(machine, step, |pose| {
+                    out.add(r.stamp(&step.profile, pose)?);
+                    Ok(())
+                })?;
                 out
             }
         };
@@ -1167,7 +1321,7 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
         profiles.push((t.number, Profile::of(t)?));
     }
     let blocks = parse5(text, &machine.letters())?;
-    let (changes, gaps) = tool_changes_and_gaps(text)?;
+    let scan = Scan::of(text)?;
     let (grid, cell) = grid_for(stock, params)?;
     let (reach, initial) = match *stock {
         StockShape::Box { min, max } => ((max - min).len(), max.z),
@@ -1192,8 +1346,9 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
                 continue;
             }
         };
-        let profile = *tool_at(&changes, &profiles, line)?;
+        let profile = *tool_at(&scan.changes, &profiles, line)?;
         // The position before this block, unless the program lost it since the last one.
+        let gaps = &scan.gaps;
         let lost = |since: usize| gaps.partition_point(|g| *g <= since) < gaps.partition_point(|g| *g <= line);
         let from = state.as_ref().filter(|s| s.tcp == tcp && !lost(s.line)).cloned();
         let to = State { linear, rotary, tcp, line };
@@ -1224,11 +1379,20 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
             JointWords::Arc { .. } => feed_length += length,
             JointWords::Dwell { .. } => {}
         }
-        let step_len = profile.step(tol);
-        let (how, points) = match (b, &from) {
-            (JointWords::Arc { center, ccw, f, mm_per_unit, .. }, Some(f0)) => {
+        let (how, travel) = match (b, &from, scan.plane_at(line)) {
+            // An arc in the XZ or YZ plane: the reader takes `I J` as in XY, so its centre and
+            // turn are found again from the block's own words.
+            (JointWords::Arc { ccw, f, mm_per_unit, .. }, Some(f0), Some((plane, ijk))) => {
+                let center = f0.linear + Vec3::new(ijk[0], ijk[1], ijk[2]) * *mm_per_unit;
+                let arc = PlaneArc::new(f0.linear, to.linear, center, plane, *ccw);
+                let travel = arc.length();
+                minutes += travel / (f * mm_per_unit);
+                let chords = if kind == Kind::Three { arc.chords(tol * 0.25)? } else { 0 };
+                (How::Tilted { arc, chords, rotary: to.rotary.clone(), tcp }, travel)
+            }
+            (JointWords::Arc { center, ccw, f, mm_per_unit, .. }, Some(f0), None) => {
                 let st = Vec2::new(f0.linear.x, f0.linear.y) - *center;
-                let sweep = arc_sweep(f0.linear, to.linear, *center, *ccw);
+                let sweep = arc_turn(f0.linear, to.linear, *center, *ccw);
                 let travel = (st.len() * sweep).hypot(to.linear.z - f0.linear.z);
                 minutes += travel / (f * mm_per_unit);
                 let offset = end.tip - to.linear;
@@ -1241,24 +1405,30 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
                     rotary: to.rotary.clone(),
                     tcp,
                 };
-                (how, points(travel / step_len)?)
+                (how, travel)
             }
-            (JointWords::Arc { .. }, None) => return Err(CamError::Parse(line, "an arc right after the position was lost".into())),
-            (_, Some(f0)) => {
+            (JointWords::Arc { .. }, None, _) => return Err(CamError::Parse(line, "an arc right after the position was lost".into())),
+            (_, Some(f0), _) => {
                 let (a, c) = (Joints { linear: f0.linear, rotary: f0.rotary.clone() }, Joints { linear: to.linear, rotary: to.rotary.clone() });
                 let lin = a.linear.dist(c.linear);
                 let lever = start.tip.len().max(end.tip.len()) + lin + lever_extra + profile.radius;
                 let travel = length.max(lin) + a.rotary_change(&c) * lever;
-                (How::Joint { from: a, to: c, tcp }, points(travel / step_len)?)
+                (How::Joint { from: a, to: c, tcp }, travel)
             }
-            (_, None) => (How::Straight, points(length / step_len)?),
+            (_, None, _) => (How::Straight, length),
         };
-        if kind == Kind::Rotary {
-            stamps = stamps.saturating_add(points);
+        // Tool positions along the block: only the 4th axis's model places the tool at points
+        // (a heightfield sweeps each block exactly), so only it is limited by them.
+        let points = if kind == Kind::Rotary {
+            let n = points(travel / profile.step(tol))?;
+            stamps = stamps.saturating_add(n);
             if stamps > MAX_STAMPS {
                 return Err(CamError::TooLarge("the program needs too many tool positions to simulate: give a larger tolerance".into()));
             }
-        }
+            n
+        } else {
+            0
+        };
         // Where the material must be for a cut at the tool's full width.
         let probes = (!rapid && matches!(how, How::Joint { .. })).then(|| {
             let mid = Pose { tip: start.tip.lerp(end.tip, 0.5), axis: (start.axis + end.axis).normalized().unwrap_or(end.axis) };
@@ -1296,6 +1466,13 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
     let rapids_in_material: Vec<BlockRemoval> = removals.iter().filter(|r| r.rapid && r.depth > tol).copied().collect();
     let removed_volume = removals.iter().map(|r| r.volume).sum();
     let mut warnings = Vec::new();
+    if steps.is_empty() {
+        warnings.push(
+            "no move of the program was simulated: none comes after every axis of the machine (its rotary included) is written, so \
+             nothing was checked"
+                .into(),
+        );
+    }
     let slots: Vec<usize> = removals.iter().filter(|r| r.slot).map(|r| r.line).collect();
     if !slots.is_empty() {
         let shown: Vec<String> = slots.iter().take(10).map(usize::to_string).collect();
@@ -1348,6 +1525,7 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
             StockGrid::Radii { radii, .. } => radii.len(),
         },
         stock: stock_grid,
+        moves: steps.len(),
         removals,
         rapids_in_material,
         removed_volume,
