@@ -36,9 +36,11 @@ mod ops;
 mod path;
 mod piece;
 mod post;
+pub mod rapids;
 mod readback;
 pub mod readback5;
 pub mod rotary;
+pub mod stock;
 pub mod strategies5;
 mod surface;
 pub mod surface_ops;
@@ -98,7 +100,11 @@ mod helical_tests;
 #[cfg(test)]
 mod kinematics_tests;
 #[cfg(test)]
+mod rapids_tests;
+#[cfg(test)]
 mod rotary_tests;
+#[cfg(test)]
+mod stock_tests;
 #[cfg(test)]
 mod strategies5_tests;
 #[cfg(test)]
