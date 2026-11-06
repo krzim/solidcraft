@@ -143,7 +143,7 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `steep_shallow` | As `scallop`, with `threshold_deg` (40), `overlap` (a tenth of the diameter), `stepdown` (the spacing × sin threshold), `shallow`: `scallop` \| `parallel` (scallop), `angle_deg` (with `parallel`; 0) |
 | `pencil` | `heights`; `min_angle_deg` (30); `passes` (0: the crease alone); `stepover` (tool's, else 10% of its diameter); `min_length` (the tool's radius); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` |
 | `rest_finish` | `heights`; `previous_tool` (a tool number of the job); `threshold` (twice the tolerance); `scallop_height` or `stepover`; `overlap` (a quarter of the diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` |
-| `indexed` | `a_deg` and `operation`: any of the five above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
+| `indexed` | `a_deg` and `operation`: any of the 3-axis operations above (`contour` to `rest_finish`), run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
 | `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}` or `{type: "helix", pitch}`; `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
 | `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
 | `wrap` | `radius` (of the cylinder the path is drawn on); `points: [[x, y, z], …]` (x along the axis, y the arc length round it, z the depth: 0 on the cylinder, negative into it) or `sketch` + `curve` (a curve id; its sketch x and y are taken as x and arc length) with `depth` (0); `clearance` (5) and `retract` (1) above the cylinder; `max_angle_step_deg` (2) |
@@ -184,9 +184,12 @@ whatever its slope. Every pass is then sampled and refined with the drop-cutter 
 `parallel` pass is: no point it cuts at is below where the cutter rests, moves that go down are
 fed no faster down than the plunge feed, and passes are linked by feeding across when the link
 is short and clears the part, otherwise by lifting to the retract height. They can run inside
-`indexed` like the other 3-axis operations. A grid larger than 4 million nodes, more than
-10 000 levels or more drop-cutter samples than the operation's budget is refused with a message
-saying what to make larger.
+`indexed` like the other 3-axis operations. With `climb` (the default) every offset pass and
+z-level keeps what is still to cut on the right of the tool's travel (the spindle turning
+clockwise seen from above), whichever way the passes run: inward, outward, or closing on a
+crease; `climb: false` keeps it on the left. A grid larger than 4 million nodes, more than
+10 000 levels, straight shallow passes of more than 4 million points or more drop-cutter
+samples than the operation's budget is refused with a message saying what to make larger.
 
 - **`scallop`** (constant stepover): passes offset from the boundary inward (`direction:
   "outward"` runs the same passes from the middle out). With `scallop_height` the spacing is
@@ -223,13 +226,16 @@ independently of the strategies on a 0.1 mm grid; `crates/cam/src/finish3d_tests
 | Part | Strategy | Largest | 95% of points under | Points within 0.0125 mm |
 | --- | --- | --- | --- | --- |
 | Dome (radius 12, 7 mm high) | `scallop` | 0.019 mm | 0.0096 mm | 99.7% |
-| Bowl (60° wall, concave fillet radius 4) | `scallop` | 0.021 mm | 0.0102 mm | 97.4% |
-| Bowl | `steep_shallow` (40°, scallop) | 0.023 mm | 0.0096 mm | 97.8% |
-| Bowl | `steep_shallow` (40°, parallel) | 0.027 mm | 0.0072 mm | 98.8% |
+| Bowl (60° wall, concave fillet radius 4) | `scallop` | 0.021 mm | 0.0109 mm | 96.6% |
+| Bowl | `steep_shallow` (40°, scallop) | 0.023 mm | 0.0100 mm | 97.4% |
+| Bowl | `steep_shallow` (40°, parallel) | 0.027 mm | 0.0076 mm | 98.6% |
 | Three treads 4 mm apart | `scallop` | 0.018 mm | 0.0090 mm | 99.95% |
 | Three treads | `steep_shallow` (45°) | 0.016 mm | 0.0094 mm | 99.9% |
 
-The largest values are at single points where offset fronts meet. On a sharp wall-and-floor
-corner a 10 mm ball leaves up to 5.6 mm; `rest_finish` with a 4 mm ball after it leaves at most
+The largest values are at single points where offset fronts meet. On the dome a plain
+`parallel` raster at the stepover the scallop height gives on flat ground does about as well
+(0.019 mm, 95% under 0.0087 mm, 98.5% within) with a shorter path (1860 mm against 2470 mm): the
+dome shows no advantage for `scallop`, and the other parts were not compared with a raster. On a
+sharp wall-and-floor corner a 10 mm ball leaves up to 5.6 mm; `rest_finish` with a 4 mm ball after it leaves at most
 0.016 mm, and cuts nothing on the floor further out or on the top. A pencil pass on a fillet
 joint tighter than the ball runs within 0.003 mm of where the ball touches both faces.

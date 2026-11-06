@@ -62,6 +62,9 @@ const MAX_PENCIL_PASSES: u32 = 100;
 const CLEANUP_ANGLE: f64 = 30.0;
 /// Most passes of a group put in order by distance; a larger group keeps the order found.
 const MAX_ORDERED: usize = 4000;
+/// Most points of the straight shallow passes of [`steep_shallow`] before they are clipped and
+/// cut: each becomes a move, and a path holds at most [`MAX_MOVES`].
+const MAX_LINE_POINTS: usize = 2 * MAX_MOVES;
 
 /// The 8 neighbours of a node, counter-clockwise from +X.
 const RING: [(isize, isize); 8] = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)];
@@ -972,13 +975,16 @@ fn nearest_first(mut runs: Vec<Run>, mut from: Option<Vec2>) -> Vec<Run> {
     out
 }
 
-/// XY lines as runs at the floor, turned for climb milling (lines are traced with what is
-/// still to cut on their left).
-fn runs_at(lines: Vec<Vec<Vec2>>, level: f64, climb: bool) -> Vec<Run> {
+/// XY lines as runs at `level`, each turned so what is still to cut is on its right for climb
+/// milling and on its left for conventional. The lines are distance lines traced with the
+/// further side on their left; `ahead_further` says whether the passes still to cut are on that
+/// side (passes run away from where the distance is measured from) or on the nearer side (they
+/// run towards it: outward offsets, a pencil's offsets closing on its crease).
+fn runs_at(lines: Vec<Vec<Vec2>>, level: f64, climb: bool, ahead_further: bool) -> Vec<Run> {
     lines
         .into_iter()
         .map(|mut pts| {
-            if climb {
+            if climb == ahead_further {
                 pts.reverse();
             }
             Run { pts, level }
@@ -999,8 +1005,9 @@ pub fn scallop(surface: &Surface, tool: &Tool, p: &ScallopParams) -> Result<Tool
     plan.link_len = (2.0 * d).max(tool.diameter);
     let weight = plan.weights(by_height, d, tool.diameter);
     let domain = plan.map.inside.clone();
-    let mut groups: Vec<Vec<Run>> = plan.offsets(&domain, &weight, d)?.into_iter().map(|g| runs_at(g, p.heights.bottom, p.climb)).collect();
-    if p.direction == OffsetDirection::Outward {
+    let inward = p.direction == OffsetDirection::Inward;
+    let mut groups: Vec<Vec<Run>> = plan.offsets(&domain, &weight, d)?.into_iter().map(|g| runs_at(g, p.heights.bottom, p.climb, inward)).collect();
+    if !inward {
         groups.reverse();
     }
     groups.push(plan.cleanup()?);
@@ -1089,7 +1096,7 @@ pub fn steep_shallow(surface: &Surface, tool: &Tool, p: &SteepShallowParams) -> 
             let domain: Vec<bool> = (0..map.len()).map(|k| map.inside.get(k).copied().unwrap_or(false) && !is_steep(k)).collect();
             for g in plan.offsets(&domain, &weight, d)? {
                 let lines: Vec<Vec<Vec2>> = g.into_iter().flat_map(|l| clip(l, &keep_shallow)).collect();
-                groups.push(runs_at(lines, p.heights.bottom, p.climb));
+                groups.push(runs_at(lines, p.heights.bottom, p.climb, true));
             }
         }
         ShallowPattern::Parallel { angle } => {
@@ -1103,8 +1110,10 @@ pub fn steep_shallow(surface: &Surface, tool: &Tool, p: &SteepShallowParams) -> 
             let (ta, tb) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), c| (a.min(c.dot(dir)), b.max(c.dot(dir))));
             let count = ((hi - lo) / gap).ceil();
             let along = ((tb - ta) / map.gx.min(map.gy)).ceil();
-            if !(count * along <= MAX_WORK) || !(count <= MAX_LEVELS as f64 * 100.0) {
-                return Err(CamError::TooLarge("the shallow passes visit more than 1e9 grid points; use a larger spacing or step".into()));
+            // Every point of these lines becomes at least one move once they are cut, so lines
+            // with far more points than a path may hold are refused before they are built.
+            if !((count + 1.0) * (along + 1.0) <= MAX_LINE_POINTS as f64) {
+                return Err(CamError::TooLarge(format!("the shallow passes have more than {MAX_LINE_POINTS} points; use a larger spacing or step")));
             }
             let inside_rect = |q: Vec2| {
                 let e = 1e-9;
@@ -1277,7 +1286,8 @@ pub fn pencil(surface: &Surface, tool: &Tool, p: &PencilParams) -> Result<Toolpa
             }
         }
         for g in by_level.into_iter().rev() {
-            groups.push(runs_at(g, floor, p.climb));
+            // Outermost first, closing on the crease: what is still to cut is crease-side.
+            groups.push(runs_at(g, floor, p.climb, false));
         }
     }
     groups.push(lines.into_iter().map(|pts| Run { pts, level: floor }).collect());
@@ -1326,7 +1336,8 @@ fn settle(height: &dyn Fn(Vec2) -> Result<Option<f64>>, q: Vec2, n: Vec2, g: f64
 /// than that by more than the threshold, what it left at the point is measured from the
 /// envelope of every position it can take on the grid: the lowest its cutting surface reaches
 /// over the point, less the point's height, square to the surface. Where that is more than the
-/// threshold the point is to cut. Those places, grown by `overlap`, are cut with passes offset
+/// threshold the point is to cut. Those places, grown by `overlap` measured over the tip's
+/// surface (so not up a cliff onto ground nothing was left on), are cut with passes offset
 /// from their edges inward, as [`scallop`] offsets from a boundary. A path with nothing to cut
 /// has no moves.
 pub fn rest_finish(surface: &Surface, tool: &Tool, p: &RestParams) -> Result<Toolpath> {
@@ -1407,10 +1418,14 @@ pub fn rest_finish(surface: &Surface, tool: &Tool, p: &RestParams) -> Result<Too
         return Out3::new(p.heights, p.feeds).finish();
     }
     let is_rest = |k: usize| rest.get(k).copied().unwrap_or(false);
-    let grow = flat_distance(map, &is_rest, p.overlap + 1e-9);
+    // Grown over the tip's surface, not the plane, so the overlap runs on over the ground round
+    // what is left and stops at a cliff (the small tool riding up onto a wall's top edge, where
+    // nothing was left).
+    let seeds: Vec<(usize, f64)> = (0..map.len()).filter(|k| is_rest(*k)).map(|k| (k, 0.0)).collect();
+    let grow = march(map, &|k| Some(map.p3(k)), &vec![1.0; map.len()], &seeds, p.overlap + 1e-9);
     let domain: Vec<bool> = grow.iter().enumerate().map(|(k, v)| *v <= p.overlap + 1e-9 && map.inside.get(k).copied().unwrap_or(false)).collect();
     let weight = plan.weights(by_height, d, tool.diameter);
-    let mut groups: Vec<Vec<Run>> = plan.offsets(&domain, &weight, d)?.into_iter().map(|g| runs_at(g, floor, p.climb)).collect();
+    let mut groups: Vec<Vec<Run>> = plan.offsets(&domain, &weight, d)?.into_iter().map(|g| runs_at(g, floor, p.climb, true)).collect();
     // The creases inside what is left, where the offsets land a grid step short at best.
     let g = map.gx.max(map.gy);
     let near = flat_distance(map, &|k| domain.get(k).copied().unwrap_or(false), 2.0 * g);

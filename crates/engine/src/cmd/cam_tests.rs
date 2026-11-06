@@ -496,3 +496,44 @@ fn pencil_and_rest_finishing_cut_the_corner_of_a_stepped_block() {
         }
     }
 }
+
+#[test]
+fn steep_shallow_and_outward_scallop_on_a_stepped_block_read_back_and_pass_the_gouge_check() {
+    let mut s = stepped_block();
+    let dir = Dir::new("steep");
+    let scope = Some(solidcraft_io::vfs::PathScope::new([dir.0.clone()]));
+    let h = json!({"clearance": 30, "retract": 15, "top": 8, "bottom": -1});
+    let b = json!({"rect": [[-14, -10], [14, 10]]});
+    let tools = json!([ball(1, 10.0), ball(2, 6.0)]);
+    // The z-levels down the wall at X 0 and the passes on the floor and the top, written,
+    // read back and checked against the block; climb and conventional, inward and outward.
+    for (file, op) in [
+        (
+            "steep.tap",
+            json!({"name": "split", "type": "steep_shallow", "tool": 2, "heights": h, "stepover": 0.6, "threshold_deg": 45, "boundary": b}),
+        ),
+        (
+            "raster.tap",
+            json!({"name": "split", "type": "steep_shallow", "tool": 2, "heights": h, "stepover": 0.6, "shallow": "parallel", "climb": false, "boundary": b}),
+        ),
+        ("out.tap", json!({"name": "offsets", "type": "scallop", "tool": 2, "heights": h, "stepover": 0.6, "direction": "outward", "boundary": b})),
+    ] {
+        let out = dir.file(file);
+        let r = solidcraft_io::vfs::scoped(scope.clone(), || {
+            run(&mut s, "cam.job", json!({"job": finish_job(tools.clone(), op.clone()), "output": out}))
+        });
+        assert_clean(&r);
+        assert!(r["operations"][0]["moves"].as_u64().is_some_and(|m| m > 100), "{r}");
+        let c = run(&mut s, "cam.check", json!({"path": out}));
+        // The ball's tip never below the floor's top, nor outside the boundary.
+        let (lo, hi) = (&c["bounds"][0], &c["bounds"][1]);
+        assert!(lo[2].as_f64().is_some_and(|z| z > -1e-3), "{file}: {c}");
+        assert!(lo[0].as_f64().is_some_and(|x| x > -14.0 - 1e-6) && hi[0].as_f64().is_some_and(|x| x < 14.0 + 1e-6), "{file}: {c}");
+    }
+    // Rest finishing where the previous tool left nothing (the flat top): a job with no cut,
+    // not an error.
+    let rest =
+        json!({"name": "rest", "type": "rest_finish", "tool": 2, "previous_tool": 1, "heights": h, "boundary": {"rect": [[4, -10], [14, 10]]}});
+    let r = run(&mut s, "cam.job", json!({"job": finish_job(tools, rest), "dry_run": true}));
+    assert_eq!(r["passed"], true, "{r}");
+}

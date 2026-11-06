@@ -522,6 +522,10 @@ fn rest_finishing_cuts_only_the_corner() {
     for (_, q) in &cuts {
         assert!(q.x > -5.0 - 0.5 - 0.3 && q.x < 0.3, "{q:?}");
         assert!(q.z < 6.0 - 1e-6 || q.x < 0.0, "{q:?}");
+        // The overlap runs on over the floor, not up the wall onto its top edge: closer to the
+        // wall than its own radius the small ball can only ride that edge, where the big one
+        // left nothing.
+        assert!(q.x < -2.0 + 0.05, "{q:?} rides the wall's top edge");
     }
     let xs =
         cuts.iter().filter(|(_, q)| q.z.abs() < 0.01).map(|(_, q)| q.x).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| (a.min(x), b.max(x)));
@@ -691,5 +695,112 @@ fn hostile_finishing_params_are_refused() {
         let mut p = rp.clone();
         f(&mut p);
         assert!(matches!(rest_finish(&s, &tool, &p), Err(CamError::Invalid(_))), "case {i}");
+    }
+}
+
+/// The turn of the feed moves about the Z axis through `c`, at radii from `r0` to `r1`: the
+/// share of their length going counter-clockwise.
+fn counter_clockwise_share(path: &Toolpath, c: Vec2, r0: f64, r1: f64) -> f64 {
+    let (mut ccw, mut all) = (0.0, 0.0);
+    for (a, b) in feed_moves(path) {
+        let (pa, pb) = (Vec2::new(a.x, a.y) - c, Vec2::new(b.x, b.y) - c);
+        let r = pa.x.hypot(pa.y);
+        let len = pa.dist(pb);
+        if r < r0 || r > r1 || len < 1e-6 {
+            continue;
+        }
+        all += len;
+        if pa.x * pb.y - pa.y * pb.x > 0.0 {
+            ccw += len;
+        }
+    }
+    assert!(all > 10.0, "{all} mm of moves between radius {r0} and {r1}");
+    ccw / all
+}
+
+#[test]
+fn offset_passes_climb_whichever_way_they_run() {
+    // Climb milling keeps what is still to cut on the right of the travel (the spindle turning
+    // clockwise seen from above). Inward, what is left is the middle: the loops round the dome
+    // go clockwise. Outward, it is the outside: they go counter-clockwise.
+    let s = dome();
+    let tool = ball(6.0);
+    let h = heights(8.0);
+    let mut p = scallop_params(h, rect(-14.0, -14.0, 14.0, 14.0), Spacing::Stepover(1.0));
+    p.step = 0.5;
+    for (direction, climb, ccw) in [
+        (OffsetDirection::Inward, true, false),
+        (OffsetDirection::Inward, false, true),
+        (OffsetDirection::Outward, true, true),
+        (OffsetDirection::Outward, false, false),
+    ] {
+        p.direction = direction;
+        p.climb = climb;
+        let path = scallop(&s, &tool, &p).unwrap();
+        verify(&path, &h).unwrap();
+        let share = counter_clockwise_share(&path, Vec2::new(0.0, 0.0), 2.0, 11.0);
+        let want = if ccw { share } else { 1.0 - share };
+        assert!(want > 0.9, "{direction:?} climb {climb}: {share} of the moves counter-clockwise");
+    }
+}
+
+#[test]
+fn pencil_offset_passes_climb_towards_the_crease() {
+    // The offset passes on the floor beside the crease at X -3 leave what is still to cut on
+    // their +X side, towards the crease: climb milling runs them along +Y, conventional along
+    // -Y.
+    let s = fillet_joint(1.0);
+    let tool = ball(6.0);
+    let h = heights(6.0);
+    for climb in [true, false] {
+        let p = PencilParams {
+            heights: h,
+            feeds: feeds(),
+            min_angle: 30f64.to_radians(),
+            passes: 2,
+            stepover: 0.5,
+            min_length: 3.0,
+            boundary: rect(-10.0, -8.0, 8.0, 8.0),
+            stock_to_leave: 0.0,
+            step: 0.2,
+            tolerance: 0.005,
+            climb,
+        };
+        let path = pencil(&s, &tool, &p).unwrap();
+        verify(&path, &h).unwrap();
+        let along: Vec<f64> = feed_moves(&path)
+            .iter()
+            .filter(|(a, b)| b.z.abs() < 0.02 && [-3.5, -4.0].iter().any(|x| (b.x - x).abs() < 0.1) && (b.y - a.y).abs() > 1e-3)
+            .map(|(a, b)| b.y - a.y)
+            .collect();
+        assert!(along.len() > 20, "{along:?}");
+        let forward = along.iter().filter(|dy| **dy > 0.0).count() as f64 / along.len() as f64;
+        assert!(if climb { forward > 0.95 } else { forward < 0.05 }, "climb {climb}: {forward} of the offset moves along +Y");
+    }
+}
+
+#[test]
+fn shallow_rasters_too_dense_to_cut_are_refused_before_they_are_built() {
+    // A stepover of half a micron over a 20 mm square makes over 50 000 passes of 200 points
+    // each: refused while planning, not after building ten million points.
+    let s = dome();
+    let tool = ball(6.0);
+    let sp = SteepShallowParams {
+        heights: heights(8.0),
+        feeds: feeds(),
+        spacing: Spacing::Stepover(5e-4),
+        threshold: 0.7,
+        overlap: 0.5,
+        stepdown: Some(1.0),
+        shallow: ShallowPattern::Parallel { angle: 0.0 },
+        boundary: rect(-10.0, -10.0, 10.0, 10.0),
+        stock_to_leave: 0.0,
+        step: 0.1,
+        tolerance: 0.01,
+        climb: true,
+    };
+    match steep_shallow(&s, &tool, &sp) {
+        Err(CamError::TooLarge(why)) => assert!(why.contains("shallow passes"), "{why}"),
+        other => panic!("{:?}", other.map(|p| p.moves.len())),
     }
 }
