@@ -35,8 +35,9 @@
 //! motion codes) are written the same way as by [`crate::emit`]; after a safe retract or a turn
 //! of the rotaries the next move states its motion code again. With [`Post5::safe_rotate_first`]
 //! an operation that starts by turning the rotaries takes the `safe_rotate` lines before its
-//! comment. A rotary with limits that has room for a whole turn can take a continuous cut past
-//! them with [`Rewind`]s.
+//! comment, and with [`Post5::coolant_after_turn`] its coolant comes on after that first turn
+//! rather than before it. A rotary with limits that has room for a whole turn can take a
+//! continuous cut past them with [`Rewind`]s.
 //!
 //! [`parse5`] reads the motion back (the subset these write), which is how the output is
 //! checked: see [`crate::readback5`].
@@ -100,6 +101,12 @@ pub struct Post5 {
     /// before its comment and tool change, rather than right before the turn.
     #[serde(default, skip_serializing_if = "is_false")]
     pub safe_rotate_first: bool,
+    /// Whether an operation that starts by turning the rotaries switches its coolant on right
+    /// after that turn (`G0 A…` then `M8`) rather than before it, after the operation's start
+    /// lines. Coolant that goes off, and an operation that turns nothing at its start, are
+    /// written as without it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub coolant_after_turn: bool,
     /// Whether a rapid that turns a rotary first rises to the clearance height (`G0 Z…` in the
     /// program's coordinates, after `safe_rotate`), so the part never turns into the tool. The
     /// height is `clearance`, or else the highest rapid of the operation, which is where its
@@ -177,6 +184,7 @@ impl Post5 {
             angle_decimals: 4,
             safe_rotate: Vec::new(),
             safe_rotate_first: false,
+            coolant_after_turn: false,
             clearance_retract: true,
             clearance: None,
             tolerance: 0.005,
@@ -383,6 +391,9 @@ struct Writer5<'a> {
     length_offset: Option<u32>,
     /// The tool in the spindle.
     tool: Option<u32>,
+    /// Lines held back until the operation's first turn of the rotaries is written
+    /// ([`Post5::coolant_after_turn`]), or until any other motion if that comes first.
+    held: Vec<String>,
 }
 
 impl Writer5<'_> {
@@ -414,17 +425,39 @@ impl Writer5<'_> {
     /// The lines of a template. A template may hold any motion code, so the next motion states
     /// its own; one that sets feed per minute (`G94`) ends inverse time.
     fn template(&mut self, lines: &[String], values: &Values) -> Result<()> {
-        for line in lines {
-            let text = fill(line, values)?;
-            if words(&text, 0).is_ok_and(|ws| ws.iter().any(|&(c, v)| c == 'G' && (v * 10.0).round() as i64 == 940)) {
+        let filled = lines.iter().map(|line| fill(line, values)).collect::<Result<Vec<String>>>()?;
+        self.filled(&filled);
+        Ok(())
+    }
+
+    /// Template lines already filled in, written as [`Writer5::template`] writes them.
+    fn filled(&mut self, lines: &[String]) {
+        for text in lines {
+            if words(text, 0).is_ok_and(|ws| ws.iter().any(|&(c, v)| c == 'G' && (v * 10.0).round() as i64 == 940)) {
                 (self.inverse, self.feed) = (false, None);
             }
-            self.block(&text);
+            self.block(text);
         }
         if !lines.is_empty() {
             self.mode = None;
         }
+    }
+
+    /// Holds a template's lines back until the next turn of the rotaries has been written (or
+    /// any other motion comes first).
+    fn hold(&mut self, lines: &[String], values: &Values) -> Result<()> {
+        for line in lines {
+            self.held.push(fill(line, values)?);
+        }
         Ok(())
+    }
+
+    /// The held lines, if any.
+    fn release(&mut self) {
+        if !self.held.is_empty() {
+            let held = std::mem::take(&mut self.held);
+            self.filled(&held);
+        }
     }
 
     /// Safe lines (the post's safe retract or `safe_rotate`) unless the tool is still at the
@@ -563,6 +596,7 @@ impl Writer5<'_> {
         block.extend(self.rotary_words(rot));
         self.block(&join(&block));
         self.mode = None;
+        self.release();
         Ok(())
     }
 
@@ -570,6 +604,7 @@ impl Writer5<'_> {
     /// descending. Where the tool's height is not known it first rises to `rise` (or the
     /// rapid's own height, if higher), so it never moves across at a height it does not know.
     fn rapid(&mut self, to: Vec3, rise: Option<f64>) {
+        self.release();
         let up_first = match self.height {
             Height::At(z) => to.z > z,
             Height::Top => false,
@@ -629,6 +664,7 @@ impl Writer5<'_> {
     }
 
     fn feed(&mut self, to: Vec3, rot: &[f64], rate: Rate) -> Result<()> {
+        self.release();
         let mut words = self.linear_words(to, true, true);
         words.extend(self.rotary_words(rot));
         (self.pos, self.height) = (Some(to), Height::At(to.z));
@@ -646,6 +682,7 @@ impl Writer5<'_> {
 
     /// An arc in the machine's XY plane, the rotaries held: as [`crate::emit`] writes one.
     fn arc(&mut self, to: Vec3, center: Vec2, ccw: bool, feed: f64, rot: &[f64]) -> Result<()> {
+        self.release();
         let Some(from) = self.pos else { return Err(CamError::Unsafe("an arc before the first positioning move".into())) };
         let (nx, ny) = (self.coord(to.x), self.coord(to.y));
         let same_x = self.lin.first().and_then(Option::as_ref) == Some(&nx);
@@ -695,6 +732,7 @@ impl Writer5<'_> {
         if !(seconds >= 0.0) || !(seconds <= 1.0e6) {
             return Err(CamError::Unsafe("a dwell must be 0 seconds or longer".into()));
         }
+        self.release();
         values.seconds = self.value(seconds, 3);
         values.milliseconds = number(seconds * 1000.0, 0);
         let dwell = fill(template, values)?;
@@ -1118,6 +1156,7 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
         mode: None,
         length_offset: None,
         tool: None,
+        held: Vec::new(),
     };
     let mut values = Values { program: plain(name), units: base.units.code().into(), work_offset: work_offset_code(offset)?, ..Values::default() };
     w.comment(name);
@@ -1211,7 +1250,13 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
         }
         w.template(&base.operation_start, &values)?;
         if p.coolant != coolant {
-            w.template(if p.coolant { &base.coolant_on } else { &base.coolant_off }, &values)?;
+            // With `coolant_after_turn` the coolant comes on after the operation's first turn
+            // of the rotaries, where it starts with one.
+            if p.coolant && post.coolant_after_turn && first_turn(&p.motion).is_some_and(|rot| w.turns(rot)) {
+                w.hold(&base.coolant_on, &values)?;
+            } else {
+                w.template(if p.coolant { &base.coolant_on } else { &base.coolant_off }, &values)?;
+            }
             coolant = p.coolant;
         }
         if let Some(t) = tcp
@@ -1286,6 +1331,7 @@ fn emit_ops(name: &str, work_offset: Option<u8>, ops: &[Op<'_>], post: &Post5, m
                 }
             }
         }
+        w.release();
         w.template(&base.operation_end, &values)?;
     }
     w.per_minute();

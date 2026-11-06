@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::cam_rates::{MachineRatesSpec, MachineTimeReport};
 use super::types::SketchRef;
 
 /// Plan and check a CAM job and write its G-code: toolpaths for every operation on the design's
@@ -97,6 +98,14 @@ pub struct CamJob {
     pub tool_library_path: Option<String>,
     /// The operations, run and written in this order.
     pub operations: Vec<OperationSpec>,
+    /// The machine's top rates (from its controller's settings): the reply then times the
+    /// program as the machine runs it and warns about blocks the controller would slow. Give
+    /// this or `machine_rates_path`. Default: none.
+    #[serde(default)]
+    pub machine_rates: Option<MachineRatesSpec>,
+    /// A JSON file holding `machine_rates`, read from the job file's folder when relative.
+    #[serde(default)]
+    pub machine_rates_path: Option<String>,
 }
 
 /// A machine: a preset's name or the CAM crate's `Machine` JSON.
@@ -551,6 +560,13 @@ pub struct CamJobReply {
     pub program_head: Vec<String>,
     /// The program read back and compared with the toolpaths.
     pub readback: ReadbackReport,
+    /// Time at feed of the whole program, dwells included, minutes: as the machine runs it with
+    /// the job's `machine_rates`, otherwise as written.
+    pub cut_minutes: f64,
+    /// Time at rapid with the machine's rapid rates, minutes; `null` without `machine_rates`.
+    pub rapid_minutes: Option<f64>,
+    /// The program timed against the job's `machine_rates`; `null` without them.
+    pub machine_time: Option<MachineTimeReport>,
     /// The gouge check against the part and fixtures.
     pub gouge: GougeReport,
     /// Moves along which a tool's shank or holder comes closer to the part or fixtures than

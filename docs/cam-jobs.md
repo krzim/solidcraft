@@ -100,6 +100,8 @@ silently left at its default. That holds for the tools, the machine and the post
 | `tools` | The tools, as the CAM crate's `Tool` JSON (below). Give this or `tool_library_path`. |
 | `tool_library_path` | A JSON file holding an array of tools. |
 | `operations` | 1 to 200 operations, run and written in order (below). |
+| `machine_rates` | The machine's top rates (below, "Machine rates"): the reply then times the program as the machine runs it and warns about blocks its controller would slow. Default: none. |
+| `machine_rates_path` | A JSON file holding `machine_rates`, read from the job file's folder when relative. |
 
 ### Coordinates
 
@@ -168,3 +170,57 @@ rotary letter's lowest and highest angle), `bounds` and `errors` (the first line
 cannot read). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
 elsewhere are read on a best-effort basis and stop at the first block it cannot follow
 (incremental coordinates, for one).
+
+## Machine rates
+
+A controller moves no axis faster than its top rate. A rapid takes as long as its slowest axis
+needs, and a cut written faster than an axis can go is slowed down, so it takes longer than
+its `F` says. That includes a feed above the machine's top feed, and an inverse-time block
+(`G93`) that turns A faster than A can turn. Give the job the machine's rates and `cam.job`
+times the program as the machine runs it:
+
+```json
+"machine_rates": {"rapid_xyz_mm_min": 8000, "rapid_z_mm_min": 4000, "rapid_a_deg_min": 8000,
+                  "max_feed_mm_min": 8000, "max_feed_z_mm_min": 4000, "max_a_deg_min": 8000,
+                  "spindle_rpm": [10000, 24000], "spindle_start_seconds": 6, "travel_mm": [300, 170, 130]}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `rapid_xyz_mm_min` | Rapid rate of X and Y, and of Z unless `rapid_z_mm_min` is given. Required. |
+| `rapid_z_mm_min` | Rapid rate of Z, where it differs. |
+| `rapid_a_deg_min` | Rapid rate of the rotaries, degrees a minute. Without it a turn at rapid is not timed (the reply says so). |
+| `max_feed_mm_min`, `max_feed_z_mm_min` | Top feed of X and Y, and of Z. |
+| `max_a_deg_min` | Top rate of the rotaries while cutting, degrees a minute. |
+| `spindle_rpm` | `[lowest, highest]`: the controller runs any other `S` at the nearest end of its range. |
+| `spindle_start_seconds` | How long the controller waits at each spindle start (`M3`, `M4`). |
+| `travel_mm` | `[x, y, z]`: the travel of the linear axes. |
+
+A rate left out is not limited. Every rate must be above 0. Unknown keys are refused, in a
+`machine_rates_path` file too.
+
+With rates, the reply's `cut_minutes` is the time at feed as the machine runs it (dwells
+included), `rapid_minutes` the time at rapid, and `machine_time` has the detail:
+`written_cut_minutes` (the `F` words alone), `spindle_minutes`, `total_minutes`,
+`slowed_blocks` (and of those `rotary_over` and `feed_over`), `peak_rotary_deg_min` and
+`peak_feed_mm_min` with their lines, `spindle_out_of_range`, `span_mm` and `warnings`. The
+warnings are in the reply's `notes` too: blocks that ask A for more than `max_a_deg_min`
+(the controller slows them, so the time is longer and the feed at the tool is lower than
+written), blocks that ask a linear axis for more than its top feed, spindle speeds outside
+`spindle_rpm`, and a program that spans more than `travel_mm`. Without rates, `cut_minutes`
+is the time as written and `rapid_minutes` is `null`.
+
+The times leave out acceleration, so they are a lower bound for programs of many short blocks.
+Moves to and from the machine's home (`G28`) are in machine coordinates and are not timed.
+
+### Controller settings a post must match
+
+- **Dwells.** `G4 P` is read in seconds by some controllers and in milliseconds by others; a
+  Mach3 profile has a setting for it. A post's `dwell` template gives the length as
+  `{seconds}` or `{milliseconds}`, exactly one of them (a template with neither or both is
+  refused). The read-back and the machine time read `P` in the same unit, so a post set to
+  milliseconds is checked the same way.
+- **Coolant and the index.** By default an operation switches its coolant on after its start
+  lines, before its first turn of A. A post with `"coolant_after_turn": true` switches it on
+  right after that turn (`G0 A90.` then `M8`). Coolant that goes off, and an operation that
+  turns nothing at its start, are written the same either way.

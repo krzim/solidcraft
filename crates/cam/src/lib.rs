@@ -28,6 +28,7 @@ mod gcode;
 pub mod gcode5;
 pub mod indexed;
 pub mod kinematics;
+pub mod machine_time;
 mod multiaxis;
 mod offset;
 mod ops;
@@ -91,6 +92,8 @@ mod foundation_tests;
 mod gcode5_tests;
 #[cfg(test)]
 mod kinematics_tests;
+#[cfg(test)]
+mod machine_time_tests;
 #[cfg(test)]
 mod rotary_tests;
 #[cfg(test)]
