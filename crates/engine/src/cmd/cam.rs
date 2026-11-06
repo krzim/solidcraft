@@ -59,11 +59,15 @@ pub static COMMANDS: &[CommandSpec] = &[
              tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | roughing | waterline | indexed \
              {a_deg, operation} | rotary_finish | rotary_roughing | wrap, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
-             and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
-             operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, warnings}], \
-             program_lines, program_head, readback: {max_tip_deviation, max_axis_deviation_deg, allowed_tip, allowed_axis_deg, \
+             and toolpaths, self-contained); setup_sheet?: .html | .md path (the operator's sheet: work zero, A convention, tools \
+             with Z min, operations, checks, warnings); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check \
+             fails → operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, \
+             warnings}], program_lines, program_head, readback: {max_tip_deviation, max_axis_deviation_deg, allowed_tip, allowed_axis_deg, \
              cut_minutes, pass}, gouge: {worst, tolerance, hits, skipped, pass}, holder_collisions, passed, failures, dry_run, outputs: \
-             {gcode?, preview?}, notes. Without dry_run or allow_unsafe a failed check refuses and nothing is written",
+             {gcode?, preview?, setup_sheet?}, notes, summary: {work_zero, part_extent, work_offset, rotary, tools: [{number, kind, \
+             diameter, flute_length, stickout?, holder?, z_min?, operations}], operations: [{name, kind, tool, spindle_rpm, feed, \
+             plunge_feed, rotary?, cut_length, cut_minutes}], totals, checks, warnings}. Without dry_run or allow_unsafe a failed \
+             check refuses and nothing is written",
         ),
     CommandSpec::new("cam.posts", "CAM Posts", crate::checked!("cam.posts", posts))
         .noundo()
@@ -747,6 +751,7 @@ struct Planned {
     op: MachineOperation,
     poses: Toolpath5,
     tool: Tool,
+    feeds: Feeds,
     gouge_check: bool,
     report: OperationReport,
     axes: String,
@@ -857,7 +862,7 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             Some(a) => format!("3+1 A{}°", num(a)),
             None => "3-axis".into(),
         };
-        Ok(Planned { op: MachineOperation::Indexed(io), poses, tool: r.tool, gouge_check: c.gouge_check, report, axes })
+        Ok(Planned { op: MachineOperation::Indexed(io), poses, feeds: r.feeds, tool: r.tool, gouge_check: c.gouge_check, report, axes })
     };
     let continuous = |c: Common<'_>, r: Resolved, kind: &str, path: Toolpath5| -> Planned {
         let stats = path.stats();
@@ -872,7 +877,15 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             ..OperationReport::default()
         };
         let op = Operation5 { name: c.name.into(), tool: r.tool.clone(), spindle_rpm: r.rpm, coolant: c.coolant, path: path.clone() };
-        Planned { op: MachineOperation::Continuous(op), poses: path, tool: r.tool, gouge_check: c.gouge_check, report, axes: "4-axis".into() }
+        Planned {
+            op: MachineOperation::Continuous(op),
+            poses: path,
+            feeds: r.feeds,
+            tool: r.tool,
+            gouge_check: c.gouge_check,
+            report,
+            axes: "4-axis".into(),
+        }
     };
     match spec {
         OperationSpec::Contour(o) => indexed(&Op3Spec::Contour(o.clone()), vec![0.0; rotaries], None),
@@ -955,8 +968,9 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         (None, true) => None,
         (None, false) => return Err(bad(cmd, "give `output` (the G-code file to write) or `dry_run: true`")),
     };
+    let sheet_format = sheet::format_of(cmd, params.setup_sheet.as_deref())?;
     if !dry_run {
-        for path in output.iter().chain(&params.preview) {
+        for path in output.iter().chain(&params.preview).chain(&params.setup_sheet) {
             if path.trim().is_empty() {
                 return Err(bad(cmd, "a file path must not be empty"));
             }
@@ -965,6 +979,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         if output.is_some() && output == params.preview {
             return Err(bad(cmd, "`output` and `preview` must be different files"));
         }
+        sheet::distinct(cmd, output.as_deref(), params.preview.as_deref(), params.setup_sheet.as_deref())?;
     }
     let (job, base): (CamJob, Option<PathBuf>) = match (params.job, &params.job_path) {
         (Some(_), Some(_)) => return Err(bad(cmd, "give `job` or `job_path`, not both")),
@@ -1079,6 +1094,25 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
 
+    let setup = sheet::build(&sheet::Inputs {
+        name: &name,
+        machine: &machine,
+        post_name: &post_name,
+        post: &post,
+        work_offset: job.work_offset,
+        origin,
+        part: &surfaces.part,
+        planned: &planned,
+        text: &text,
+        readback: &readback,
+        gouge: &gouge,
+        holder_checked: holder_total.is_some(),
+        failures: &failures,
+        notes: &notes,
+        program_file: if dry_run { None } else { output.as_deref() },
+    });
+    let summary = sheet::summary(&setup);
+
     let mut outputs = Outputs::default();
     if !dry_run {
         if let Some(path) = &output {
@@ -1098,6 +1132,14 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
             })?;
             outputs.preview = Some(path.clone());
         }
+        if let (Some(path), Some(format)) = (&params.setup_sheet, sheet_format) {
+            solidcraft_io::vfs::write(path, setup.render(format).as_bytes()).map_err(|e| {
+                let written: Vec<&str> = outputs.gcode.iter().chain(&outputs.preview).map(String::as_str).collect();
+                let written = if written.is_empty() { String::new() } else { format!(" ({} written)", written.join(" and ")) };
+                EngineError::Other(format!("{path}: {e}{written}"))
+            })?;
+            outputs.setup_sheet = Some(path.clone());
+        }
     }
     let reply = CamJobReply {
         name,
@@ -1114,6 +1156,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         dry_run,
         outputs,
         notes,
+        summary,
         param_warnings: Vec::new(),
     };
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
@@ -1364,6 +1407,8 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
 
+#[path = "cam_sheet.rs"]
+mod sheet;
 #[cfg(test)]
 #[path = "cam_tests.rs"]
 mod tests;

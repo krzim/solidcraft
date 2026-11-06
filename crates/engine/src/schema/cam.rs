@@ -35,6 +35,11 @@ pub struct CamJobParams {
     /// network access). Default: no page.
     #[serde(default)]
     pub preview: Option<String>,
+    /// Where to write the setup sheet for the machine operator: a `.html` page (self-contained,
+    /// print styles) or a `.md` file with the work zero, the rotary convention, the tools to
+    /// load, the operations in order, the checks and the warnings. Default: no sheet.
+    #[serde(default)]
+    pub setup_sheet: Option<String>,
     /// Plan and check the job, and report, but write no file; the report says whether the
     /// checks pass instead of refusing. Default: false.
     #[serde(default)]
@@ -566,6 +571,8 @@ pub struct CamJobReply {
     pub outputs: Outputs,
     /// How the bodies were tessellated, and anything else worth knowing.
     pub notes: Vec<String>,
+    /// What the operator sets up: the setup sheet's tables in compact form.
+    pub summary: super::cam_sheet::SetupSummary,
     /// In the warn parameter-check mode: what the call's parameters got wrong.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub param_warnings: Vec<String>,
@@ -636,6 +643,9 @@ pub struct Outputs {
     /// The HTML preview.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// The setup sheet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_sheet: Option<String>,
 }
 
 /// List the built-in multi-axis posts, or return one as JSON to copy into a post file.
