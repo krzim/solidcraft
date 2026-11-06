@@ -221,7 +221,10 @@ enum Shape {
     Cone(f64),
     /// A flat tip of radius `tip`, then a cone: height `slope·(d - tip)` beyond it (a chamfer
     /// mill).
-    Taper { slope: f64, tip: f64 },
+    Taper {
+        slope: f64,
+        tip: f64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

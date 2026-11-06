@@ -381,7 +381,13 @@ fn derived_stock_and_hostile_input() {
     }
     let rotary = Machine::four_axis_a();
     let round = StockShape::Cylinder { x_min: -10.0, x_max: 10.0, radius: 12.0 };
-    for moves in ["G0 X0 Y0 Z20 A0\nG1 A99999. F100", "G0 X0 Y0 Z20 A0\nG1 X1. Y0. Z-60. A5. F100", "G0 X0 Y0 Z20 A0\nG2 X0 Y0.001 I-5 J0 F100", "G0 X0 Y0 Z20 A0\nG18 G2 X0 Z20 I999999 K0 F100", "G0 X0 Y0 Z20 A0\nG19 G3 Y0 Z20 J-5 K0 F100"] {
+    for moves in [
+        "G0 X0 Y0 Z20 A0\nG1 A99999. F100",
+        "G0 X0 Y0 Z20 A0\nG1 X1. Y0. Z-60. A5. F100",
+        "G0 X0 Y0 Z20 A0\nG2 X0 Y0.001 I-5 J0 F100",
+        "G0 X0 Y0 Z20 A0\nG18 G2 X0 Z20 I999999 K0 F100",
+        "G0 X0 Y0 Z20 A0\nG19 G3 Y0 Z20 J-5 K0 F100",
+    ] {
         let _ = simulate(&format!("T1 M6\n{moves}\n"), &rotary, &t, &round, &cylinder_x(10.0, -15.0, 15.0, 64), &params(0.01, 0.2));
     }
 }

@@ -49,6 +49,19 @@ The command never writes a program that fails one of these unless `allow_unsafe`
 - **Rapids.** Every `G0` of the program as written, the stock and the turns of a 4th axis
   included (see "Stock, facing and rapid safety" below).
 - **Travel.** With a machine whose JSON has `linear_limits`, every position is within them.
+- **Operation checks** that are part of planning, each refusing the job with a message that
+  names the operation: a drill's rapid down to the R height over the part round a hole (see
+  [Drilling](#drilling)), a face down into the stock or below it (see
+  [Facing](#facing)), an A turn between operations that would swing the part into the tool (see
+  [The setup check](#the-setup-check)), and every tool used where it cannot cut (see
+  [Which tool for which operation](#which-tool-for-which-operation)).
+- **Simulation**, with `simulate: true`: the program as written removes material from the
+  stock, and a gouge or a rapid through material fails the job (see
+  [Stock-removal simulation](#stock-removal-simulation)).
+
+With `machine_rates` the reply also times the program as the machine runs it and warns about
+blocks its controller would slow (see [Machine rates](#machine-rates)); those are warnings, not
+failures.
 
 Without `dry_run` or `allow_unsafe`, a failure refuses the call with every failed check in the
 message. With `dry_run`, the reply carries `passed: false` and `failures`.
@@ -57,13 +70,16 @@ message. With `dry_run`, the reply carries `passed: false` and `failures`.
 
 `operations` (each with `name`, `kind`, `tool`, `moves`, `cut_length`, `cut_minutes`,
 `max_tilt_deg`, `a_deg` when indexed, `gouge`, `holder_collisions`, `warnings`), `program_lines`,
-`program_head` (the first lines), `readback`, `gouge`, `holder_collisions` (`null` when no tool
-has holder data), `rapids` (`checked`, `hits`, `worst`, `pass`, `from_unknown`, `first`),
+`program_head` (the first lines), `readback`, `cut_minutes` (as the machine runs it with
+`machine_rates`, else as written), `rapid_minutes` and `machine_time` (with `machine_rates`, else
+`null`), `gouge`, `holder_collisions` (`null` when no tool has holder data), `rapids` (`checked`, `hits`, `worst`, `pass`, `from_unknown`, `first`),
 `travel` (`checked`, `violation`, `pass`; `null` without `linear_limits`), `stock` (as checked
 against; `null` without one), `passed`, `failures`, `dry_run`, `outputs` (`gcode`, `preview`,
 `setup_sheet`), `notes` (how the bodies were tessellated, a post that writes no work offset, an
-output extension other than the post's) and `summary`, the setup sheet's tables in compact form
-(see [Setup sheet](#setup-sheet)), on a dry run too.
+output extension other than the post's), `simulation` (with `simulate`, as `cam.simulate`
+replies) and `summary`, the setup sheet's tables in compact form (see
+[Setup sheet](#setup-sheet)), on a dry run too. An adaptive operation's entry in `operations`
+also has `adaptive`, the engagement measured along its path.
 
 ## The job
 
@@ -142,6 +158,23 @@ and for a thread mill `thread_pitch` and `tooth_height` (see
 `spindle_rpm` or `feeds` takes the tool's; its
 stepdown and stepover default to the tool's too.
 
+### Which tool for which operation
+
+Every operation refuses a tool that cannot do its cut, with the reason, before planning:
+
+| Kind | Used by | Refused by |
+| --- | --- | --- |
+| `flat_endmill`, `bull_nose`, `ball_endmill` | every milling operation; a flat end mill may also plunge holes in `drill` | `drill` (a ball or bull nose), `chamfer`, `thread_mill` |
+| `face_mill` | `face`, `contour`, `pocket`, `adaptive`, `bore` and the surface finishes, always entering along a ramp or helix | `contour` or `pocket` that would plunge (`ramp_angle_deg` 0 and no ramp or helix entry), `roughing`, `rotary_roughing`, `drill`, `chamfer`, `thread_mill` |
+| `chamfer` | `chamfer`; the surface finishes (`parallel`, `waterline`, `scallop` and the like; on steep walls only the cone's top rim cuts) | `contour`, `pocket`, `adaptive`, `adaptive_roughing`, `bore`, `roughing`, `rotary_roughing`, a swarf cut |
+| `drill` | `drill` | every milling operation |
+| `thread_mill` | `thread_mill` | every other operation |
+
+The gouge check and the simulation take each tool's real cutting end: a chamfer mill's flat tip
+and cone, a face mill's inserts (square, or rounded by `corner_radius`), a drill's point at its
+own `point_angle_deg`, and a thread mill's whole radius (in `thread_mill` the check takes its
+core instead, below).
+
 ### Operations
 
 Every operation has `name`, `type`, `tool` (a tool's `number`), and optionally `spindle_rpm`,
@@ -168,13 +201,13 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
 | `bore` | `sketch` (its circles) + `diameter_range?: [min, max]` or `holes: [{center: [x, y], diameter}]`; `heights` (`top` the hole's top, `bottom` its floor); `pitch` or `ramp_angle_deg` (2, the pitch at most `stepdown`: the tool's, else 10% of its diameter); `stepover` (between rings; the tool's, else 40% of its diameter); `climb` (true); `finish_passes` (0); `stock_to_leave` (0.1 with finishing passes, else 0) |
 | `thread_mill` | `sketch` (its circles' centres) + `diameter_range?` or `centers: [[x, y], …]`; `heights` (the thread from `top` down to `bottom`); `pitch`; `thread_diameter` (the major, nominal diameter); `internal` (true); `right_hand` (true); `climb` (true); `thread_depth` (ISO metric: 0.5413 × pitch inside, 0.6134 × pitch outside); `radial_passes` (1); `spring_pass` (false) |
-| `face` | `bottom`; `top` (the stock's top; required without a stock); `retract` (2 above the top, or the stock's top if higher); `clearance` (10 above the retract); `stepdown` (tool's, else 1); `stepover` (tool's, else 70% of the flat of its end); `angle_deg` (0); `zigzag` (true); `overhang` (half the tool's diameter and 0.5); `rect: [[x, y], [x, y]]` (the stock seen from above, else the part's extent). A flat end mill or a bull nose. |
+| `face` | `bottom`; `top` (the stock's top; required without a stock); `retract` (2 above the top, or the stock's top if higher); `clearance` (10 above the retract); `stepdown` (tool's, else 1); `stepover` (tool's, else 70% of the flat of its end); `angle_deg` (0); `zigzag` (true); `overhang` (half the tool's diameter and 0.5); `rect: [[x, y], [x, y]]` (the stock seen from above, else the part's extent). A face mill, a flat end mill or a bull nose. |
 | `wrap` | `radius` (of the cylinder the path is drawn on); `points: [[x, y, z], …]` (x along the axis, y the arc length round it, z the depth: 0 on the cylinder, negative into it) or `sketch` + `curve` (a curve id; its sketch x and y are taken as x and arc length) with `depth` (0); `clearance` (5) and `retract` (1) above the cylinder; `max_angle_step_deg` (2) |
 | `wrap_pocket` | `radius` (of the cylinder the profile is drawn on); `sketch` + `profiles?` or `polygon: [[x, arc length], …]` (unrolled: x along the axis, y the arc length round the cylinder); `bottom` (the floor's depth from the cylinder, negative into it); `top` (0); `stepdown`; `stepover`; `clearance` (5) and `retract` (1) above the cylinder; `climb`; `stock_to_leave` (walls); `ramp_angle_deg`; `tolerance`; `max_angle_step_deg` (2). See "Wrapped pockets and contours" below. |
 | `wrap_contour` | As `wrap_pocket`, with `side` (outside) instead of `stepover`: the profile's boundary followed in depth levels |
-| `indexed_pattern` | `a_deg: [angles]` or `count` (evenly over a turn, from `start_deg`, 0), and `operation`: one of the five 3-axis operations, run as an `indexed` operation at each angle, named `<name> A<angle>` |
+| `indexed_pattern` | `a_deg: [angles]` or `count` (evenly over a turn, from `start_deg`, 0), and `operation`: any 3-axis operation, run as an `indexed` operation at each angle, named `<name> A<angle>` |
 
-The 3-axis operations (`contour` to `drill`) run with every rotary at zero; on `3axis` and
+The 3-axis operations (`contour` to `chamfer` in the table) run with every rotary at zero; on `3axis` and
 `4axis_a` that is work coordinates. Inside `indexed` their heights, polygons and boundaries are
 in the frame A = `a_deg` brings under the tool: its Z is the tool axis, so at A = 90° the frame's
 Z is work +Y. A sketch used as a boundary must lie on a plane square to the operation's tool axis
@@ -248,6 +281,7 @@ is refused when the part or a fixture within the tool's radius and a tenth more 
 (the rim of a hole of the tool's size) is above the R height by more than the tolerance: a hole in
 a boss drilled with the heights of the plate under it, say. Drill holes whose tops are at
 different heights in separate operations, each with its own `top` and `retract`.
+
 ## Helical bores and thread milling
 
 `bore` and `thread_mill` follow a helix round each hole's axis (+Z of work coordinates, every
@@ -304,6 +338,7 @@ tip radius, under the thread mill's own shank and holder: that core must stay cl
 while the teeth beyond it cut the thread. The program still names the thread mill. Thread mills
 are refused by every other milling operation, and anywhere else a thread mill is checked whole,
 its teeth and all.
+
 ## Stock, facing and rapid safety
 
 A job may say what it starts from with `stock`, in work coordinates. A box gives its corners;
@@ -370,6 +405,7 @@ unless `dry_run` or `allow_unsafe` is given.
 A machine given as JSON with `linear_limits: [[x, y, z], [x, y, z]]` (the lowest and highest
 position of the linear axes, as written in the program) has every block's end, and points along
 every arc, held against them. The first position beyond them fails the job, by line and axis.
+
 ## Adaptive clearing
 
 `adaptive` (2D, like `pocket`) and `adaptive_roughing` (3D, like `roughing`) clear material with
@@ -424,6 +460,7 @@ same profiles (stepover 40% of the diameter) measured the same way (`max_engagem
 `full_slot_share`, `cut_length`, `cut_minutes`). A measured engagement more than 3° above
 `limit_deg`, or any full slot outside the entries, is also a warning of the operation. Both
 operations also work inside `indexed`.
+
 ## Chamfers
 
 A face mill (`kind: "face_mill"`) is a flat end, its inserts' corners rounded by
@@ -459,6 +496,7 @@ The gouge check holds the cone to the model: chamfer edges the model has chamfer
 `solid.chamfer` at the tool's angle) and it passes; a chamfer the model does not show cuts into
 it, so a deburr of a sharp-edged model sets `gouge_check: false`. Inside `indexed` a chamfer runs
 in the frame the A angle brings under the tool.
+
 ## Leads, entries, linking and tabs
 
 The 2D operations (`contour` and `pocket`, on their own or inside `indexed`) take these keys.
@@ -489,6 +527,7 @@ Ring by ring a pocket is cut from the inside out: a ring only after the rings ne
 otherwise the nearest ring first, so that the rooms of a pocket are cleared one after the other.
 The vertical leads some posts write (an arc in the plane of the cut's normal and Z, `G18`/`G19`)
 are not written: the program reader and the read-back follow arcs in the XY plane only.
+
 ## 3D finishing strategies
 
 `scallop`, `steep_shallow`, `pencil` and `rest_finish` place their passes by the shape of the
@@ -555,6 +594,7 @@ dome shows no advantage for `scallop`, and the other parts were not compared wit
 sharp wall-and-floor corner a 10 mm ball leaves up to 5.6 mm; `rest_finish` with a 4 mm ball after it leaves at most
 0.016 mm, and cuts nothing on the floor further out or on the top. A pencil pass on a fillet
 joint tighter than the ball runs within 0.003 mm of where the ball touches both faces.
+
 ## Wrapped pockets and contours, rings and indexed patterns
 
 More 4th-axis work for a table about +X (`machine: "4axis_a"`), all checked like the others:
@@ -631,6 +671,7 @@ change) its own clearance is held against the X it works over instead. A post wh
 `safe_rotate` lines take the tool to the machine's top before every turn is not held to either.
 A job that fails is refused with the operation, the height and how far the part (or the stock)
 reaches.
+
 ## Machine rates
 
 A controller moves no axis faster than its top rate. A rapid takes as long as its slowest axis
@@ -684,6 +725,7 @@ Moves to and from the machine's home (`G28`) are in machine coordinates and are 
   lines, before its first turn of A. A post with `"coolant_after_turn": true` switches it on
   right after that turn (`G0 A90.` then `M8`). Coolant that goes off, and an operation that
   turns nothing at its start, are written the same either way.
+
 ## Stock-removal simulation
 
 `cam.simulate` checks a written program independently of the toolpaths it came from: it reads
@@ -715,9 +757,12 @@ passing with nothing checked. A failed simulation is reported, never refused;
 inside `cam.job` its failures join the job's. When an operation of the job has `gouge_check:
 false` (an engraving), the simulation's gouges are warned about, not failed.
 
-**The stock.** A job without a stock starts from one taken from the part: on a 3-axis machine
-the part's box, on a 4th axis the cylinder about work X through the part's farthest point from
-the axis, over the part's length. A program whose rapids are safe for a block-shaped part may
+**The stock.** The simulation starts from the job's `stock` when it can model it on the
+machine: a box on a 3-axis machine, a bar about X on a 4th axis (`stock.derived` is then false,
+and a face of the stock's top shows as removed volume). A job without a stock, or with one of
+the other shape (a note says so), starts from one taken from the part: on a 3-axis machine the
+part's box, on a 4th axis the cylinder about work X through the part's farthest point from the
+axis, over the part's length. A program whose rapids are safe for a block-shaped part may
 then cut that round bar at its retract height, which is what the bar would do on the machine.
 
 **3-axis.** The stock is a heightfield over the box: one top height per cell, at the cell's
@@ -760,6 +805,7 @@ depend on how many. A 50 × 50 mm dome finished with a 6 mm ball in parallel pas
 (about 21,000 blocks) simulates on a million cells (0.05 mm) in about 7 seconds on one thread and
 under a second on eight; a 4th-axis finish on a 16 mm long, 20 mm diameter barrel, 1° apart, on
 414,000 cells in about 3 seconds on one thread and under a second on eight.
+
 ## Setup sheet
 
 `cam.job {…, "setup_sheet": "C:/parts/bracket-setup.html"}` writes what the machine operator
@@ -782,7 +828,8 @@ It holds, in order:
   (counter-clockwise seen from the +X end for `4axis_a`; clockwise with `a_reversed`), which side
   of the part A+90° brings up under the tool and which way the top of the part moves as A
   rises, and its travel limits when the machine has them.
-- **Stock**, when the job describes it.
+- **Stock**, when the job gives one: a block by its size and its corners from work zero (and
+  the height of its top), a bar by its diameter and its ends along X.
 - **Tools:** only those the operations use, by number: kind, diameter (and corner radius),
   flutes, flute length, shank, stickout, holder, the lowest Z the program sends the tip to
   (Z min, in program coordinates: on a 4th axis that is the distance from the A axis), the
@@ -799,7 +846,8 @@ It holds, in order:
   controller times the written program, the program's line count, and the X, Y, Z and A range
   the program moves over.
 - **Checks:** the read-back, the gouge check (with the operations not checked) and, when a tool
-  has holder data, the shank and holder check, each with its result.
+  has holder data, the shank and holder check, each with its result. The rapid, travel and
+  simulation results are in the reply and its `failures`.
 - **Warnings:** failed checks (a sheet is only written with them under `allow_unsafe`),
   operations not checked for gouges, tools without holder data, a rotary that turns past a full
   turn either way.
@@ -810,7 +858,8 @@ Every name and description from the job is escaped for the format, so a name suc
 
 The reply's `summary` carries the same tables in compact form, on a dry run too, so an agent can
 tell the user what to set up without opening the sheet: `work_zero` (the sentences),
-`part_extent` (`[[x, y, z] lowest, [x, y, z] highest]` from work zero), `work_offset`, `rotary`
+`part_extent` (`[[x, y, z] lowest, [x, y, z] highest]` from work zero), `stock` (the
+sentence, `null` without one), `work_offset`, `rotary`
 (the sentences), `tools` (`number`, `kind`, `diameter`, `flute_length`, `stickout?`, `holder?`,
 `z_min?`, `operations`), `operations` (`name`, `kind`, `tool`, `spindle_rpm`, `feed`,
 `plunge_feed`, `rotary?`, `cut_length`, `cut_minutes`), `totals` (`operations`, `tools`,

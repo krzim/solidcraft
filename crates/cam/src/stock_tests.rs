@@ -295,3 +295,24 @@ fn facing_into_the_stock_or_below_it_is_refused() {
     bad.stock = Some(Stock::Box { min: Vec3::new(f64::NAN, 0.0, 0.0), max: Vec3::new(1.0, 1.0, 1.0) });
     assert!(face(&tool, &bad).is_err());
 }
+
+/// A face mill faces: its passes go down beside the stock, never into it, and its stepover is
+/// held to the flat between its inserts' corners. A chamfer mill and a thread mill do not face.
+#[test]
+fn a_face_mill_faces_and_its_inserts_corners_set_the_flat() {
+    let mut fm = Tool::new(3, ToolKind::FaceMill, 20.0, 5.0);
+    fm.corner_radius = Some(0.8);
+    close(flat_diameter(&fm), 18.4, 1e-12);
+    let path = face(&fm, &params(&fm, 0.0, true)).unwrap();
+    assert!(!cuts_at(&path, -1.5).is_empty());
+    let square = Tool::new(3, ToolKind::FaceMill, 20.0, 5.0);
+    close(flat_diameter(&square), 20.0, 1e-12);
+    assert!(face(&square, &params(&square, 0.0, false)).is_ok());
+    let mut chamfer = Tool::new(4, ToolKind::Chamfer, 20.0, 5.0);
+    chamfer.angle_deg = Some(90.0);
+    let thread = Tool::new(5, ToolKind::ThreadMill, 10.0, 5.0);
+    for t in [chamfer, thread] {
+        let e = face(&t, &params(&t, 0.0, true)).unwrap_err();
+        assert!(e.to_string().contains("facing needs a face mill"), "{e}");
+    }
+}

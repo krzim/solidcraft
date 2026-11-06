@@ -139,7 +139,15 @@ fn continuous(c: Common<'_>, r: Resolved, kind: &str, path: Toolpath5) -> Planne
         ..OperationReport::default()
     };
     let op = Operation5 { name: c.name.into(), tool: r.tool.clone(), spindle_rpm: r.rpm, coolant: c.coolant, path: path.clone() };
-    Planned { op: MachineOperation::Continuous(op), poses: path, feeds: r.feeds, tool: r.tool, gouge_check: c.gouge_check, report, axes: "4-axis".into() }
+    Planned {
+        op: MachineOperation::Continuous(op),
+        poses: path,
+        feeds: r.feeds,
+        tool: r.tool,
+        gouge_check: c.gouge_check,
+        report,
+        axes: "4-axis".into(),
+    }
 }
 
 /// The depths and motion of a wrapped operation.

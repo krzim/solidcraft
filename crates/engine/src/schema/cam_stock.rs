@@ -55,7 +55,7 @@ pub struct AroundPartSpec {
 pub struct FaceOp {
     /// The operation's name, written as a comment in the program.
     pub name: String,
-    /// The `number` of the tool it cuts with: a flat end mill or a bull nose (a face mill).
+    /// The `number` of the tool it cuts with: a face mill, a flat end mill or a bull nose.
     pub tool: u32,
     /// Spindle speed, rev/min. Default: the tool's `spindle_rpm`.
     #[serde(default)]

@@ -391,7 +391,7 @@ pub struct FaceParams {
 /// The diameter of the flat of `tool`'s end: what leaves a flat floor.
 pub fn flat_diameter(tool: &Tool) -> f64 {
     match tool.kind {
-        ToolKind::BullNose => tool.diameter - 2.0 * tool.corner_radius.unwrap_or(0.0),
+        ToolKind::BullNose | ToolKind::FaceMill => tool.diameter - 2.0 * tool.corner_radius.unwrap_or(0.0),
         _ => tool.diameter,
     }
 }
@@ -435,12 +435,13 @@ impl Path {
     }
 }
 
-/// Faces the area of `p` with `tool` (a flat end mill or a bull nose, as a face mill is) down
-/// to `p.heights.bottom`; see the module notes.
+/// Faces the area of `p` with `tool` (a face mill, a flat end mill or a bull nose) down to
+/// `p.heights.bottom`; see the module notes. Every pass goes down beside the stock, so a face
+/// mill never plunges into material.
 pub fn face(tool: &Tool, p: &FaceParams) -> Result<Toolpath> {
     tool.validate()?;
-    if !matches!(tool.kind, ToolKind::FlatEndmill | ToolKind::BullNose) {
-        return invalid("facing needs a flat end mill or a bull nose (a face mill is either)");
+    if !matches!(tool.kind, ToolKind::FlatEndmill | ToolKind::BullNose | ToolKind::FaceMill) {
+        return invalid("facing needs a face mill, a flat end mill or a bull nose");
     }
     p.heights.validate()?;
     p.feeds.validate()?;

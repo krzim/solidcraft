@@ -220,7 +220,9 @@ pub(super) fn build(i: &Inputs<'_>) -> SetupSheet {
                     kind: t.kind.label().into(),
                     description: t.description.clone(),
                     diameter: t.diameter,
-                    corner_radius: t.corner_radius.filter(|_| matches!(t.kind, solidcraft_cam::ToolKind::BullNose | solidcraft_cam::ToolKind::FaceMill)),
+                    corner_radius: t
+                        .corner_radius
+                        .filter(|_| matches!(t.kind, solidcraft_cam::ToolKind::BullNose | solidcraft_cam::ToolKind::FaceMill)),
                     flutes: t.flutes,
                     flute_length: t.flute_length,
                     shank_diameter: t.shank_diameter,
