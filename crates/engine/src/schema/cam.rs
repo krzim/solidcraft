@@ -176,6 +176,14 @@ pub enum PatternSpec {
         /// Advance along X per turn, mm.
         pitch: f64,
     },
+    /// Circumferential passes: a full turn of A at each X, at most `stepover` mm apart along X.
+    Rings {
+        /// Most distance between rings along X, mm.
+        stepover: f64,
+        /// Every other ring turns back, so A stays within a turn. Default: true.
+        #[serde(default)]
+        zigzag: Option<bool>,
+    },
 }
 
 /// Declares an operation's struct with the fields every operation has, then its own.
@@ -497,6 +505,12 @@ operation! {
     }
 }
 
+// Wrapped pockets and contours, and indexed patterns: their own file, inside this module for
+// the `operation!` macro.
+#[path = "cam_xrotary.rs"]
+mod xrotary;
+pub use xrotary::{IndexedPatternOp, WrapContourOp, WrapPocketOp};
+
 /// A 3-axis operation, as an indexed operation runs it.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -532,6 +546,9 @@ pub enum OperationSpec {
     RotaryFinish(RotaryFinishOp),
     RotaryRoughing(RotaryRoughingOp),
     Wrap(WrapOp),
+    WrapPocket(WrapPocketOp),
+    WrapContour(WrapContourOp),
+    IndexedPattern(IndexedPatternOp),
 }
 
 /// What `cam.job` returns.

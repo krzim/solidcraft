@@ -57,7 +57,8 @@ pub static COMMANDS: &[CommandSpec] = &[
              (the design point that is work zero; on a 4th axis the A axis is work X through it), bodies?: [names] (default every visible \
              body), fixtures?: [names] (checked against, never cut), tolerance?: mm (default 0.01; bodies are tessellated at half of it), \
              tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | roughing | waterline | indexed \
-             {a_deg, operation} | rotary_finish | rotary_roughing | wrap, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
+             {a_deg, operation} | indexed_pattern {a_deg: [..] | count, start_deg?, operation} | rotary_finish | rotary_roughing \
+             (pattern: lines | helix | rings) | wrap | wrap_pocket | wrap_contour, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
              and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
              operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, warnings}], \
@@ -758,6 +759,7 @@ fn pattern(ctx: &Ctx<'_>, op: &str, p: PatternSpec) -> Result<RotaryPattern> {
             RotaryPattern::Lines { angle_step: ctx.degrees(op, angle_step_deg, "`angle_step_deg`")?, zigzag: zigzag.unwrap_or(true) }
         }
         PatternSpec::Helix { pitch } => RotaryPattern::Helix { pitch },
+        PatternSpec::Rings { stepover, zigzag } => RotaryPattern::Rings { stepover, zigzag: zigzag.unwrap_or(true) },
     })
 }
 
@@ -939,6 +941,10 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             let path = wrap_with_step(&flat, o.radius, tol, step).map_err(|e| ctx.bad(c.name, e))?;
             Ok(continuous(c, r, "wrap", path))
         }
+        OperationSpec::WrapPocket(o) => xrotary::plan_wrap_pocket(ctx, o),
+        OperationSpec::WrapContour(o) => xrotary::plan_wrap_contour(ctx, o),
+        // `xrotary::plan_into` plans a pattern as its indexed operations.
+        OperationSpec::IndexedPattern(o) => Err(ctx.bad(common3(&o.operation).name, "an indexed pattern is planned as its indexed operations")),
     }
 }
 
@@ -1008,7 +1014,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let ctx = Ctx { cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, origin, tol };
     let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
     for spec in &job.operations {
-        planned.push(plan(&ctx, spec, post.base.arc_tolerance)?);
+        xrotary::plan_into(&ctx, spec, &post, &mut planned)?;
     }
 
     let program = MachineProgram { name: name.clone(), operations: planned.iter().map(|p| p.op.clone()).collect(), work_offset: job.work_offset };
@@ -1363,6 +1369,9 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
     reply.rapid_minutes = params.rapid_rate.map(|r| reply.rapid_length / r);
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
+
+#[path = "cam_xrotary.rs"]
+mod xrotary;
 
 #[cfg(test)]
 #[path = "cam_tests.rs"]

@@ -41,6 +41,7 @@ pub mod strategies5;
 mod surface;
 pub mod surface_ops;
 mod tool;
+pub mod wrapped;
 
 pub use check::verify;
 pub use cutter::Cutter;
@@ -99,3 +100,5 @@ mod strategies5_tests;
 mod surface_ops_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wrapped_tests;
