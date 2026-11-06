@@ -23,6 +23,7 @@ mod check;
 pub mod collision;
 mod cutter;
 mod dropcutter;
+pub mod finish3d;
 mod frame;
 mod gcode;
 pub mod gcode5;
@@ -45,6 +46,10 @@ mod tool;
 pub use check::verify;
 pub use cutter::Cutter;
 pub use dropcutter::{drop_along, drop_triangle, drop_z};
+pub use finish3d::{
+    OffsetDirection, PencilParams, RestParams, ScallopParams, ShallowPattern, Spacing, SteepShallowParams, pencil, rest_finish, scallop,
+    steep_shallow,
+};
 pub use frame::{Frame, angle_about, rotate, rotate_about};
 pub use gcode::{Operation, Program, emit, parse, work_offset_code};
 pub use multiaxis::{Move5, Operation5, PathStats5, Pose, Program5, Toolpath5, slerp, verify5};
@@ -85,6 +90,8 @@ pub(crate) fn invalid<T>(why: impl Into<String>) -> Result<T> {
 
 #[cfg(test)]
 mod collision_tests;
+#[cfg(test)]
+mod finish3d_tests;
 #[cfg(test)]
 mod foundation_tests;
 #[cfg(test)]

@@ -392,3 +392,107 @@ fn hostile_jobs_are_refused_without_panics() {
     assert!(s.execute("cam.check", &json!({"path": junk, "rapid_rate": -1})).is_err());
     assert!(s.execute("cam.posts", &json!({"name": "nope"})).is_err());
 }
+
+/// A 40 × 30 floor 10 mm thick, its top at Z 0, with a block 8 mm tall standing on its +X half:
+/// a sharp concave corner along Y at X 0.
+fn stepped_block() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "corner": [-20, -15, -10], "body_name": "Block"}));
+    run(&mut s, "solid.box", json!({"length": 20, "width": 30, "height": 8, "corner": [0, -15, 0], "operation": "join"}));
+    s
+}
+
+fn finish_job(tools: Value, op: Value) -> Value {
+    json!({"name": "finish", "machine": "3axis", "post": "mach3_4axis", "tools": tools, "operations": [op]})
+}
+
+#[test]
+fn the_3d_finishing_strategies_read_back_and_pass_the_gouge_check() {
+    let h = json!({"clearance": 30, "retract": 15, "top": 7, "bottom": -1});
+    let mut s = dome();
+    let b = json!({"rect": [[-14, -14], [14, 14]]});
+    for op in [
+        json!({"name": "scallop", "type": "scallop", "tool": 2, "heights": h, "scallop_height": 0.01, "boundary": b}),
+        json!({"name": "out", "type": "scallop", "tool": 2, "heights": h, "stepover": 1.0, "direction": "outward", "climb": false, "boundary": b}),
+        json!({"name": "split", "type": "steep_shallow", "tool": 2, "heights": h, "scallop_height": 0.01, "threshold_deg": 35, "boundary": b}),
+        json!({"name": "split raster", "type": "steep_shallow", "tool": 2, "heights": h, "stepover": 0.8, "shallow": "parallel", "angle_deg": 30, "boundary": b}),
+        json!({"name": "pencil", "type": "pencil", "tool": 2, "heights": h, "passes": 1, "stepover": 0.5, "boundary": b}),
+    ] {
+        let r = run(&mut s, "cam.job", json!({"job": finish_job(json!([ball(2, 6.0)]), op.clone()), "dry_run": true}));
+        assert_clean(&r);
+        let o = &r["operations"][0];
+        assert_eq!(o["kind"], op["type"], "{r}");
+        assert!(o["moves"].as_u64().is_some_and(|m| m > 20), "{r}");
+    }
+    // An indexed scallop on the 4th axis, in the frame A = 90° brings under the tool.
+    let mut bar = bar();
+    let job = json!({
+        "machine": "4axis_a", "post": "mach3_4axis", "tools": [ball(3, 4.0)],
+        "operations": [{"type": "indexed", "a_deg": 90, "operation": {
+            "name": "side", "type": "scallop", "tool": 3, "scallop_height": 0.01,
+            "heights": {"clearance": 30, "retract": 15, "top": 10, "bottom": -1}, "boundary": {"rect": [[-10, -6], [10, 6]]}}}]
+    });
+    let r = run(&mut bar, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    assert_eq!(r["operations"][0]["kind"], "indexed scallop", "{r}");
+}
+
+#[test]
+fn pencil_and_rest_finishing_cut_the_corner_of_a_stepped_block() {
+    let mut s = stepped_block();
+    let dir = Dir::new("corner");
+    let h = json!({"clearance": 30, "retract": 15, "top": 8, "bottom": -1});
+    let b = json!({"rect": [[-14, -10], [10, 10]]});
+    let tools = json!([ball(1, 10.0), ball(2, 4.0)]);
+    let scope = Some(solidcraft_io::vfs::PathScope::new([dir.0.clone()]));
+    // The pencil runs along the corner: the 4 mm ball's tip stops 2 mm short of the wall.
+    let pencil = json!({"name": "pencil", "type": "pencil", "tool": 2, "heights": h, "boundary": b});
+    let out = dir.file("pencil.tap");
+    let r = solidcraft_io::vfs::scoped(scope.clone(), || run(&mut s, "cam.job", json!({"job": finish_job(tools.clone(), pencil), "output": out})));
+    assert_clean(&r);
+    let c = run(&mut s, "cam.check", json!({"path": out}));
+    let (lo, hi) = (&c["bounds"][0], &c["bounds"][1]);
+    assert!((lo[0].as_f64().unwrap() + 2.0).abs() < 0.05 && (hi[0].as_f64().unwrap() + 2.0).abs() < 0.05, "{c}");
+    assert!(lo[2].as_f64().unwrap().abs() < 0.01, "{c}");
+    // Rest finishing after the 10 mm ball cuts only between where the two tips stop, and a
+    // little round it.
+    let rest = json!({"name": "rest", "type": "rest_finish", "tool": 2, "previous_tool": 1, "heights": h, "scallop_height": 0.01, "overlap": 0.5, "boundary": b});
+    let out = dir.file("rest.tap");
+    let r = solidcraft_io::vfs::scoped(scope, || run(&mut s, "cam.job", json!({"job": finish_job(tools.clone(), rest.clone()), "output": out})));
+    assert_clean(&r);
+    let c = run(&mut s, "cam.check", json!({"path": out}));
+    let (lo, hi) = (c["bounds"][0][0].as_f64().unwrap(), c["bounds"][1][0].as_f64().unwrap());
+    assert!(lo > -5.0 - 0.5 - 0.3 && hi < -2.0 + 0.05, "{c}");
+    assert!(c["feed_length"].as_f64().is_some_and(|l| l > 100.0), "{c}");
+    // Both a scallop height and a stepover, an unknown previous tool, values out of range and
+    // a misspelt key: refused.
+    for (f, word) in [
+        (json!({"stepover": 0.5}), "not both"),
+        (json!({"previous_tool": 9}), "previous_tool"),
+        (json!({"threshold": -1}), "threshold"),
+        (json!({"overlap": 1e308}), "overlap"),
+        (json!({"previous_tol": 1}), "previous_tol"),
+    ] {
+        let mut op = rest.clone();
+        for (k, v) in f.as_object().unwrap() {
+            op[k] = v.clone();
+        }
+        let e = s.execute("cam.job", &json!({"job": finish_job(tools.clone(), op), "dry_run": true})).unwrap_err();
+        assert!(matches!(e, EngineError::BadParams { .. }) && e.to_string().contains(word), "{f}: {e}");
+    }
+    for op in [
+        json!({"name": "x", "type": "steep_shallow", "tool": 2, "heights": h, "threshold_deg": 95}),
+        json!({"name": "x", "type": "steep_shallow", "tool": 2, "heights": h, "angle_deg": 10}),
+        json!({"name": "x", "type": "pencil", "tool": 2, "heights": h, "passes": 100000}),
+        json!({"name": "x", "type": "pencil", "tool": 2, "heights": h, "min_angle_deg": f64::MAX}),
+        json!({"name": "x", "type": "scallop", "tool": 2, "heights": h, "scallop_height": 5}),
+        json!({"name": "x", "type": "scallop", "tool": 2, "heights": h, "step": 1e-9}),
+        json!({"name": "x", "type": "scallop", "tool": 2, "heights": h, "direction": "sideways"}),
+    ] {
+        match s.execute("cam.job", &json!({"job": finish_job(tools.clone(), op.clone()), "dry_run": true})) {
+            Err(EngineError::Internal(_, msg)) => panic!("{op}: panicked: {msg}"),
+            Err(_) => {}
+            Ok(v) => panic!("{op}: accepted: {v}"),
+        }
+    }
+}

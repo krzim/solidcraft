@@ -56,7 +56,7 @@ pub static COMMANDS: &[CommandSpec] = &[
              a_limits_deg?: [min, max], post: built-in name (cam.posts) | post_path: Post5 JSON file, work_offset?: 1-6, origin?: [x,y,z] \
              (the design point that is work zero; on a 4th axis the A axis is work X through it), bodies?: [names] (default every visible \
              body), fixtures?: [names] (checked against, never cut), tolerance?: mm (default 0.01; bodies are tessellated at half of it), \
-             tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | roughing | waterline | indexed \
+             tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | roughing | waterline | scallop | steep_shallow | pencil | rest_finish | indexed \
              {a_deg, operation} | rotary_finish | rotary_roughing | wrap, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
              and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
@@ -728,6 +728,10 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
             let path = waterline(surface, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
             Ok((path, r, "waterline"))
         }
+        Op3Spec::Scallop(o) => finish3d::plan_scallop(ctx, o, surface),
+        Op3Spec::SteepShallow(o) => finish3d::plan_steep_shallow(ctx, o, surface),
+        Op3Spec::Pencil(o) => finish3d::plan_pencil(ctx, o, surface),
+        Op3Spec::RestFinish(o) => finish3d::plan_rest_finish(ctx, o, surface),
     }
 }
 
@@ -738,6 +742,10 @@ fn common3(op: &Op3Spec) -> Common<'_> {
         Op3Spec::Parallel(o) => o.common(),
         Op3Spec::Roughing(o) => o.common(),
         Op3Spec::Waterline(o) => o.common(),
+        Op3Spec::Scallop(o) => o.common(),
+        Op3Spec::SteepShallow(o) => o.common(),
+        Op3Spec::Pencil(o) => o.common(),
+        Op3Spec::RestFinish(o) => o.common(),
     }
 }
 
@@ -880,6 +888,10 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
         OperationSpec::Parallel(o) => indexed(&Op3Spec::Parallel(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Roughing(o) => indexed(&Op3Spec::Roughing(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Waterline(o) => indexed(&Op3Spec::Waterline(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::Scallop(o) => indexed(&Op3Spec::Scallop(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::SteepShallow(o) => indexed(&Op3Spec::SteepShallow(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::Pencil(o) => indexed(&Op3Spec::Pencil(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::RestFinish(o) => indexed(&Op3Spec::RestFinish(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Indexed(o) => {
             let name = common3(&o.operation).name;
             if rotaries != 1 {
@@ -1363,6 +1375,9 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
     reply.rapid_minutes = params.rapid_rate.map(|r| reply.rapid_length / r);
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
+
+#[path = "cam_finish3d.rs"]
+mod finish3d;
 
 #[cfg(test)]
 #[path = "cam_tests.rs"]
