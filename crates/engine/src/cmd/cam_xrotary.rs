@@ -12,6 +12,7 @@
 //!   turns A at it rather than at the machine's top. A job that fails it is refused.
 
 use solidcraft_cam::wrapped::{WrapContourParams, WrapCut, WrapPocketParams, wrap_contour, wrap_pocket};
+use solidcraft_cam::{Move5, Pose};
 
 use super::*;
 use crate::schema::cam::{IndexedOp, IndexedPatternOp, WrapContourOp, WrapPocketOp};
@@ -51,7 +52,13 @@ pub(super) fn plan_into(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5, plann
             planned.push(plan(ctx, spec, arc_tol)?);
         }
     }
-    planned.iter().skip(start).try_for_each(|p| setup_check(ctx, spec, post, p))
+    for k in start..planned.len() {
+        let prev = k.checked_sub(1).and_then(|j| planned.get(j));
+        if let Some(p) = planned.get(k) {
+            setup_check(ctx, spec, post, prev, p)?;
+        }
+    }
+    Ok(())
 }
 
 /// The angles of an indexed pattern, degrees.
@@ -241,9 +248,26 @@ fn turning_radius(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5) -> Option<(
     }
 }
 
-/// Refuses the planned operation `p` of `spec` when the radius it turns at is not clear of the
-/// part (and the stock) along the X it works over, the tool's radius either side.
-fn setup_check(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5, p: &Planned) -> Result<()> {
+/// Refuses the planned operation `p` of `spec` when A turns into it, or within it, closer to the
+/// axis than the part (or the stock) reaches there.
+///
+/// A turn into an operation happens where the operation before it (`prev`) left the tool, so
+/// with the same tool and no `safe_rotate` lines it is checked there ([`turn_check`]). A
+/// continuous operation also turns A at its clearance radius along the X it works over, the
+/// tool's radius either side. An indexed operation turns only on entry: where the tool's place
+/// is not known (the first operation, or after a tool change) its own clearance is held against
+/// the X it works over instead.
+fn setup_check(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5, prev: Option<&Planned>, p: &Planned) -> Result<()> {
+    if ctx.machine.rotaries.is_empty() {
+        return Ok(());
+    }
+    let entry = prev.filter(|q| post.safe_rotate.is_empty() && q.tool.number == p.tool.number);
+    if let Some(q) = entry {
+        turn_check(ctx, post, q, p)?;
+        if matches!(spec, OperationSpec::Indexed(_) | OperationSpec::IndexedPattern(_)) {
+            return Ok(());
+        }
+    }
     let Some((clearance, stock)) = turning_radius(ctx, spec, post) else { return Ok(()) };
     let (lo, hi) = p.poses.poses().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), q| (lo.min(q.tip.x), hi.max(q.tip.x)));
     if !(lo <= hi) {
@@ -269,6 +293,68 @@ fn setup_check(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5, p: &Planned) -
             num(reach),
             num(lo),
             num(hi),
+            num(reach + ctx.tol)
+        ),
+    ))
+}
+
+/// Refuses `p` when A turns into it from where `prev` (with the same tool) left the tool and
+/// the part, turning, would meet the tool there. The post rises first, never down, to its
+/// `clearance` or else the highest rapid of `p` (with `clearance_retract`; without it the tool
+/// stays where it is), then turns A at that X and moves across: the tool's end must stay farther
+/// from the A axis than the part reaches within the tool's radius of that X.
+fn turn_check(ctx: &Ctx<'_>, post: &Post5, prev: &Planned, p: &Planned) -> Result<()> {
+    let (Some(from), Some(to)) = (prev.poses.poses().last(), p.poses.poses().next()) else { return Ok(()) };
+    let turns = match (&prev.op, &p.op) {
+        (MachineOperation::Indexed(a), MachineOperation::Indexed(b)) => {
+            a.rotary.len() != b.rotary.len() || a.rotary.iter().zip(&b.rotary).any(|(x, y)| (x - y).abs() > 1e-12)
+        }
+        _ => from.axis.dist(to.axis) > 1e-9,
+    };
+    if !turns {
+        return Ok(());
+    }
+    // The tool's height in program coordinates: along its axis from the A axis.
+    let height = |q: &Pose| q.tip.y * q.axis.y + q.tip.z * q.axis.z;
+    let z = height(&from);
+    // How far the tip is off to the side of the axis, square to the tool.
+    let side = (from.tip.y.hypot(from.tip.z).powi(2) - z * z).max(0.0).sqrt();
+    let rise = if post.clearance_retract {
+        post.clearance.or_else(|| {
+            p.poses
+                .moves
+                .iter()
+                .filter_map(|m| match m {
+                    Move5::Rapid { to } => Some(height(to)),
+                    _ => None,
+                })
+                .reduce(f64::max)
+        })
+    } else {
+        None
+    };
+    let up = rise.map_or(z, |c| c.max(z));
+    let r = p.tool.radius();
+    // The nearest the tool's end comes to the axis as it turns.
+    let near = (side - r).max(0.0).hypot(up);
+    let (lo, hi) = (from.tip.x - r, from.tip.x + r);
+    let Some(reach) = part_reach(ctx.part, lo, hi) else { return Ok(()) };
+    if near > reach + ctx.tol {
+        return Ok(());
+    }
+    Err(ctx.bad(
+        &p.report.name,
+        format!(
+            "A turns into it where operation `{}` leaves the tool, {} mm from the A axis at X {}, but the part reaches {} mm from it \
+             between X {} and {}: it would swing into the tool. Raise the clearance of `{}` (or the post's) so the tool turns more \
+             than {} mm from the axis",
+            prev.report.name,
+            num(near),
+            num(from.tip.x),
+            num(reach),
+            num(lo),
+            num(hi),
+            prev.report.name,
             num(reach + ctx.tol)
         ),
     ))

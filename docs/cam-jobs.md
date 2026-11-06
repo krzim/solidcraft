@@ -235,8 +235,16 @@ the stretch of X it works over (its moves, the tool's radius either side): where
 round and where A turns, the tool must be outside the part's largest radius about the A axis
 there, by more than the job's tolerance. That is the `clearance` of `rotary_finish` and
 `rotary_roughing` (which must also clear its `stock_radius`), and `radius + clearance` for
-`wrap`, `wrap_pocket` and `wrap_contour`. An `indexed` or `indexed_pattern` operation is held to
-it too where the post turns A at the operation's clearance height (or at the post's
-`clearance`): a post whose `safe_rotate` lines take the tool to the machine's top first is not.
-A job that fails it is refused with the operation, the clearance and how far the part (or the
-stock) reaches.
+`wrap`, `wrap_pocket` and `wrap_contour`.
+
+A turns into an operation where the one before it left the tool: the post rises there (to its
+`clearance`, or else to the new operation's highest rapid, never down) and turns A before it
+moves across. So whenever A turns between two operations with the same tool, of any kind (a
+plain 3-axis one included), the tool's end at that height must be outside the part's largest
+radius within the tool's radius of the X where it stands. Raising the earlier operation's
+clearance, or the post's, fixes it. An `indexed` or `indexed_pattern` operation turns A only as
+it starts; where the tool's place is not known (the program's first operation, or after a tool
+change) its own clearance is held against the X it works over instead. A post whose
+`safe_rotate` lines take the tool to the machine's top before every turn is not held to either.
+A job that fails is refused with the operation, the height and how far the part (or the stock)
+reaches.

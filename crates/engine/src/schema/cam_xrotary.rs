@@ -118,10 +118,10 @@ operation! {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IndexedPatternOp {
-    /// The A angles, degrees (1 to 360 of them). Give this or `count`.
+    /// The A angles, degrees (1 to 200 of them). Give this or `count`.
     #[serde(default)]
     pub a_deg: Option<Vec<f64>>,
-    /// How many angles, evenly over a full turn (1 to 360). Give this or `a_deg`.
+    /// How many angles, evenly over a full turn (1 to 200). Give this or `a_deg`.
     #[serde(default)]
     pub count: Option<u32>,
     /// With `count`: the first angle, degrees. Default: 0.

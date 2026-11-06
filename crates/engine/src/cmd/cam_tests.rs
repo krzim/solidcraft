@@ -687,3 +687,49 @@ fn hostile_rotary_operations_are_refused_without_panics() {
         assert!(bar().execute("cam.job", &json!({"job": job, "dry_run": true})).is_err(), "{stepover}");
     }
 }
+
+/// A stepped bar about X: a 30 mm square section from X −20 to 0 (its corners 21.21 mm from
+/// the axis) and a 20 mm one from 0 to 20 (14.14 mm).
+fn stepped_bar() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 20, "width": 30, "height": 30, "corner": [-20, -15, -15], "body_name": "Big"}));
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 20, "corner": [0, -10, -10], "body_name": "Small"}));
+    s
+}
+
+#[test]
+fn a_turn_between_operations_is_checked_where_the_tool_turns() {
+    let mut s = stepped_bar();
+    // A 3-axis finish of the big section's top (15 mm up), its rapids `clearance` mm up.
+    let big = |clearance: f64| {
+        json!({
+            "name": "big", "type": "parallel", "tool": 1,
+            "heights": {"clearance": clearance, "retract": 17, "top": 15, "bottom": 0},
+            "stepover": 3, "boundary": {"rect": [[-16, -6], [-4, 6]]}
+        })
+    };
+    // The small section's side at A 90°, its rapids 16 mm up: clear of the small section.
+    let small = json!({"type": "indexed", "a_deg": 90, "operation": {
+        "name": "small", "type": "parallel", "tool": 1,
+        "heights": {"clearance": 16, "retract": 12, "top": 10, "bottom": 0},
+        "stepover": 3, "boundary": {"rect": [[5, -5], [15, 5]]}
+    }});
+    // `big` leaves the tool 18 mm up over the big section, and A turns to 90° there: its corners,
+    // 21.21 mm out, swing into the tool. Each operation is clear where it works.
+    let e = s.execute("cam.job", &json!({"job": faces_job(json!([big(18.0), small.clone()])), "dry_run": true})).unwrap_err();
+    let msg = e.to_string();
+    assert!(matches!(e, EngineError::BadParams { .. }), "{msg}");
+    assert!(msg.contains("`small`") && msg.contains("`big`") && msg.contains("21.21"), "{msg}");
+    // From 25 mm up the turn is clear.
+    let r = run(&mut s, "cam.job", json!({"job": faces_job(json!([big(25.0), small.clone()])), "dry_run": true}));
+    assert_clean(&r);
+    // The other way round A turns over the small section, at 18 mm (the post rises to `big`'s
+    // clearance first): clear, and so not refused.
+    let r = run(&mut s, "cam.job", json!({"job": faces_job(json!([small.clone(), big(18.0)])), "dry_run": true}));
+    assert_clean(&r);
+    // A post that goes to the machine's top before turning is never refused for it.
+    let mut job = faces_job(json!([big(18.0), small]));
+    job["post"] = json!("rs274_5axis");
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_eq!(r["operations"].as_array().map(Vec::len), Some(2), "{r}");
+}
