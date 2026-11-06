@@ -63,7 +63,8 @@ pub static COMMANDS: &[CommandSpec] = &[
              stock?: {box: {min, max}} | {cylinder: {radius, x_min, x_max}} | {around_part: {margin: [x,y,z]}} (work coordinates; no \
              rapid may pass through it), tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | \
              roughing | waterline | scallop | steep_shallow | pencil | rest_finish | drill | chamfer {heights: {clearance, retract, top}, \
-             width, tip_offset?, side?} | indexed {a_deg, operation} | rotary_finish | rotary_roughing | wrap | bore | thread_mill | face \
+             width, tip_offset?, side?} | indexed {a_deg, operation} | indexed_pattern {a_deg: [..] | count, start_deg?, operation} | \
+             rotary_finish | rotary_roughing (pattern: lines | helix | rings) | wrap | wrap_pocket | wrap_contour | bore | thread_mill | face \
              {bottom, top?, retract?, clearance?, stepdown?, stepover?, angle_deg?, zigzag?, overhang?, rect?}, tool: number, spindle_rpm?, \
              feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
@@ -803,6 +804,7 @@ fn pattern(ctx: &Ctx<'_>, op: &str, p: PatternSpec) -> Result<RotaryPattern> {
             RotaryPattern::Lines { angle_step: ctx.degrees(op, angle_step_deg, "`angle_step_deg`")?, zigzag: zigzag.unwrap_or(true) }
         }
         PatternSpec::Helix { pitch } => RotaryPattern::Helix { pitch },
+        PatternSpec::Rings { stepover, zigzag } => RotaryPattern::Rings { stepover, zigzag: zigzag.unwrap_or(true) },
     })
 }
 
@@ -1000,6 +1002,10 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
         }
         OperationSpec::Bore(o) => helical::bore_op(ctx, o, arc_tol),
         OperationSpec::ThreadMill(o) => helical::thread_mill_op(ctx, o, arc_tol),
+        OperationSpec::WrapPocket(o) => xrotary::plan_wrap_pocket(ctx, o),
+        OperationSpec::WrapContour(o) => xrotary::plan_wrap_contour(ctx, o),
+        // `xrotary::plan_into` plans a pattern as its indexed operations.
+        OperationSpec::IndexedPattern(o) => Err(ctx.bad(common3(&o.operation).name, "an indexed pattern is planned as its indexed operations")),
     }
 }
 
@@ -1081,7 +1087,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
     for spec in &job.operations {
-        planned.push(plan(&ctx, spec, post.base.arc_tolerance)?);
+        xrotary::plan_into(&ctx, spec, &post, &mut planned)?;
     }
 
     let program = MachineProgram { name: name.clone(), operations: planned.iter().map(|p| p.op.clone()).collect(), work_offset: job.work_offset };
@@ -1456,6 +1462,8 @@ mod chamfer;
 mod leads;
 #[path = "cam_finish3d.rs"]
 mod finish3d;
+#[path = "cam_xrotary.rs"]
+mod xrotary;
 
 #[cfg(test)]
 #[path = "cam_tests.rs"]

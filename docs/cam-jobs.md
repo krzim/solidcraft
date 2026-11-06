@@ -158,12 +158,15 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `adaptive_roughing` | `heights` (`top` is the stock's top); `stepdown`; `optimal_load`; `min_engagement_deg`, `max_engagement_deg`; `helix_diameter`; `ramp_angle_deg`; `climb`; `boundary` (the stock's extent; the part's extent); `stock_to_leave` (0.25); `flats` (true); `tolerance` |
 | `chamfer` | `sketch` + `profiles?` or `polygon`; `heights: {clearance, retract, top}` (no `bottom`: the depth follows from the width); `width` (across the top); `tip_offset` (0.2); `side`: `outside` \| `inside` (outside); `climb` (true); `tolerance`. A chamfer mill only; see [Chamfers](#chamfers) |
 | `indexed` | `a_deg` and `operation`: any of the 3-axis operations above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
-| `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}` or `{type: "helix", pitch}`; `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
+| `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}`, `{type: "helix", pitch}` or `{type: "rings", stepover, zigzag?}` (below); `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
 | `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
 | `bore` | `sketch` (its circles) + `diameter_range?: [min, max]` or `holes: [{center: [x, y], diameter}]`; `heights` (`top` the hole's top, `bottom` its floor); `pitch` or `ramp_angle_deg` (2, the pitch at most `stepdown`: the tool's, else 10% of its diameter); `stepover` (between rings; the tool's, else 40% of its diameter); `climb` (true); `finish_passes` (0); `stock_to_leave` (0.1 with finishing passes, else 0) |
 | `thread_mill` | `sketch` (its circles' centres) + `diameter_range?` or `centers: [[x, y], …]`; `heights` (the thread from `top` down to `bottom`); `pitch`; `thread_diameter` (the major, nominal diameter); `internal` (true); `right_hand` (true); `climb` (true); `thread_depth` (ISO metric: 0.5413 × pitch inside, 0.6134 × pitch outside); `radial_passes` (1); `spring_pass` (false) |
 | `face` | `bottom`; `top` (the stock's top; required without a stock); `retract` (2 above the top, or the stock's top if higher); `clearance` (10 above the retract); `stepdown` (tool's, else 1); `stepover` (tool's, else 70% of the flat of its end); `angle_deg` (0); `zigzag` (true); `overhang` (half the tool's diameter and 0.5); `rect: [[x, y], [x, y]]` (the stock seen from above, else the part's extent). A flat end mill or a bull nose. |
 | `wrap` | `radius` (of the cylinder the path is drawn on); `points: [[x, y, z], …]` (x along the axis, y the arc length round it, z the depth: 0 on the cylinder, negative into it) or `sketch` + `curve` (a curve id; its sketch x and y are taken as x and arc length) with `depth` (0); `clearance` (5) and `retract` (1) above the cylinder; `max_angle_step_deg` (2) |
+| `wrap_pocket` | `radius` (of the cylinder the profile is drawn on); `sketch` + `profiles?` or `polygon: [[x, arc length], …]` (unrolled: x along the axis, y the arc length round the cylinder); `bottom` (the floor's depth from the cylinder, negative into it); `top` (0); `stepdown`; `stepover`; `clearance` (5) and `retract` (1) above the cylinder; `climb`; `stock_to_leave` (walls); `ramp_angle_deg`; `tolerance`; `max_angle_step_deg` (2). See "Wrapped pockets and contours" below. |
+| `wrap_contour` | As `wrap_pocket`, with `side` (outside) instead of `stepover`: the profile's boundary followed in depth levels |
+| `indexed_pattern` | `a_deg: [angles]` or `count` (evenly over a turn, from `start_deg`, 0), and `operation`: one of the five 3-axis operations, run as an `indexed` operation at each angle, named `<name> A<angle>` |
 
 The 3-axis operations (`contour` to `drill`) run with every rotary at zero; on `3axis` and
 `4axis_a` that is work coordinates. Inside `indexed` their heights, polygons and boundaries are
@@ -546,3 +549,79 @@ dome shows no advantage for `scallop`, and the other parts were not compared wit
 sharp wall-and-floor corner a 10 mm ball leaves up to 5.6 mm; `rest_finish` with a 4 mm ball after it leaves at most
 0.016 mm, and cuts nothing on the floor further out or on the top. A pencil pass on a fillet
 joint tighter than the ball runs within 0.003 mm of where the ball touches both faces.
+## Wrapped pockets and contours, rings and indexed patterns
+
+More 4th-axis work for a table about +X (`machine: "4axis_a"`), all checked like the others:
+the program is read back and every cut is checked for gouges.
+
+### Wrapped pockets and contours
+
+`wrap_pocket` and `wrap_contour` cut a closed 2D profile into a cylinder of `radius` round the
+A axis, the tool pointing at the axis. The profile is drawn unrolled: x along the axis, y the
+arc length round the cylinder at `radius` (a polygon, or a sketch on a plane facing +Z whose
+x and y are taken that way, in work coordinates). It is cut in levels from `top` down to
+`bottom` (depths from the cylinder, negative into it), at most `stepdown` apart; the floor is
+the cylinder of radius `radius + bottom`, exactly.
+
+Unrolling distorts with depth. The profile keeps its angles as it goes down (a wall at arc
+length y is the radial plane at A = y / radius), but a tool of radius r at a level of radius ρ
+must have its centre r from the wall in arc length *at ρ*, which is an angle of r / ρ: wider in
+angle the deeper the level. Offsetting once at the cylinder and wrapping that at every depth
+would cut each wall too far round by r·(1/ρ − 1/radius) of angle at the floor. So every level is
+planned on its own: the profile's arc lengths are scaled by ρ / radius (the unrolled plane at the
+cutting radius, where lengths are true), the pocket or contour is offset there and wrapped at ρ.
+Along X nothing is distorted. A radial tool's side is parallel to its axis, so above the tip it
+stays farther from a radial wall than at the tip: a wall is left as steps no taller than a
+stepdown, and at the tip at most r − ρ·atan(r / ρ) ≈ r³ / (3ρ²) short of it (0.02 mm for a 6 mm
+tool at radius 20), never cut into.
+
+Lines are kept exact; curves and the offset arcs are followed in chords within a quarter of the
+tolerance each and the wrapped moves within half of it. Cuts are written as short moves, each
+turning A by at most `max_angle_step_deg`, in inverse time where the post says so; A stays
+within the profile's angles, and a post with `rewind` brings a long cut back within the table's
+limits. Everything one level cuts must fit within one turn at that level, or the operation is
+refused. Text engraving is not part of these operations.
+
+### Rings
+
+`{"type": "rings", "stepover": 2, "zigzag": true}` is a third `pattern` for `rotary_finish` and
+`rotary_roughing`: circumferential passes, a full turn of A at each X, X stepping between them.
+The rings are evenly spaced over `range`, both ends included, at most `stepover` apart (exactly
+it when it divides the range). With `zigzag` (the default) every other ring turns back, so A
+stays within one turn; without it every ring turns the same way, one cutting direction
+throughout, and A winds on a turn per ring (the post's `rewind`, or a table that turns without
+end). Rings are linked by feeding across X when that is short and clear. For roughing, rings
+farther apart than the tool is wide are refused.
+
+### Indexed patterns
+
+```json
+{"type": "indexed_pattern", "a_deg": [0, 90, 180, 270],
+ "operation": {"name": "flat", "type": "parallel", "tool": 1, "heights": {"clearance": 40, "retract": 17, "top": 15, "bottom": 0}}}
+```
+
+runs one 3-axis operation at several A angles, as that many `indexed` entries would: each is
+named `<name> A<angle>` (`flat A0`, `flat A90`, …) and written exactly as an `indexed` entry with
+that name and angle. `count: 6` spreads six angles evenly over a turn from `start_deg` (0). A
+pattern has 1 to 200 angles, and a job's operations, every angle counted, are at most 200.
+
+### The setup check
+
+Before anything is written, every rotary operation's clearance is held against the part along
+the stretch of X it works over (its moves, the tool's radius either side): where its rapids go
+round and where A turns, the tool must be outside the part's largest radius about the A axis
+there, by more than the job's tolerance. That is the `clearance` of `rotary_finish` and
+`rotary_roughing` (which must also clear its `stock_radius`), and `radius + clearance` for
+`wrap`, `wrap_pocket` and `wrap_contour`.
+
+A turns into an operation where the one before it left the tool: the post rises there (to its
+`clearance`, or else to the new operation's highest rapid, never down) and turns A before it
+moves across. So whenever A turns between two operations with the same tool, of any kind (a
+plain 3-axis one included), the tool's end at that height must be outside the part's largest
+radius within the tool's radius of the X where it stands. Raising the earlier operation's
+clearance, or the post's, fixes it. An `indexed` or `indexed_pattern` operation turns A only as
+it starts; where the tool's place is not known (the program's first operation, or after a tool
+change) its own clearance is held against the X it works over instead. A post whose
+`safe_rotate` lines take the tool to the machine's top before every turn is not held to either.
+A job that fails is refused with the operation, the height and how far the part (or the stock)
+reaches.

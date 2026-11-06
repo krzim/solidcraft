@@ -50,6 +50,7 @@ pub mod strategies5;
 mod surface;
 pub mod surface_ops;
 mod tool;
+pub mod wrapped;
 
 pub use chamfer::{ChamferGeometry, ChamferParams, DEFAULT_TIP_OFFSET, chamfer, chamfer_geometry};
 pub use check::verify;
@@ -134,3 +135,5 @@ mod strategies5_tests;
 mod surface_ops_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wrapped_tests;

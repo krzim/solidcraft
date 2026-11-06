@@ -196,6 +196,11 @@ pub enum RotaryPattern {
     Lines { angle_step: f64, zigzag: bool },
     /// One pass going round and round, advancing `pitch` mm along +X per turn.
     Helix { pitch: f64 },
+    /// Circumferential passes: a full turn of A at each X, the rings at most `stepover` mm
+    /// apart along X (evenly over the range, both ends included). With `zigzag` every other ring
+    /// turns back, so A stays within one turn; without it every ring turns the same way (one
+    /// cutting direction) and A winds on, a turn per ring.
+    Rings { stepover: f64, zigzag: bool },
 }
 
 /// Finishing a part turned on the rotary axis: the tool, radial, follows the surface.
@@ -302,10 +307,13 @@ impl Drum<'_> {
     }
 }
 
-/// How a pass's parameter maps to a place: along X at a fixed angle, or round a helix.
+/// How a pass's parameter maps to a place: along X at a fixed angle, round a ring at a fixed X,
+/// or round a helix.
 #[derive(Clone, Copy, Debug)]
 enum Way {
     Line(f64),
+    /// Round at `x`, the parameter the angle.
+    Ring(f64),
     /// At angle `t`, x is `x0 + pitch·(t − lead)/2π` held within `lo..=hi`: with a lead of a
     /// turn the tool goes a full turn round at `lo` before the helix and at `hi` after it.
     Helix {
@@ -318,10 +326,11 @@ enum Way {
 }
 
 impl Way {
-    /// `(x, θ)` at parameter `t` (x along a line, the angle round a helix).
+    /// `(x, θ)` at parameter `t` (x along a line, the angle round a ring or a helix).
     fn at(self, t: f64) -> (f64, f64) {
         match self {
             Way::Line(theta) => (t, theta),
+            Way::Ring(x) => (x, t),
             Way::Helix { x0, pitch, lead, lo, hi } => ((x0 + pitch * (t - lead) / TAU).clamp(lo, hi), t),
         }
     }
@@ -390,6 +399,11 @@ fn setup_check(
                 return invalid("the helix pitch must be above 0");
             }
         }
+        RotaryPattern::Rings { stepover, .. } => {
+            if !(1e-4..=MAX_COORD).contains(&stepover) {
+                return invalid("the stepover between rings must be above 0");
+            }
+        }
     }
     Ok(Setup { pattern, lo, hi, clearance, retract, feeds: *feeds, step, tol, max_step })
 }
@@ -397,7 +411,7 @@ fn setup_check(
 /// Refuses roughing passes farther apart than the tool is wide, which would leave ridges of
 /// stock at full height between them: lines farther apart at the stock radius (the straight
 /// distance between neighbours, the whole stock's width for two lines, and never cleared for
-/// one), or a helix of a larger pitch.
+/// one), or a helix of a larger pitch, or rings farther apart along X.
 fn check_rough_stepover(pattern: RotaryPattern, stock_radius: f64, tool: &Tool) -> Result<()> {
     let stepover = match pattern {
         RotaryPattern::Lines { angle_step, .. } => {
@@ -408,6 +422,7 @@ fn check_rough_stepover(pattern: RotaryPattern, stock_radius: f64, tool: &Tool) 
             2.0 * stock_radius * (PI / lines).min(FRAC_PI_2).sin()
         }
         RotaryPattern::Helix { pitch } => pitch,
+        RotaryPattern::Rings { stepover, .. } => stepover,
     };
     if stepover <= tool.diameter {
         Ok(())
@@ -478,6 +493,23 @@ impl Setup {
                 let way = Way::Helix { x0: self.lo, pitch, lead, lo: self.lo, hi: self.hi };
                 Ok(vec![RPass::new(way, sample(way, 0.0, total, n as usize)?, false)])
             }
+            RotaryPattern::Rings { stepover, zigzag } => {
+                let gaps = (len / stepover - 1e-9).ceil().max(1.0);
+                let per = (TAU / (step / self.retract).min(self.max_step)).ceil().max(1.0);
+                if !((gaps + 1.0) * (per + 1.0) <= MAX_SAMPLES as f64) {
+                    return Err(CamError::TooLarge(format!("more than {MAX_SAMPLES} samples; use a larger step, stepover or tool")));
+                }
+                let (gaps, per) = (gaps as usize, per as usize);
+                (0..=gaps)
+                    .map(|k| {
+                        let way = Way::Ring(if k == gaps { self.hi } else { self.lo + len * k as f64 / gaps as f64 });
+                        // Zigzag rings all go round 0..2π, every other one backwards; the others
+                        // go on round, ring k from k turns, so each starts where the last ended.
+                        let t0 = if zigzag { 0.0 } else { TAU * k as f64 };
+                        Ok(RPass::new(way, sample(way, t0, t0 + TAU, per)?, zigzag && k % 2 == 1))
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -486,6 +518,7 @@ impl Setup {
         let spacing = match self.pattern {
             RotaryPattern::Lines { angle_step, .. } => self.retract * angle_step,
             RotaryPattern::Helix { pitch } => pitch,
+            RotaryPattern::Rings { stepover, .. } => stepover,
         };
         (2.0 * spacing).max(tool.diameter)
     }
@@ -676,8 +709,8 @@ impl Out5<'_> {
 
 /// Finishes a part turned on the rotary axis: for each sample the tool comes in radially and
 /// its tip stops where the cutter first touches the surface ([`drop_along`] towards the axis),
-/// lines along X at angle steps or one continuous helix, refined as the 3-axis passes are
-/// ([`crate::surface_ops`]). Where nothing is under the tool it lifts out and comes back in
+/// lines along X at angle steps, rings round at X steps or one continuous helix, refined as
+/// the 3-axis passes are ([`crate::surface_ops`]). Where nothing is under the tool it lifts out and comes back in
 /// where the surface starts again; where the surface is inside the floor radius the tool runs
 /// at the floor. Passes are linked by feeding across when that is short and clear, otherwise
 /// out to the clearance radius and round.

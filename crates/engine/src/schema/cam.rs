@@ -188,6 +188,14 @@ pub enum PatternSpec {
         /// Advance along X per turn, mm.
         pitch: f64,
     },
+    /// Circumferential passes: a full turn of A at each X, at most `stepover` mm apart along X.
+    Rings {
+        /// Most distance between rings along X, mm.
+        stepover: f64,
+        /// Every other ring turns back, so A stays within a turn. Default: true.
+        #[serde(default)]
+        zigzag: Option<bool>,
+    },
 }
 
 /// Declares an operation's struct with the fields every operation has, then its own.
@@ -556,6 +564,11 @@ pub use drill::{DrillCycleSpec, DrillOp};
 #[path = "cam_finish3d.rs"]
 mod finish3d;
 pub use finish3d::{DirectionSpec, PencilOp, RestFinishOp, ScallopOp, ShallowSpec, SteepShallowOp};
+// Wrapped pockets and contours, and indexed patterns: their own file, inside this module for
+// the `operation!` macro.
+#[path = "cam_xrotary.rs"]
+mod xrotary;
+pub use xrotary::{IndexedPatternOp, WrapContourOp, WrapPocketOp};
 
 /// A 3-axis operation, as an indexed operation runs it.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -613,6 +626,9 @@ pub enum OperationSpec {
     ThreadMill(ThreadMillOp),
     Face(FaceOp),
     Chamfer(ChamferOp),
+    WrapPocket(WrapPocketOp),
+    WrapContour(WrapContourOp),
+    IndexedPattern(IndexedPatternOp),
 }
 
 /// What `cam.job` returns.

@@ -523,3 +523,85 @@ fn rotary_descents_never_go_in_faster_than_the_plunge_feed() {
         assert!(inward > 0);
     }
 }
+
+/// The rings of a path: its cuts grouped by X in order, as `(x, angles)`, without the links
+/// (the few cuts across X between two rings).
+fn rings_of(path: &Toolpath5) -> Vec<(f64, Vec<f64>)> {
+    let mut rings: Vec<(f64, Vec<f64>)> = Vec::new();
+    for m in &path.moves {
+        let Move5::Feed { to, .. } = *m else { continue };
+        match rings.last_mut() {
+            Some((x, angles)) if (to.tip.x - *x).abs() <= 1e-9 => angles.push(angle(to.axis)),
+            _ => rings.push((to.tip.x, vec![angle(to.axis)])),
+        }
+    }
+    rings.retain(|(_, a)| a.len() > 10);
+    rings
+}
+
+/// Rings: a full turn at each X, exactly the stepover apart when it divides the range, every
+/// other one turning back with zigzag, all the same way without.
+#[test]
+fn rotary_rings_step_over_exactly_along_x() {
+    let rc = 20.0;
+    let s = cylinder_x(rc, -30.0, 30.0, 256);
+    let chord = rc * (1.0 - (PI / 256.0).cos());
+    for zigzag in [true, false] {
+        let mut p = finish(RotaryPattern::Rings { stepover: 2.5, zigzag });
+        p.range = Some([-10.0, 10.0]);
+        let path = rotary_finish(&s, &ball(6.0), &p).unwrap();
+        verify5(&path, p.max_angle_step).unwrap();
+        radial_axes(&path);
+        assert!(path.stats().max_axis_step <= p.max_angle_step + 1e-12);
+        for q in path.poses().filter(|q| radius(q.tip) < 24.0) {
+            let r = radius(q.tip);
+            assert!(r <= rc + 1e-9 && r >= rc - chord - 1e-9, "{q:?}: {r}");
+        }
+        // 9 rings, 2.5 mm apart, both ends of the range included.
+        let rings = rings_of(&path);
+        let xs: Vec<f64> = rings.iter().map(|(x, _)| *x).collect();
+        assert_eq!(xs.len(), 9, "{xs:?}");
+        for (k, x) in xs.iter().enumerate() {
+            close(*x, -10.0 + 2.5 * k as f64, 1e-9);
+        }
+        // Each ring goes a whole turn, one way or the other.
+        let mut ways = Vec::new();
+        for (_, a) in &rings {
+            let turned: f64 = a.windows(2).map(|w| (w[1] - w[0] + PI).rem_euclid(TAU) - PI).sum();
+            assert!(turned.abs() >= TAU - 2.0 * p.max_angle_step, "{turned}");
+            ways.push(turned.signum());
+        }
+        if zigzag {
+            assert!(ways.windows(2).all(|w| w[0] == -w[1]), "{ways:?}");
+        } else {
+            assert!(ways.iter().all(|w| *w == ways[0]), "{ways:?}");
+        }
+        // Linked at feed: in once at the start, out at the end.
+        assert!(path.moves.iter().filter(|m| matches!(m, Move5::Rapid { .. })).count() <= 4);
+    }
+    // A stepover that does not divide the range: evenly spaced, no more than it apart.
+    let mut p = finish(RotaryPattern::Rings { stepover: 3.0, zigzag: true });
+    p.range = Some([-10.0, 10.0]);
+    let rings = rings_of(&rotary_finish(&s, &ball(6.0), &p).unwrap());
+    assert_eq!(rings.len(), 8);
+    for (k, (x, _)) in rings.iter().enumerate() {
+        close(*x, -10.0 + 20.0 * k as f64 / 7.0, 1e-9);
+    }
+    // Roughing refuses rings farther apart than the tool is wide, and roughs with closer ones.
+    let mut r = roughing(RotaryPattern::Rings { stepover: 7.0, zigzag: true });
+    assert!(rotary_roughing(&s, &ball(6.0), &r).is_err());
+    r.pattern = RotaryPattern::Rings { stepover: 3.0, zigzag: false };
+    let rough = rotary_roughing(&cylinder_x(10.0, -30.0, 30.0, 128), &Tool::new(1, ToolKind::FlatEndmill, 6.0, 20.0), &r).unwrap();
+    verify5(&rough, r.max_angle_step).unwrap();
+    assert!(rough.poses().all(|q| radius(q.tip) >= 10.0 + 0.5 - 0.02), "the stock to leave is left");
+    for stepover in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e300] {
+        let p = finish(RotaryPattern::Rings { stepover, zigzag: true });
+        assert!(rotary_finish(&s, &ball(6.0), &p).is_err(), "{stepover}");
+    }
+    // Rings too fine to sample are refused, not run.
+    let mut p = finish(RotaryPattern::Rings { stepover: 1e-4, zigzag: true });
+    p.step = 1e-4;
+    assert!(matches!(rotary_finish(&s, &ball(6.0), &p), Err(CamError::TooLarge(_))));
+    let json = serde_json::to_string(&RotaryPattern::Rings { stepover: 2.0, zigzag: false }).unwrap();
+    assert_eq!(json, r#"{"type":"rings","stepover":2.0,"zigzag":false}"#);
+}
