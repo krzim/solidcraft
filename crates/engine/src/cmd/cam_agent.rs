@@ -20,15 +20,15 @@
 //! `Body::classify_point`); the toolpaths and their checks stay on the CAM crate's surface.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use solidcore_record::{Region2, Seg2, Vec2, Vec3};
 use solidcraft_cam::collision::Hit;
 use solidcraft_cam::gcode5::{JointWords, Post5, parse5};
-use solidcraft_cam::kinematics::{Joints, Machine, forward};
-use solidcraft_cam::{Feeds, Frame, Heights, Tool, ToolKind, offset_regions};
+use solidcraft_cam::kinematics::{Carrier, Joints, Machine, forward};
+use solidcraft_cam::{Feeds, Frame, Heights, HolderSection, Tool, ToolKind, offset_regions};
 use solidcraft_geom::prelude::*;
 use solidcraft_kernel::{Body, PointClass};
 
@@ -289,6 +289,7 @@ pub(super) fn load_job(cmd: &str, p: &Value, params: &CamJobParams) -> Result<Lo
 /// The part's and the fixtures' exact geometry, in design coordinates.
 pub(super) struct Geometry {
     part: Vec<Body>,
+    fixtures: Vec<Body>,
     part_box: std::result::Result<[Vec3; 2], String>,
     fixture_box: Option<[Vec3; 2]>,
     origin: Vec3,
@@ -324,12 +325,82 @@ impl Geometry {
             }
         }
         let part: Vec<Body> = names.iter().filter_map(|n| st.bodies.iter().find(|b| &b.name == n)).map(|b| b.body.clone()).collect();
-        let fixture_bodies: Vec<&Body> = fixtures.iter().filter_map(|n| st.bodies.iter().find(|b| &b.name == n)).map(|b| &b.body).collect();
+        let fixture_bodies: Vec<Body> = fixtures.iter().filter_map(|n| st.bodies.iter().find(|b| &b.name == n)).map(|b| b.body.clone()).collect();
         let part_box = exact_box(&part.iter().collect::<Vec<_>>());
-        let fixture_box = if fixture_bodies.is_empty() { None } else { exact_box(&fixture_bodies).ok() };
+        let fixture_box = if fixture_bodies.is_empty() { None } else { exact_box(&fixture_bodies.iter().collect::<Vec<_>>()).ok() };
         let tol = part.iter().map(|b| b.record().tolerance).fold(0.0, f64::max);
         let delta = (tol * 4.0).clamp(1e-3, 0.05);
-        Ok(Geometry { part, part_box, fixture_box, origin, delta })
+        Ok(Geometry { part, fixtures: fixture_bodies, part_box, fixture_box, origin, delta })
+    }
+
+    /// The highest program Z the part and the fixtures reach while the machine's table rotaries
+    /// turn them through any angle, with the rotaries' name; `None` on a machine without
+    /// rotaries or with a rotary head (whose program Z is not the table's). On a table machine
+    /// the program's coordinates are the machine's, so this is where a tool must be for the
+    /// part to turn under it. An upper bound from the exact boxes' corners, made tight on one
+    /// rotary with the exact boxes of the bodies turned every 10° (a point's height between two
+    /// of those is at most 1/cos 5° of its height above the axis there).
+    fn turn_top(&self, machine: &Machine) -> Option<(f64, String)> {
+        let rotaries = &machine.rotaries;
+        if rotaries.is_empty() || rotaries.iter().any(|r| r.carrier != Carrier::Table) {
+            return None;
+        }
+        let o = machine.work_origin;
+        let boxes: Vec<[Vec3; 2]> = self.part_box.clone().ok().into_iter().chain(self.fixture_box).collect();
+        if boxes.is_empty() {
+            return None;
+        }
+        // The boxes' corners where they are in the machine with every rotary at zero.
+        let corners: Vec<Vec3> = boxes
+            .iter()
+            .flat_map(|[lo, hi]| {
+                (0..8).map(move |i| {
+                    Vec3::new(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z })
+                })
+            })
+            .map(|p| p - self.origin + o)
+            .collect();
+        let (top, name) = match rotaries.as_slice() {
+            [r] => {
+                let d = r.direction.normalized()?;
+                let c = r.center;
+                let side = (1.0 - d.z * d.z).max(0.0).sqrt();
+                let along = |q: Vec3| c.z + (q - c).dot(d) * d.z;
+                let radial = |q: Vec3| ((q - c) - d * (q - c).dot(d)).len();
+                let corner = corners.iter().map(|&q| along(q) + radial(q) * side).fold(f64::NEG_INFINITY, f64::max);
+                let low_along = corners.iter().map(|&q| along(q)).fold(f64::INFINITY, f64::min);
+                // The exact boxes of the bodies turned about the axis (in design coordinates:
+                // through `c - o + origin`), as program Z.
+                let pivot = c - o + self.origin;
+                let lift = o.z - self.origin.z;
+                let mut sampled = Some(f64::NEG_INFINITY);
+                'turns: for k in 0..36 {
+                    let angle = (k as f64 * 10.0).to_radians();
+                    for b in self.part.iter().chain(&self.fixtures) {
+                        match solidcraft_kernel::transform(b, Vec3::ZERO, pivot, d, angle).and_then(|t| t.exact_bounds()) {
+                            Ok(bb) if bb.max.z.is_finite() => sampled = sampled.map(|s| s.max(bb.max.z + lift)),
+                            _ => {
+                                sampled = None;
+                                break 'turns;
+                            }
+                        }
+                    }
+                }
+                let half = 5f64.to_radians().cos();
+                let tight = sampled.filter(|s| s.is_finite()).map(|s| s / half - low_along * (1.0 / half - 1.0));
+                (tight.map_or(corner, |t| t.min(corner)), format!("{} axis", r.letter.char()))
+            }
+            rs => {
+                // Turning about a line through c_k keeps a point within |p - c_k| of it, so
+                // within |p - c_0| + 2 |c_k - c_0| of the first centre after every turn.
+                let c0 = rs.first()?.center;
+                let spread: f64 = rs.iter().map(|r| 2.0 * (r.center - c0).len()).sum();
+                let reach = corners.iter().map(|&q| (q - c0).len()).fold(f64::NEG_INFINITY, f64::max);
+                let letters: String = rs.iter().map(|r| r.letter.char()).collect();
+                (c0.z + reach + spread, format!("{letters} axes"))
+            }
+        };
+        top.is_finite().then_some((top, name))
     }
 
     /// The highest and lowest Z of `bounds` in `frame` (inside work coordinates), and whether
@@ -431,23 +502,35 @@ impl Geometry {
         Ok(None)
     }
 
-    /// The lowest floor of the part inside `regions` (in `frame`'s XY), below `top`; `None`
-    /// when somewhere in the regions there is no material at all (the region goes through).
-    fn floor(&self, frame: &Frame, regions: &[Region2], top: f64, low: f64, tol: f64) -> std::result::Result<Option<f64>, String> {
+    /// The lowest floor of the part inside `regions` (in `frame`'s XY), at or below `top`, over
+    /// the columns that meet material: a hole through the part in the region (a bolt hole in a
+    /// pocket's floor) is no floor, and is reported apart. `lowest` is `None` where every column
+    /// goes through.
+    fn floor(&self, frame: &Frame, regions: &[Region2], top: f64, low: f64, tol: f64) -> std::result::Result<Floor, String> {
         let samples = region_samples(regions, tol)?;
         if samples.is_empty() {
             return Err("the region is too narrow to find its floor".into());
         }
         let levels = self.up_levels(frame, top, low);
-        let mut floor = f64::INFINITY;
+        let mut floor = Floor { lowest: None, through_at: None };
         for q in samples {
             match self.column_floor(frame, q.x, q.y, top, &levels, tol)? {
-                Some(z) => floor = floor.min(z),
-                None => return Ok(None),
+                Some(z) => floor.lowest = Some(floor.lowest.map_or(z, |f: f64| f.min(z))),
+                None => {
+                    floor.through_at.get_or_insert(q);
+                }
             }
         }
-        Ok(floor.is_finite().then_some(floor))
+        Ok(floor)
     }
+}
+
+/// What [`Geometry::floor`] finds down a region.
+struct Floor {
+    /// The lowest height the material starts at, over the columns that meet any.
+    lowest: Option<f64>,
+    /// A point (frame XY) where the region goes through the part.
+    through_at: Option<Vec2>,
 }
 
 /// The point a fraction `t` along `s` (lines and arcs; other curves by their ends).
@@ -531,14 +614,27 @@ pub(super) struct Agent {
     derived: RefCell<Vec<DerivedHeights>>,
     used: RefCell<BTreeMap<usize, (Heights, Frame)>>,
     notes: RefCell<Vec<String>>,
+    /// The height the part and fixtures reach as the table turns, and the rotaries' name, when
+    /// the post turns the rotaries at the operations' clearance (no `safe_rotate` to the
+    /// machine's top, no post `clearance` above it).
+    turn: Option<(f64, String)>,
+    /// The job's tolerance (mm).
+    tol: f64,
+    /// The operations whose heights or tool were worked out here: their tools are checked with
+    /// at least the holder they must have.
+    auto: RefCell<BTreeSet<usize>>,
 }
+
+/// How much wider than its shank a holder is taken to be when a tool gives none (mm), and how
+/// far up from the holder's face it is checked.
+const LEAST_HOLDER: (f64, f64) = (1.0, 50.0);
 
 fn positive(v: Option<f64>, max: f64) -> bool {
     v.is_none_or(|x| x.is_finite() && x > 0.0 && x <= max)
 }
 
 impl Agent {
-    pub fn new(cmd: &str, job: &CamJob, geo: Geometry, loaded: &Loaded) -> Result<Agent> {
+    pub fn new(cmd: &str, job: &CamJob, geo: Geometry, loaded: &Loaded, machine: &Machine, post: &Post5) -> Result<Agent> {
         let h = job.default_heights.unwrap_or_default();
         let clearance_above = h.clearance_above.unwrap_or(10.0);
         let retract_above = h.retract_above.unwrap_or(2.0);
@@ -559,8 +655,18 @@ impl Agent {
                 "`default_feeds` must have scales from 0.05 to 2, positive feed limits, a spindle range [lowest, highest] above 0 and a positive fallback",
             ));
         }
+        // A post that goes to the machine's top before a turn, or to its own clearance above
+        // the part's reach, turns the part clear of the tool whatever the operations' heights.
+        let turn = if post.safe_rotate.is_empty() {
+            geo.turn_top(machine).filter(|(top, _)| !(post.clearance_retract && post.clearance.is_some_and(|c| c > *top)))
+        } else {
+            None
+        };
         Ok(Agent {
             geo,
+            turn,
+            tol: job.tolerance.unwrap_or(0.01),
+            auto: RefCell::new(BTreeSet::new()),
             clearance_above,
             retract_above,
             feeds: f,
@@ -750,6 +856,10 @@ pub(super) fn heights(ctx: &Ctx<'_>, op: &str, given: Option<&HeightsInput>, reg
             )
         })
     };
+    // Given heights are checked before anything is worked out from them.
+    if [g.clearance, g.retract, g.top, g.bottom].iter().flatten().any(|v| !(v.is_finite() && v.abs() <= super::MAX_COORD)) {
+        return Err(refuse_op(ctx, op, "heights", "the heights must be finite numbers within 1000 m".into(), None, "give finite heights".into()));
+    }
     let mut derived: Vec<String> = Vec::new();
     let mut why: Vec<String> = Vec::new();
     let top = match g.top {
@@ -776,11 +886,18 @@ pub(super) fn heights(ctx: &Ctx<'_>, op: &str, given: Option<&HeightsInput>, reg
                     low
                 }
                 Region::Floor(regions) => match ag.geo.floor(frame, regions, top, low, tol) {
-                    Ok(Some(z)) if z < top - 1e-6 => {
+                    Ok(Floor { lowest: Some(z), through_at }) if z < top - 1e-6 => {
                         why.push(format!("bottom {}: the lowest floor of the part inside the region", num(z)));
+                        if let Some(q) = through_at {
+                            why.push(format!(
+                                "the region also goes through the part (at {}, {}): a hole there is not cut through by this operation",
+                                num(q.x),
+                                num(q.y)
+                            ));
+                        }
                         z
                     }
-                    Ok(Some(z)) => {
+                    Ok(Floor { lowest: Some(z), through_at: None }) => {
                         return Err(refuse_op(
                             ctx,
                             op,
@@ -790,7 +907,9 @@ pub(super) fn heights(ctx: &Ctx<'_>, op: &str, given: Option<&HeightsInput>, reg
                             "give `heights.bottom`, or draw the region over a pocket the model has".into(),
                         ));
                     }
-                    Ok(None) => {
+                    // No floor below the top, and somewhere no material at all: the region
+                    // goes through the part (or off its edge).
+                    Ok(Floor { .. }) => {
                         why.push(format!("bottom {}: the part's bottom (the region goes through the part)", num(low)));
                         low
                     }
@@ -824,13 +943,26 @@ pub(super) fn heights(ctx: &Ctx<'_>, op: &str, given: Option<&HeightsInput>, reg
         None => {
             let c = (top.max(obstacle) + ag.clearance_above).max(retract);
             derived.push("clearance".into());
-            why.push(format!(
-                "clearance {}: {} above the {}",
-                num(c),
-                num(ag.clearance_above),
-                if fixture_top.is_some_and(|f| f > part_top) { "fixtures' top" } else { "part's top" }
-            ));
-            c
+            match &ag.turn {
+                Some((reach, axis)) if reach + ag.clearance_above > c => {
+                    why.push(format!(
+                        "clearance {}: {} above the part's reach from the {axis} ({}), where the post turns the part under the tool",
+                        num(reach + ag.clearance_above),
+                        num(ag.clearance_above),
+                        num(*reach)
+                    ));
+                    reach + ag.clearance_above
+                }
+                _ => {
+                    why.push(format!(
+                        "clearance {}: {} above the {}",
+                        num(c),
+                        num(ag.clearance_above),
+                        if fixture_top.is_some_and(|f| f > part_top) { "fixtures' top" } else { "part's top" }
+                    ));
+                    c
+                }
+            }
         }
     };
     if !([clearance, retract, top, bottom].iter().all(|v| v.is_finite() && v.abs() <= super::MAX_COORD)) {
@@ -885,9 +1017,32 @@ pub(super) fn heights(ctx: &Ctx<'_>, op: &str, given: Option<&HeightsInput>, reg
             ),
         ));
     }
+    if let Some((reach, axis)) = &ag.turn
+        && clearance <= reach + 1e-6
+    {
+        return Err(refuse_op(
+            ctx,
+            op,
+            "clearance",
+            format!(
+                "the clearance height ({}) is inside the part's reach from the {axis} ({}): the post turns the part at the clearance, so it would turn into the tool",
+                num(clearance),
+                num(*reach)
+            ),
+            None,
+            format!(
+                "raise `heights.clearance` to at least {} (the part reaches {} from the {axis}), or leave it out ({} is the default), or use a post that goes to the machine's top before turning (`safe_rotate`) or gives a `clearance` above {}",
+                num(reach + ag.retract_above),
+                num(*reach),
+                num(reach + ag.clearance_above),
+                num(*reach)
+            ),
+        ));
+    }
     let h = super::heights(&HeightsSpec { clearance, retract, top, bottom });
     ag.used.borrow_mut().insert(ag.index.get(), (h, *frame));
     if !derived.is_empty() {
+        ag.auto.borrow_mut().insert(ag.index.get());
         ag.derived.borrow_mut().push(DerivedHeights {
             op_index: ag.index.get(),
             op: op.to_string(),
@@ -968,8 +1123,15 @@ fn kind_of(name: &str) -> Option<ToolKind> {
     serde_json::from_value(Value::String(name.trim().to_ascii_lowercase())).ok()
 }
 
-/// The tool `spec` picks from the job's tools, and why.
-fn pick<'t>(ctx: &'t Ctx<'_>, op: &str, spec: &ToolSpec, fit: Option<&dyn Fn(&Tool) -> bool>) -> Result<(&'t Tool, String)> {
+/// How deep below the material beside it `t` can cut before its holder's face gets there: its
+/// stickout (its flutes when it gives none), or its flutes when its shank is wider than its cut.
+fn reach(t: &Tool) -> f64 {
+    if t.shank_diameter.is_some_and(|s| s > t.diameter + 1e-9) { t.flute_length } else { t.stickout.unwrap_or(t.flute_length).max(t.flute_length) }
+}
+
+/// The tool `spec` picks from the job's tools, and why. With `depth` (a 2D operation's cut, top
+/// to bottom), the tools that reach it come first.
+fn pick<'t>(ctx: &'t Ctx<'_>, op: &str, spec: &ToolSpec, fit: Option<&dyn Fn(&Tool) -> bool>, depth: Option<f64>) -> Result<(&'t Tool, String)> {
     let nums = [spec.diameter, spec.max_diameter, spec.min_diameter, spec.min_flute_length, spec.min_stickout];
     if !nums.iter().all(|v| v.is_none_or(|x| x.is_finite() && x > 0.0 && x <= 10_000.0)) {
         return Err(refuse_op(ctx, op, "tool", "a tool spec's sizes must be above 0".into(), None, "give sizes in mm above 0".into()));
@@ -997,7 +1159,14 @@ fn pick<'t>(ctx: &'t Ctx<'_>, op: &str, spec: &ToolSpec, fit: Option<&dyn Fn(&To
     };
     let sized_tools: Vec<&Tool> = ctx.tools.iter().filter(|t| sized(t)).collect();
     let mut matches: Vec<&Tool> = sized_tools.iter().copied().filter(|t| fit.is_none_or(|f| f(t))).collect();
-    matches.sort_by(|a, b| b.diameter.total_cmp(&a.diameter).then(a.flute_length.total_cmp(&b.flute_length)).then(a.number.cmp(&b.number)));
+    let reaches = |t: &Tool| depth.is_none_or(|d| reach(t) + 1e-9 >= d);
+    matches.sort_by(|a, b| {
+        reaches(b)
+            .cmp(&reaches(a))
+            .then(b.diameter.total_cmp(&a.diameter))
+            .then(a.flute_length.total_cmp(&b.flute_length))
+            .then(a.number.cmp(&b.number))
+    });
     let Some(first) = matches.first().copied() else {
         let (error, fix) = if sized_tools.is_empty() {
             let same_kind: Vec<Tool> = ctx.tools.iter().filter(|t| kind.is_none_or(|k| t.kind == k)).cloned().collect();
@@ -1026,6 +1195,17 @@ fn pick<'t>(ctx: &'t Ctx<'_>, op: &str, spec: &ToolSpec, fit: Option<&dyn Fn(&To
     if fit.is_some() {
         why.push_str(" and fits the profile");
     }
+    if let Some(d) = depth {
+        if reaches(first) {
+            why.push_str(&format!(", reaching the {} mm deep cut", num(d)));
+        } else {
+            why.push_str(&format!(
+                "; none of the matches reaches the {} mm deep cut (this one stands out {} mm): give a longer tool, or cut less deep",
+                num(d),
+                num(reach(first))
+            ));
+        }
+    }
     let others: Vec<String> = matches.iter().skip(1).take(10).map(|t| format!("T{}", t.number)).collect();
     if !others.is_empty() {
         why.push_str(&format!("; also matched: {}", others.join(", ")));
@@ -1036,6 +1216,12 @@ fn pick<'t>(ctx: &'t Ctx<'_>, op: &str, spec: &ToolSpec, fit: Option<&dyn Fn(&To
 /// `c`'s tool, spindle speed and feeds: the tool by number or spec (`fit`: whether a tool fits
 /// the operation's profiles), its cutting data with the job's feeds policy.
 pub(super) fn resolve(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&Tool) -> bool>) -> Result<Resolved> {
+    resolve_for(ctx, c, fit, None)
+}
+
+/// [`resolve`] for a cut `depth` deep (a 2D operation's top to bottom): a tool asked for by
+/// what it is is one that reaches it where the job has one.
+pub(super) fn resolve_for(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&Tool) -> bool>, depth: Option<f64>) -> Result<Resolved> {
     let ag = ctx.agent;
     ag.name_op(c.name);
     let (tool, why) = match c.tool {
@@ -1056,7 +1242,10 @@ pub(super) fn resolve(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&Tool) 
                 ));
             }
         },
-        ToolRef::Spec(spec) => pick(ctx, c.name, spec, fit)?,
+        ToolRef::Spec(spec) => {
+            ag.auto.borrow_mut().insert(ag.index.get());
+            pick(ctx, c.name, spec, fit, depth)?
+        }
     };
     let pol = ag.feeds;
     let op = c.name;
@@ -1263,20 +1452,57 @@ impl Agent {
         }
     }
 
-    /// The refusal of operation `index`'s holder or shank collisions.
-    pub fn holder_refusal(&self, index: usize, p: &Planned, hits: &[Hit], text: &str, machine: &Machine) -> Refusal {
-        let t = &p.tool;
-        let first = hits.first().copied();
+    /// The tool operation `index`'s shank and holder are checked with, and whether its holder is
+    /// the least one it can have: where the operation's heights or tool were worked out and the
+    /// tool gives no `holder`, one [`LEAST_HOLDER`] wider than its shank from its stickout up
+    /// (a real one is wider still), so a cut worked out deeper than the tool reaches is seen.
+    ///
+    /// A shank no wider than the cut rides in the slot its flutes cut: it is checked shrunk by
+    /// the job's tolerance, as the cutter is in the gouge check, so a shank as wide as the
+    /// flutes (a tool that gives no `shank_diameter`) running down the wall it has just cut is
+    /// no collision.
+    pub fn holder_tool(&self, index: usize, tool: &Tool) -> (Tool, bool) {
+        let mut t = tool.clone();
+        let shank = tool.shank_diameter.unwrap_or(tool.diameter);
+        if shank <= tool.diameter + 1e-9 {
+            t.shank_diameter = Some((shank - 2.0 * self.tol).max(shank * 0.5));
+        }
+        if !tool.holder.is_empty() || !self.auto.borrow().contains(&index) {
+            return (t, false);
+        }
+        t.holder = vec![HolderSection { diameter: shank + LEAST_HOLDER.0, length: LEAST_HOLDER.1 }];
+        (t, true)
+    }
+
+    /// The refusal of operation `index`'s holder or shank collisions, `t` the tool as checked
+    /// (`least`: with the least holder of [`Agent::holder_tool`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn holder_refusal(&self, index: usize, p: &Planned, t: &Tool, least: bool, hits: &[Hit], text: &str, machine: &Machine) -> Refusal {
+        // The deepest hit: how far the tool must reach.
+        let frame = self.used(index).map(|(_, f)| f);
+        let top = frame.and_then(|f| self.geo.part_range(&f).ok().map(|(top, _, _)| top));
+        let depth_of = |h: &Hit| match (frame, top) {
+            (Some(f), Some(top)) => Some(top - f.to_local(h.pose.tip).z),
+            _ => None,
+        };
+        let first = hits.iter().copied().max_by(|a, b| depth_of(a).unwrap_or(0.0).total_cmp(&depth_of(b).unwrap_or(0.0))).or(hits.first().copied());
         let tip = first.map(|h| h.pose.tip);
         let envelopes = t.envelopes();
         let env = first.and_then(|h| h.envelope).and_then(|i| envelopes.get(i)).copied();
         let stickout = t.stickout.unwrap_or(t.flute_length).max(t.flute_length);
         let shank = env.is_some_and(|e| e.top <= stickout + 1e-9);
-        let depth = match (self.used(index), tip) {
-            (Some((_, frame)), Some(tip)) => self.geo.part_range(&frame).ok().map(|(top, _, _)| top - frame.to_local(tip).z),
-            _ => None,
-        };
+        let depth = first.as_ref().and_then(depth_of);
         let fix = match (shank, depth) {
+            (false, Some(d)) if least => format!(
+                "tool {} gives no `holder`, so it is checked with the least it can have (1 mm wider than its shank, from where it stands out: {} mm{}), and the cut goes {} mm below the part's top: use a tool standing out at least {} mm, e.g. `tool: {{min_stickout: {}}}`, give tool {} its real `stickout` and `holder` if it stands out further, or cut less deep (`heights.bottom`)",
+                t.number,
+                num(stickout),
+                if p.tool.stickout.is_none() { ", its flutes, as it gives no `stickout`" } else { "" },
+                num(d),
+                num(d + 1.0),
+                num((d + 1.0).ceil()),
+                t.number
+            ),
             (true, Some(d)) => format!(
                 "the shank meets the part: use a tool whose flutes reach at least {} mm (tool {} has {} mm), e.g. `tool: {{min_flute_length: {}}}`, or cut less deep here",
                 num(d + 0.5),
@@ -1295,7 +1521,18 @@ impl Agent {
             (false, None) => "use a tool that stands out further, or a slimmer holder".into(),
         };
         Refusal {
-            error: format!("tool {}'s {} touches the part or a fixture along {} moves", t.number, if shank { "shank" } else { "holder" }, hits.len()),
+            error: format!(
+                "tool {}'s {} touches the part or a fixture along {} moves",
+                t.number,
+                if shank {
+                    "shank"
+                } else if least {
+                    "holder (the least it can have: none is given)"
+                } else {
+                    "holder"
+                },
+                hits.len()
+            ),
             op: Some(OpRef { index, name: p.report.name.clone() }),
             check: "holder".into(),
             at: tip.map(point),
@@ -1379,6 +1616,8 @@ pub(super) fn reply_value(reply: CamJobReply, compact: bool) -> Result<Value> {
             total_minutes: reply.readback.cut_minutes,
             program_lines: reply.program_lines,
             outputs: reply.outputs,
+            // Everything but how the bodies were tessellated, which every job says.
+            notes: reply.notes.into_iter().filter(|n| !n.starts_with(super::TESSELLATION_NOTE)).collect(),
             param_warnings: reply.param_warnings,
         })
     } else {

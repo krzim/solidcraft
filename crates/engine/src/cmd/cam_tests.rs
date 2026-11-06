@@ -499,7 +499,7 @@ fn omitted_heights_are_worked_out_from_the_part() {
     let mut s = block_with_pocket();
     let ops = json!([
         pocket_op(json!(4)),
-        {"name": "outline", "type": "contour", "tool": 6, "polygon": [[-20, -15], [20, -15], [20, 15], [-20, 15]], "stepdown": 5},
+        {"name": "outline", "type": "contour", "tool": 10, "polygon": [[-20, -15], [20, -15], [20, 15], [-20, 15]], "stepdown": 5},
         // Only the top given: the rest follow it.
         {"name": "shallow", "type": "pocket", "tool": 4, "polygon": POCKET, "heights": {"top": 18}, "stepover": 1.5, "gouge_check": false},
         {"name": "finish", "type": "parallel", "tool": 9, "stepover": 2, "boundary": {"rect": [[-10, -6], [10, 6]]}}
@@ -637,7 +637,7 @@ fn the_compact_reply_keeps_what_an_agent_needs() {
     let mut s = block_with_pocket();
     let ops = json!([
         pocket_op(json!({"kind": "flat_endmill", "max_diameter": 6})),
-        {"name": "outline", "type": "contour", "tool": 6, "polygon": [[-20, -15], [20, -15], [20, 15], [-20, 15]], "stepdown": 5}
+        {"name": "outline", "type": "contour", "tool": 10, "polygon": [[-20, -15], [20, -15], [20, 15], [-20, 15]], "stepdown": 5}
     ]);
     let r = run(&mut s, "cam.job", json!({"job": agent_job(ops), "dry_run": true, "compact": true}));
     let mut keys: Vec<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
@@ -646,7 +646,7 @@ fn the_compact_reply_keeps_what_an_agent_needs() {
     assert_eq!((r["compact"].as_bool(), r["passed"].as_bool()), (Some(true), Some(true)), "{r}");
     let lines: Vec<&str> = r["operations"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
     assert!(lines[0].starts_with("0 `pocket`: pocket, T6 6 mm flat end mill") && lines[0].contains("heights 30/22/20/15"), "{lines:?}");
-    assert!(lines[1].starts_with("1 `outline`: contour, T6"), "{lines:?}");
+    assert!(lines[1].starts_with("1 `outline`: contour, T10"), "{lines:?}");
     assert!(r["total_minutes"].as_f64().is_some_and(|m| m > 0.0), "{r}");
     assert_eq!(r["tools"][1]["why"], "given by number", "{r}");
     // The compact reply of a failing dry run carries the failures with their fixes.
@@ -691,5 +691,163 @@ fn agent_keys_are_strict() {
             Err(_) => {}
             Ok(v) => panic!("{bad}: accepted: {v}"),
         }
+    }
+}
+
+// Review of the agent-facing defaults: what they work out must never turn a safe job into a
+// crash the checks do not see, and must not walk an agent into a refusal it could have avoided.
+
+/// A block 40 × 60 × 60 about the X axis, its corners 42.4 mm from it, with a 12 × 12 pocket 5 mm
+/// deep in its top (+Z) and another in its +Y face.
+fn tall_block_on_a() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 60, "height": 60, "corner": [-20, -30, -30], "body_name": "Block"}));
+    run(&mut s, "solid.box", json!({"length": 12, "width": 12, "height": 5, "corner": [-6, -6, 25], "operation": "cut"}));
+    run(&mut s, "solid.box", json!({"length": 12, "width": 5, "height": 12, "corner": [-6, 25, -6], "operation": "cut"}));
+    s
+}
+
+fn turning_job(post: &str, heights: Option<Value>) -> Value {
+    let square = json!([[-6, -6], [6, -6], [6, 6], [-6, 6]]);
+    let mut top = json!({"name": "top pocket", "type": "pocket", "tool": 1, "polygon": square, "stepover": 1.5});
+    let mut side = json!({"name": "side pocket", "type": "pocket", "tool": 1, "polygon": square, "stepover": 1.5});
+    if let Some(h) = heights {
+        top["heights"] = h.clone();
+        side["heights"] = h;
+    }
+    json!({"machine": "4axis_a", "post": post, "tools": [flat(1, 4.0)], "operations": [top, {"type": "indexed", "a_deg": 90, "operation": side}]})
+}
+
+/// The lowest Z (program coordinates) at which the program turns its A axis, and how many turns.
+fn lowest_turn(text: &str) -> (f64, usize) {
+    let (mut z, mut a): (Option<f64>, Option<f64>) = (None, None);
+    let (mut lowest, mut turns) = (f64::INFINITY, 0);
+    for line in text.lines() {
+        let code = line.split('(').next().unwrap_or("");
+        for w in code.split_whitespace() {
+            let (letter, value) = w.split_at(1);
+            let Ok(v) = value.parse::<f64>() else { continue };
+            match letter {
+                "Z" => z = Some(v),
+                "A" => {
+                    if a.is_none_or(|old| (old - v).abs() > 1e-9) {
+                        turns += 1;
+                        lowest = lowest.min(z.unwrap_or(f64::NEG_INFINITY));
+                    }
+                    a = Some(v);
+                }
+                _ => {}
+            }
+        }
+    }
+    (lowest, turns)
+}
+
+/// On a 4th axis the part turns under the tool between operations: a clearance worked out from
+/// the part's top in one frame (here 30 + 10) is below the corners' 42.4 mm reach from the A axis,
+/// and the built-in 4-axis posts turn A at the operation's clearance. Nothing checks rapids, so
+/// the worked-out clearance itself must clear the part as it turns, and a given one that does
+/// not is refused with the height that does.
+#[test]
+fn a_worked_out_clearance_clears_the_part_as_the_rotary_turns() {
+    let mut s = tall_block_on_a();
+    let reach = 30.0 * 2f64.sqrt();
+    let dir = Dir::new("turn");
+    let out = dir.file("turn.tap");
+    let r = run(&mut s, "cam.job", json!({"job": turning_job("mach3_4axis", None), "output": out}));
+    assert_clean(&r);
+    for d in r["derived_heights"].as_array().unwrap() {
+        let c = d["clearance"].as_f64().unwrap();
+        assert!(c >= reach + 10.0 - 1e-6 && c < reach + 10.5, "{d}");
+        assert!(d["why"].as_str().unwrap().contains("A axis"), "{d}");
+    }
+    let (lowest, turns) = lowest_turn(&std::fs::read_to_string(&out).unwrap());
+    assert!(turns >= 2 && lowest > reach, "A turns at Z {lowest}, the part reaches {reach}");
+    // A clearance given above the part's top but inside its reach is refused with the fix.
+    let job = turning_job("mach3_4axis", Some(json!({"clearance": 40, "retract": 32})));
+    let e = s.execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
+    let r = refusals(&e);
+    assert_eq!(r[0]["check"], "clearance", "{e}");
+    let fix = r[0]["fix"].as_str().unwrap();
+    assert!(fix.contains("A axis") && fix.contains("at least 44.4"), "{fix}");
+    // A post that goes to the machine's top before turning needs no more than the part's top.
+    let r = run(&mut s, "cam.job", json!({"job": turning_job("rs274_5axis", None), "dry_run": true}));
+    assert_clean(&r);
+    assert_eq!(r["derived_heights"][0]["clearance"].as_f64(), Some(40.0), "{r}");
+}
+
+/// A bolt hole through a pocket's floor is no reason to take the pocket through the part: the
+/// worked-out bottom stays on the floor (it went down to the part's bottom, and every such job
+/// was refused for a gouge through the floor).
+#[test]
+fn a_hole_through_a_pocket_floor_leaves_the_bottom_on_the_floor() {
+    let mut s = block_with_pocket();
+    run(&mut s, "solid.cylinder", json!({"radius": 2.5, "height": 20, "axis": "Z", "base": [0, 0, 0], "operation": "cut"}));
+    let r = run(&mut s, "cam.job", json!({"job": agent_job(json!([pocket_op(json!(4))])), "dry_run": true}));
+    assert_clean(&r);
+    let d = &r["derived_heights"][0];
+    assert_eq!(d["bottom"].as_f64(), Some(15.0), "{r}");
+    assert!(d["why"].as_str().unwrap().contains("through"), "{d}");
+}
+
+/// A block 40 × 30 × 20 with a 16 × 10 pocket 15 mm deep in its top.
+fn deep_pocket() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "corner": [-20, -15, 0], "body_name": "Block"}));
+    run(&mut s, "solid.box", json!({"length": 16, "width": 10, "height": 15, "corner": [-8, -5, 5], "operation": "cut"}));
+    s
+}
+
+/// A tool picked by what it is must reach the depth worked out for it, and where heights or the
+/// tool were worked out, a tool without holder data is checked with the least holder it can
+/// have (just wider than its shank, at its stickout): its holder would otherwise come down into
+/// the part with no check to see it.
+#[test]
+fn a_worked_out_cut_never_takes_the_holder_into_the_part() {
+    let mut s = deep_pocket();
+    let tools = json!([flat_tool(8, 8.0, 10.0), flat_tool(6, 6.0, 18.0)]);
+    let job = |op: Value| json!({"machine": "3axis", "post": "mach3_4axis", "tools": tools, "operations": [op]});
+    // The 8 mm tool fits but its 10 mm flutes do not reach the 15 mm floor: the 6 mm one is picked.
+    let r = run(&mut s, "cam.job", json!({"job": job(pocket_op(json!({"kind": "flat_endmill"}))), "dry_run": true}));
+    assert_clean(&r);
+    assert_eq!(r["tool_choices"][0]["tool"], 6, "{r}");
+    assert!(r["tool_choices"][0]["why"].as_str().unwrap().contains("reach"), "{r}");
+    // Given by number, the worked-out 15 mm cut with 10 mm of tool is refused, with the fix.
+    let dir = Dir::new("reach");
+    let e = s.execute("cam.job", &json!({"job": job(pocket_op(json!(8))), "output": dir.file("x.tap")})).unwrap_err();
+    let r = refusals(&e);
+    assert_eq!(r[0]["check"], "holder", "{e}");
+    let fix = r[0]["fix"].as_str().unwrap();
+    assert!(fix.contains("stickout") && fix.contains("min_stickout: 16"), "{fix}");
+    // An outside contour down the whole 20 mm block: the same.
+    let outline = json!({"name": "outline", "type": "contour", "tool": 6, "polygon": [[-20, -15], [20, -15], [20, 15], [-20, 15]], "stepdown": 5});
+    let r = run(&mut s, "cam.job", json!({"job": job(outline.clone()), "dry_run": true}));
+    assert_eq!(r["failure_details"][0]["check"], "holder", "{r}");
+    // A tool standing out far enough passes.
+    let long = json!([{"number": 6, "kind": "flat_endmill", "diameter": 6, "flute_length": 18, "stickout": 26, "spindle_rpm": 12000, "feed": 800, "plunge_feed": 200}]);
+    let r = run(&mut s, "cam.job", json!({"job": with_key(job(outline), "tools", long), "dry_run": true}));
+    assert_clean(&r);
+}
+
+/// The compact reply keeps the notes that matter: here, a body named like a vise that is about
+/// to be machined as part of the part.
+#[test]
+fn the_compact_reply_keeps_the_notes_that_matter() {
+    let mut s = block_with_pocket();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [30, 30, 0], "body_name": "Vise jaw"}));
+    let r = run(&mut s, "cam.job", json!({"job": agent_job(json!([pocket_op(json!(4))])), "dry_run": true, "compact": true}));
+    let notes = r["notes"].to_string();
+    assert!(notes.contains("Vise jaw") && notes.contains("fixtures"), "{r}");
+    assert!(!notes.contains("tessellated"), "the tessellation note is not news: {r}");
+}
+
+/// Heights given out of range are refused before anything is worked out from them.
+#[test]
+fn hostile_heights_are_refused_before_the_floor_is_searched() {
+    let mut s = block_with_pocket();
+    for h in [json!({"top": 1e300}), json!({"bottom": -1e300}), json!({"clearance": 1e300})] {
+        let op = json!({"name": "p", "type": "pocket", "tool": 4, "polygon": POCKET, "heights": h});
+        let e = s.execute("cam.job", &json!({"job": agent_job(json!([op])), "dry_run": true})).unwrap_err();
+        assert_eq!(refusals(&e)[0]["check"], "heights", "{h}: {e}");
     }
 }

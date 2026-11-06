@@ -439,7 +439,7 @@ fn surfaces_of(cmd: &str, s: &Session, job: &CamJob, origin: Vec3, tol: f64) -> 
     }
     let chord = tol * 0.5;
     let mut notes = vec![format!(
-        "bodies tessellated from their exact surfaces at a chord tolerance of {} mm (half the job's tolerance), in work coordinates \
+        "{TESSELLATION_NOTE} from their exact surfaces at a chord tolerance of {} mm (half the job's tolerance), in work coordinates \
          (the design less origin [{}, {}, {}])",
         num(chord),
         num(origin.x),
@@ -467,6 +467,9 @@ fn surfaces_of(cmd: &str, s: &Session, job: &CamJob, origin: Vec3, tol: f64) -> 
     };
     Ok(Surfaces { part: part_surface, all, notes })
 }
+
+/// How the note on the bodies' tessellation starts (the compact reply leaves it out).
+const TESSELLATION_NOTE: &str = "bodies tessellated";
 
 /// A number as the notes and messages show it.
 fn num(v: f64) -> String {
@@ -650,9 +653,9 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
             };
             let (leave, tol) = (o.stock_to_leave.unwrap_or(0.0), ctx.tolerance(c.name, o.tolerance)?);
             let fit = |t: &Tool| agent::fits(&regions, t, leave, tol);
-            let r = agent::resolve(ctx, &c, if side == Side::Inside { Some(&fit) } else { None })?;
             let region = if side == Side::Outside { agent::Region::Part } else { agent::Region::Floor(&regions) };
             let h = agent::heights(ctx, c.name, o.heights.as_ref(), region, frame, tol)?;
+            let r = agent::resolve_for(ctx, &c, if side == Side::Inside { Some(&fit) } else { None }, Some(h.top - h.bottom))?;
             let cut = Cut { heights: h, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
             let params = ContourParams {
                 side,
@@ -669,8 +672,8 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
             let regions = ctx.regions(c.name, o.sketch.as_ref(), o.profiles.as_deref(), o.polygon.as_deref(), frame)?;
             let (leave, tol) = (o.stock_to_leave.unwrap_or(0.0), ctx.tolerance(c.name, o.tolerance)?);
             let fit = |t: &Tool| agent::fits(&regions, t, leave, tol);
-            let r = agent::resolve(ctx, &c, Some(&fit))?;
             let h = agent::heights(ctx, c.name, o.heights.as_ref(), agent::Region::Floor(&regions), frame, tol)?;
+            let r = agent::resolve_for(ctx, &c, Some(&fit), Some(h.top - h.bottom))?;
             let cut = Cut { heights: h, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
             let params = PocketParams {
                 stepover: or_tool(o.stepover, r.tool.stepover, r.tool.diameter * 0.4),
@@ -1004,7 +1007,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let mut notes = surfaces.notes.clone();
     notes.extend(loaded.notes.iter().cloned());
     let geometry = agent::Geometry::of(s, &job, origin, &mut notes)?;
-    let agent = agent::Agent::new(cmd, &job, geometry, &loaded)?;
+    let agent = agent::Agent::new(cmd, &job, geometry, &loaded, &machine, &post)?;
     if job.work_offset.is_some() && !post.base.writes_work_offset() {
         notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
     }
@@ -1052,15 +1055,16 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
             gouge.skipped.push(op.clone());
             p.report.warnings.push("not checked for gouges (`gouge_check: false`)".into());
         }
-        if !p.tool.envelopes().is_empty() {
-            let hits = holder_collisions(&surfaces.all, &p.tool, &p.poses, 0.0, step)
+        let (checked, least) = agent.holder_tool(i, &p.tool);
+        if !checked.envelopes().is_empty() {
+            let hits = holder_collisions(&surfaces.all, &checked, &p.poses, 0.0, step)
                 .map_err(|e| cam_err(cmd, &format!("operation `{op}`: holder check"), e))?;
             p.report.holder_collisions = hits.len();
             *holder_total.get_or_insert(0) += hits.len();
             if !hits.is_empty() {
                 failures
                     .push(format!("holder: operation `{op}`: the tool's shank or holder touches the part or a fixture along {} moves", hits.len()));
-                details.push(agent.holder_refusal(i, p, &hits, &text, &machine));
+                details.push(agent.holder_refusal(i, p, &checked, least, &hits, &text, &machine));
             }
         }
     }

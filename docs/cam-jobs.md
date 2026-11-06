@@ -214,23 +214,36 @@ A `contour`, `pocket`, `parallel`, `roughing` or `waterline` (also inside `index
 - `bottom`: for a `pocket` and an `inside` or `on` contour, the lowest floor of the part inside
   the profiles: the exact B-rep is classified down columns spread over the region (flat floors
   found exactly at their face's height, curved ones within a quarter of the tolerance, from
-  above), and the part's bottom where the region goes through the part. For an `outside`
-  contour and the 3D operations, the part's bottom. A region where the part is solid up to
-  the top is refused: there is nothing to cut.
+  above). Columns with no material at all (a bolt hole through a pocket's floor) are left out,
+  and `why` says where one is: that hole is not cut through. Where every column goes through,
+  the part's bottom. For an `outside` contour and the 3D operations, the part's bottom. A
+  region where the part is solid up to the top is refused: there is nothing to cut.
 - `retract`: `top` + `default_heights.retract_above` (2).
 - `clearance`: the higher of `top`, the part's top and the fixtures' top, plus
-  `default_heights.clearance_above` (10), and at least `retract`.
+  `default_heights.clearance_above` (10), and at least `retract`. On a machine whose rotaries
+  all turn the table, the part turns under the tool at the clearance (the built-in 4-axis posts
+  turn A there), so the clearance is also that far above the part's and fixtures' reach as
+  they turn: the highest program Z they reach at any angle, from their exact boxes turned
+  every 10° (a bound on the far side of the true reach). Not with a post that goes to the
+  machine's top before turning (`safe_rotate`) or rises to its own `clearance` above that reach.
 
 The reply's `derived_heights` lists each such operation's heights, which were worked out and
 from what. Given or worked out, a clearance at or below the part's or fixtures' top is refused
-when that top is exact.
+when that top is exact, and one inside the reach as the table turns is refused too.
+
+Where an operation's heights or tool were worked out and its tool gives no `holder`, the holder
+check takes the least holder the tool can have: 1 mm wider than its shank, from where the tool
+stands out (`stickout`, else its flutes) 50 mm up. A cut worked out deeper than the tool reaches
+is then refused (`holder`) with the stickout it needs, instead of going unchecked.
 
 ### Tools by what they are
 
 An operation's `tool` may be `{kind?, diameter?, max_diameter?, min_diameter?,
 min_flute_length?, min_stickout?}` instead of a number. The tools that meet every key match (with
 no `kind`, any tool but a drill); a `pocket` or an `inside` contour also needs the tool to fit its
-profiles. Of the matches, one of exactly `diameter` if given, else the largest diameter, then the
+profiles. Of the matches, for a `pocket` or `contour` those that reach its depth (`top` to
+`bottom`: the tool's `stickout`, else its flutes, or its flutes when its shank is wider than it)
+come first; then one of exactly `diameter` if given, else the largest diameter, then the
 shortest flutes, then the lowest number is picked. The reply's `tool_choices` gives every
 operation's tool and why (`given by number`, or the rule and the other matches).
 
@@ -250,6 +263,8 @@ returns it as the error's `structuredContent.cam_refusals`. A dry run's reply ha
 ### Compact replies
 
 `compact: true` replies `{compact: true, passed, dry_run, failures, operations, tools,
-total_minutes, program_lines, outputs}`: the failures with their fixes, one line per operation
-(index, name, kind, tool, moves, minutes, heights worked out, gouges, warnings), every
-operation's tool and why, and the program's time at feed as the controller times it.
+total_minutes, program_lines, outputs, notes?}`: the failures with their fixes, one line per
+operation (index, name, kind, tool, moves, minutes, heights worked out, gouges, warnings), every
+operation's tool and why, the program's time at feed as the controller times it, and the notes
+that are news (a feed held to the machine's limit, a library tool left out, a body named like a
+vise machined as part of the part); not the note on how the bodies were tessellated.

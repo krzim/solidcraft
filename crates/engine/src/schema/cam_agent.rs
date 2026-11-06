@@ -320,6 +320,11 @@ pub struct CamJobCompactReply {
     pub program_lines: usize,
     /// The files written.
     pub outputs: Outputs,
+    /// The notes that are news: tools held to the machine's limits or left out of a library,
+    /// a body named like a fixture machined as part of the part, and the like (not how the
+    /// bodies were tessellated, which every job says).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// In the warn parameter-check mode: what the call's parameters got wrong.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub param_warnings: Vec<String>,
