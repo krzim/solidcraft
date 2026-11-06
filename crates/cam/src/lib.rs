@@ -37,6 +37,7 @@ mod post;
 mod readback;
 pub mod readback5;
 pub mod rotary;
+pub mod sim;
 pub mod strategies5;
 mod surface;
 pub mod surface_ops;
@@ -93,6 +94,8 @@ mod gcode5_tests;
 mod kinematics_tests;
 #[cfg(test)]
 mod rotary_tests;
+#[cfg(test)]
+mod sim_tests;
 #[cfg(test)]
 mod strategies5_tests;
 #[cfg(test)]

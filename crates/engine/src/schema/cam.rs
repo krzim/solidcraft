@@ -43,6 +43,10 @@ pub struct CamJobParams {
     /// which). Default: false.
     #[serde(default)]
     pub allow_unsafe: Option<bool>,
+    /// Also simulate the written program removing material from the stock (`cam.simulate`):
+    /// a gouge or a rapid through material fails the job like the other checks. Default: false.
+    #[serde(default)]
+    pub simulate: Option<bool>,
 }
 
 /// A CAM job: what is machined, on which machine, through which post, with which tools.
@@ -566,6 +570,9 @@ pub struct CamJobReply {
     pub outputs: Outputs,
     /// How the bodies were tessellated, and anything else worth knowing.
     pub notes: Vec<String>,
+    /// The stock-removal simulation of the written program, with `simulate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub simulation: Option<super::cam_sim::CamSimulateReply>,
     /// In the warn parameter-check mode: what the call's parameters got wrong.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub param_warnings: Vec<String>,

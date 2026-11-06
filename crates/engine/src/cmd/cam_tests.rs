@@ -392,3 +392,120 @@ fn hostile_jobs_are_refused_without_panics() {
     assert!(s.execute("cam.check", &json!({"path": junk, "rapid_rate": -1})).is_err());
     assert!(s.execute("cam.posts", &json!({"name": "nope"})).is_err());
 }
+
+/// `cam.simulate` and `cam.job`'s `simulate`: the written program swept through the stock (the
+/// part's box here, the job giving none) and held against the part.
+#[test]
+fn the_simulation_passes_a_good_program_and_catches_a_gouge_and_a_rapid() {
+    let mut s = dome();
+    let dir = Dir::new("sim");
+    let out = dir.file("dome.tap");
+    let r = run(&mut s, "cam.job", json!({"job": dome_job(), "output": out, "simulate": true}));
+    assert_clean(&r);
+    let sim = &r["simulation"];
+    assert_eq!(sim["passed"], true, "{sim}");
+    assert_eq!(sim["gouge"]["cells"], 0, "{sim}");
+    assert!(sim["rapids_in_material"].as_array().is_some_and(Vec::is_empty), "{sim}");
+    assert_eq!(sim["stock"]["kind"], "box", "{sim}");
+    assert_eq!(sim["stock"]["derived"], true, "{sim}");
+    assert!((sim["stock"]["max"][2].as_f64().unwrap() - 7.0).abs() < 0.01, "the dome's top: {sim}");
+    assert!(sim["removed_volume"].as_f64().is_some_and(|v| v > 1000.0), "{sim}");
+    assert!(sim["minutes"].as_f64().is_some_and(|m| m > 0.0), "{sim}");
+    // The file on its own, with the stock left as an STL file.
+    let stl = dir.file("stock.stl");
+    let c = run(&mut s, "cam.simulate", json!({"path": out, "job": dome_job(), "stock_stl": stl}));
+    assert_eq!(c["passed"], true, "{c}");
+    assert_eq!(c["path"], out.as_str());
+    assert_eq!(c["removed_volume"], sim["removed_volume"]);
+    assert_eq!(c["stock_stl"], stl.as_str());
+    assert!(std::fs::metadata(&stl).is_ok_and(|m| m.len() > 84 + 50 * 1000));
+    // 1 mm into the block's top, then a rapid at Z5 through the stock above it (beside the dome).
+    let bad = dir.file("bad.tap");
+    std::fs::write(&bad, "G21\nT2 M6\nG0 X-18. Y-18. Z10.\nG1 Z-1. F300\nG1 X-10.\nG0 Z5.\nG0 Y10.\nG0 Z30.\n").unwrap();
+    let c = run(&mut s, "cam.simulate", json!({"path": bad, "job": dome_job(), "resolution": 0.1}));
+    assert_eq!(c["passed"], false, "{c}");
+    assert!((c["gouge"]["worst"].as_f64().unwrap() - 1.0).abs() < 0.01, "{c}");
+    let lines: Vec<u64> = c["rapids_in_material"].as_array().unwrap().iter().filter_map(|m| m["line"].as_u64()).collect();
+    assert_eq!(lines, vec![7], "{c}");
+    assert_eq!(c["failures"].as_array().map(Vec::len), Some(2), "{c}");
+}
+
+/// On a 4th axis the stock is the cylinder through the part's farthest point; a finish and an
+/// indexed pocket pass the simulation inside the job.
+#[test]
+fn the_simulation_runs_on_a_4th_axis() {
+    let mut s = bar();
+    let r = run(&mut s, "cam.job", json!({"job": barrel_job(), "dry_run": true, "simulate": true}));
+    assert_clean(&r);
+    let sim = &r["simulation"];
+    assert_eq!(sim["stock"]["kind"], "cylinder", "{sim}");
+    assert!((sim["stock"]["radius"].as_f64().unwrap() - 10.0).abs() < 1e-6, "{sim}");
+    assert_eq!(sim["gouge"]["cells"], 0, "{sim}");
+    assert!(sim["leftover"]["max"].as_f64().is_some_and(|m| m < 0.01), "the stock is the bar itself: {sim}");
+    // The block is cut from round bar through its corners (radius 15√2 ≈ 21.2): the pocket's
+    // retract at 20 is inside that bar, so its rapids there cut material.
+    let mut s = pocketed_block();
+    let r = run(&mut s, "cam.job", json!({"job": side_pocket_job(), "dry_run": true, "simulate": true}));
+    let sim = &r["simulation"];
+    assert!((sim["stock"]["radius"].as_f64().unwrap() - 15.0 * 2f64.sqrt()).abs() < 1e-6, "{sim}");
+    assert_eq!(r["passed"], false, "{r}");
+    assert!(sim["rapids_in_material"].as_array().is_some_and(|r| !r.is_empty()), "{sim}");
+    assert_eq!(sim["gouge"]["cells"], 0, "{sim}");
+    // Retracting outside the bar it passes.
+    let mut job = side_pocket_job();
+    job["operations"][0]["operation"]["heights"]["retract"] = json!(22);
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true, "simulate": true}));
+    assert_clean(&r);
+    let sim = &r["simulation"];
+    assert!(sim["removed_volume"].as_f64().is_some_and(|v| v > 12.0 * 12.0 * 5.0 * 0.9), "the pocket: {sim}");
+    assert!(sim["rapids_in_material"].as_array().is_some_and(Vec::is_empty), "{sim}");
+    // The same pocket into the solid face: the job's own check and the simulation both fail it.
+    let mut solid = Session::default();
+    run(&mut solid, "solid.box", json!({"length": 40, "width": 30, "height": 30, "corner": [-20, -15, -15]}));
+    let r = run(&mut solid, "cam.job", json!({"job": side_pocket_job(), "dry_run": true, "simulate": true}));
+    assert_eq!(r["simulation"]["passed"], false, "{r}");
+    assert!(r["simulation"]["gouge"]["worst"].as_f64().is_some_and(|w| w > 4.0), "{r}");
+    assert!(r["failures"].as_array().unwrap().iter().any(|f| f.as_str().is_some_and(|f| f.starts_with("simulation:"))), "{r}");
+}
+
+#[test]
+fn hostile_simulations_are_refused_without_panics() {
+    let mut s = dome();
+    let dir = Dir::new("sim-hostile");
+    let gcode = dir.file("p.tap");
+    std::fs::write(&gcode, "G21\nT2 M6\nG0 X0. Y0. Z10.\nG1 Z8. F300\n").unwrap();
+    let junk = dir.file("junk.tap");
+    std::fs::write(&junk, "G21\nT2 M6\nG0 X0 Y0 Z10\n\u{0}garbage QQQ\n").unwrap();
+    let five = json!({"name": "5ax", "rotaries": [
+        {"letter": "A", "direction": [1, 0, 0], "center": [0, 0, 0], "carrier": "table"},
+        {"letter": "C", "direction": [0, 0, 1], "center": [0, 0, 0], "carrier": "table"}]});
+    let mut five_job = dome_job();
+    five_job["machine"] = five;
+    let cases = [
+        json!({"path": gcode}),
+        json!({"job": dome_job()}),
+        json!({"path": gcode, "job": dome_job(), "job_path": dir.file("j.json")}),
+        json!({"path": gcode, "job": dome_job(), "resolution": 0}),
+        json!({"path": gcode, "job": dome_job(), "resolution": -1}),
+        json!({"path": gcode, "job": dome_job(), "resolution": 1e-5}),
+        json!({"path": gcode, "job": dome_job(), "resolution": 0.001}),
+        json!({"path": gcode, "job": dome_job(), "resolution": "fine"}),
+        json!({"path": gcode, "job": dome_job(), "stock_stl": ""}),
+        json!({"path": gcode, "job": dome_job(), "stock_stl": gcode}),
+        json!({"path": dir.file("missing.tap"), "job": dome_job()}),
+        json!({"path": junk, "job": dome_job()}),
+        json!({"path": gcode, "job": five_job}),
+        json!({"path": gcode, "job": dome_job(), "resolutoin": 0.1}),
+    ];
+    for p in &cases {
+        match s.execute("cam.simulate", p) {
+            Err(EngineError::Internal(_, msg)) => panic!("{p}: panicked: {msg}"),
+            Err(_) => {}
+            Ok(v) => panic!("{p}: accepted: {v}"),
+        }
+    }
+    // A tool the program loads that the job lacks.
+    std::fs::write(&gcode, "G21\nT9 M6\nG0 X0. Y0. Z10.\n").unwrap();
+    let e = s.execute("cam.simulate", &json!({"path": gcode, "job": dome_job()})).unwrap_err();
+    assert!(e.to_string().contains("tool 9"), "{e}");
+}
