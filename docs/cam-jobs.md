@@ -25,6 +25,7 @@ Units are millimetres and mm/min. Angles in a job are degrees (`a_deg`, `angle_d
 | `job_path` | A `.json` file holding the job. Relative `post_path` and `tool_library_path` in it are read from the file's folder. |
 | `output` | The G-code file. Required unless `dry_run`. |
 | `preview` | An HTML page of the part and every toolpath: self-contained (no network), one view per operation and one for the whole job, orbit and zoom, a slider that plays the moves, rapids dashed. |
+| `setup_sheet` | The setup sheet for the machine operator: a `.html` page (self-contained, print styles) or a `.md` file. See [Setup sheet](#setup-sheet). |
 | `dry_run` | Plan and check, write nothing; the reply says whether the checks pass instead of refusing. |
 | `allow_unsafe` | Write the program even when a check fails. |
 | `simulate` | Also run the program as written through the stock-removal simulation (below): a gouge or a rapid through material fails the job like the other checks, and the reply carries `simulation`. |
@@ -59,9 +60,10 @@ message. With `dry_run`, the reply carries `passed: false` and `failures`.
 `program_head` (the first lines), `readback`, `gouge`, `holder_collisions` (`null` when no tool
 has holder data), `rapids` (`checked`, `hits`, `worst`, `pass`, `from_unknown`, `first`),
 `travel` (`checked`, `violation`, `pass`; `null` without `linear_limits`), `stock` (as checked
-against; `null` without one), `passed`, `failures`, `dry_run`, `outputs` (`gcode`, `preview`) and `notes`
-(how the bodies were tessellated, a post that writes no work offset, an output extension other
-than the post's).
+against; `null` without one), `passed`, `failures`, `dry_run`, `outputs` (`gcode`, `preview`,
+`setup_sheet`), `notes` (how the bodies were tessellated, a post that writes no work offset, an
+output extension other than the post's) and `summary`, the setup sheet's tables in compact form
+(see [Setup sheet](#setup-sheet)), on a dry run too.
 
 ## The job
 
@@ -758,3 +760,58 @@ depend on how many. A 50 × 50 mm dome finished with a 6 mm ball in parallel pas
 (about 21,000 blocks) simulates on a million cells (0.05 mm) in about 7 seconds on one thread and
 under a second on eight; a 4th-axis finish on a 16 mm long, 20 mm diameter barrel, 1° apart, on
 414,000 cells in about 3 seconds on one thread and under a second on eight.
+## Setup sheet
+
+`cam.job {…, "setup_sheet": "C:/parts/bracket-setup.html"}` writes what the machine operator
+needs to set the job up beside its program: a self-contained HTML page (no scripts, nothing
+loaded from the network, print styles so it prints on one or two pages) for a `.html` or `.htm`
+path, Markdown for `.md` or `.markdown`. Any other extension is refused before anything is
+computed. Like the G-code and the preview it is written through the session's file access, so
+an MCP server's `--allow-path` folders apply, and it must be a file of its own. The sheet carries
+no date and nothing of the computer it is made on: the same job writes the same bytes.
+
+It holds, in order:
+
+- **The job:** its name, the machine, the post, the G-code file's name and the work offset it
+  runs in (`G54` to `G59`, or a note that the post writes none).
+- **Work zero:** the design point that is X0 Y0 Z0 and the part's extent from it, with each axis
+  in words (on the part's left side, in the middle, on its top, so many mm below its bottom). On
+  a 4th axis set up the usual way (`4axis_a`) Y0 Z0 is the A axis centreline, and the sheet says
+  how far the part reaches from it.
+- **Each rotary axis:** what it turns and about which line, which way positive turns it
+  (counter-clockwise seen from the +X end for `4axis_a`; clockwise with `a_reversed`), which side
+  of the part A+90° brings up under the tool and which way the top of the part moves as A
+  rises, and its travel limits when the machine has them.
+- **Stock**, when the job describes it.
+- **Tools:** only those the operations use, by number: kind, diameter (and corner radius),
+  flutes, flute length, shank, stickout, holder, the lowest Z the program sends the tip to
+  (Z min, in program coordinates: on a 4th axis that is the distance from the A axis), the
+  operations that use it, and its description. HTML sheets have a box to tick per tool.
+- **Operations** in program order: name, kind, tool, spindle speed, cut and plunge feed,
+  coolant, the A angle (`A90°`) or range (`A -180° to 180°`) as written, Z min, cut length and
+  minutes at feed. Z min and the A angles are read from the written program itself, each
+  operation's blocks being those after the comment the post writes at its start: an indexed
+  operation shows the angle it asked for (`A-90°`, as written, not the equal `A270°`), and a
+  cut on a table with limits shows the range the program turns through, rewinds included. With
+  a post that writes no comments they are worked out from the toolpaths instead (indexed angles
+  still as asked; a rewind's turn back is then not in the range).
+- **Totals:** operations, tools, tool changes, length and time at feed as planned and as the
+  controller times the written program, the program's line count, and the X, Y, Z and A range
+  the program moves over.
+- **Checks:** the read-back, the gouge check (with the operations not checked) and, when a tool
+  has holder data, the shank and holder check, each with its result.
+- **Warnings:** failed checks (a sheet is only written with them under `allow_unsafe`),
+  operations not checked for gouges, tools without holder data, a rotary that turns past a full
+  turn either way.
+- **Notes:** how the bodies were tessellated and the like.
+
+Every name and description from the job is escaped for the format, so a name such as
+`<b>|*x*` shows as written and never breaks the page or a table.
+
+The reply's `summary` carries the same tables in compact form, on a dry run too, so an agent can
+tell the user what to set up without opening the sheet: `work_zero` (the sentences),
+`part_extent` (`[[x, y, z] lowest, [x, y, z] highest]` from work zero), `work_offset`, `rotary`
+(the sentences), `tools` (`number`, `kind`, `diameter`, `flute_length`, `stickout?`, `holder?`,
+`z_min?`, `operations`), `operations` (`name`, `kind`, `tool`, `spindle_rpm`, `feed`,
+`plunge_feed`, `rotary?`, `cut_length`, `cut_minutes`), `totals` (`operations`, `tools`,
+`tool_changes`, `cut_length`, `cut_minutes`, `program_minutes?`), `checks` and `warnings`.
