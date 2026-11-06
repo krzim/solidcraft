@@ -17,8 +17,10 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 use solidcore_record::{Vec2, Vec3};
+use solidcraft_cam::collision::Hit;
+use solidcraft_cam::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, emit_program, parse5};
 use solidcraft_cam::kinematics::{Carrier, Joints, Machine, inverse};
-use solidcraft_cam::{Move5, Pose, Surface};
+use solidcraft_cam::{CommentStyle, Move5, Pose, Surface};
 use solidcraft_geom::Aabb3;
 use solidcraft_geom::prelude::*;
 use solidcraft_render::{Camera, StandardView};
@@ -26,8 +28,8 @@ use solidcraft_render::{Camera, StandardView};
 use super::{Planned, num, parse, run_job};
 use crate::cmd::CommandSpec;
 use crate::params::bad;
-use crate::schema::cam::{CamJobParams, RotaryRange};
-use crate::schema::cam_image::{CamViewParams, CamViewReply, ImagesReport, LegendEntry, ToolpathExtents, ViewCamera, ViewOperation};
+use crate::schema::cam::{CamJobParams, OperationReport, RotaryRange};
+use crate::schema::cam_image::{CamViewParams, CamViewReply, ImagesReport, LegendEntry, ProblemAt, ToolpathExtents, ViewCamera, ViewOperation};
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
 
@@ -42,7 +44,8 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[CommandSpec::new("cam.view", "CAM
          view?: iso | top | bottom | front | back | left | right (default iso, or front with a rotary axis: from -Y, the A axis \
          level); width?, height?: 16-4096 px (960 × 600) → path, image: {view, width, height, renderer, camera (as view.apply \
          takes it), legend: [{operation, colour, rgb}], key}, operations: [{name, kind, drawn, extents: {all, cut?, rotary, \
-         summary}}], passed, failures, notes. Plans and checks the job as cam.job {dry_run: true} and writes no G-code; the MCP \
+         problems?: [{check, move_index, at, distance}] (where a check failed; red crosses in the picture), summary}}], passed, \
+         failures, notes. Plans and checks the job as cam.job {dry_run: true} and writes no G-code; the MCP \
          screenshot tool shows the picture (cam_job / cam_job_path)",
     )];
 
@@ -59,6 +62,8 @@ const PIECE_PX: f64 = 6.0;
 const MAX_PIECES: usize = 64;
 /// Entries marked per operation.
 const MAX_ENTRIES: usize = 2_000;
+/// Places a check failed at, kept per operation and check.
+const MAX_PROBLEMS: usize = 20;
 /// Operations the legend names one by one.
 const LEGEND_ROWS: usize = 12;
 /// Longest name the legend writes (characters).
@@ -82,6 +87,7 @@ const ROTARY_COLOUR: [u8; 3] = [35, 35, 45];
 const TOOL_COLOUR: [u8; 3] = [60, 60, 70];
 const TEXT_COLOUR: [u8; 3] = [25, 25, 30];
 const KEY_COLOUR: [u8; 3] = [90, 90, 100];
+const PROBLEM_COLOUR: [u8; 3] = [255, 0, 0];
 
 /// An operation's colour (by its index in the job).
 pub(super) fn colour_of(index: usize) -> [u8; 3] {
@@ -154,13 +160,73 @@ fn corners(b: &Aabb3) -> [[f64; 3]; 2] {
     [[b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z]]
 }
 
+/// Keeps where a check (`gouge` or `holder`) found `hits` along an operation, for its extents
+/// and its pictures.
+pub(super) fn note_problems(report: &mut OperationReport, check: &str, hits: &[Hit]) {
+    for h in hits.iter().take(MAX_PROBLEMS) {
+        let t = h.pose.tip;
+        report.extents.problems.push(ProblemAt { check: check.into(), move_index: h.index, at: [t.x, t.y, t.z], distance: h.distance });
+    }
+}
+
+/// Marks each operation's first line in a copy of the program, so its blocks can be told apart
+/// once read back.
+fn marker(k: usize) -> String {
+    format!("SCOPMARK{k}")
+}
+
+/// Each operation's rotary range as the program writes it, radians: the program written again
+/// with a comment naming each operation (comments move nothing), read back, and every block
+/// counted to the operation whose comment comes before it. The post unwinds the angles within
+/// the machine's limits (rewinds) and writes an indexed operation at its own angle, so this is
+/// what the machine turns, not what chaining the poses gives. `None` when it cannot be read.
+fn written_rotary(machine: &Machine, post: &Post5, program: &MachineProgram) -> Option<Vec<Vec<(f64, f64)>>> {
+    let mut marked = program.clone();
+    marked.name = "PROGRAM".into();
+    for (k, op) in marked.operations.iter_mut().enumerate() {
+        match op {
+            MachineOperation::Continuous(o) => o.name = marker(k),
+            MachineOperation::Indexed(o) => o.name = marker(k),
+        }
+    }
+    let mut post = post.clone();
+    post.base.comments = CommentStyle::Parentheses;
+    post.base.operation_name_only = true;
+    let text = emit_program(&marked, &post, machine).ok()?;
+    let words = parse5(&text, &machine.letters()).ok()?;
+    // The line (from 1) each operation starts on.
+    let mut starts: Vec<usize> = Vec::with_capacity(marked.operations.len());
+    let mut lines = text.lines().enumerate();
+    for k in 0..marked.operations.len() {
+        let tag = format!("({})", marker(k));
+        let (n, _) = lines.by_ref().find(|(_, l)| l.contains(&tag))?;
+        starts.push(n + 1);
+    }
+    let mut ranges = vec![vec![(f64::INFINITY, f64::NEG_INFINITY); machine.rotaries.len()]; starts.len()];
+    for w in &words {
+        let (line, rotary) = match w {
+            JointWords::Rapid { line, rotary, .. } | JointWords::Feed { line, rotary, .. } | JointWords::Arc { line, rotary, .. } => (*line, rotary),
+            JointWords::Dwell { .. } => continue,
+        };
+        let Some(op) = starts.iter().rposition(|&s| s < line) else { continue };
+        if let Some(r) = ranges.get_mut(op) {
+            for (span, a) in r.iter_mut().zip(rotary) {
+                *span = (span.0.min(*a), span.1.max(*a));
+            }
+        }
+    }
+    Some(ranges)
+}
+
 /// Sets every operation's toolpath extents: the tip's box over every move and over the cutting
-/// moves, in work coordinates, and each rotary's range as the machine turns it, the positions
-/// chained from one operation to the next as the program runs them.
-pub(super) fn extents(machine: &Machine, planned: &mut [Planned]) {
+/// moves, in work coordinates, and each rotary's range as the written program turns it (as
+/// [`written_rotary`] reads it, else the poses' angles chained from one operation to the next).
+/// The places the checks failed at ([`note_problems`]) are kept.
+pub(super) fn extents(machine: &Machine, post: &Post5, program: &MachineProgram, planned: &mut [Planned]) {
     let letters: Vec<char> = machine.rotaries.iter().map(|r| r.letter.char()).collect();
+    let written = if letters.is_empty() { None } else { written_rotary(machine, post, program) };
     let mut joints: Option<Joints> = None;
-    for p in planned.iter_mut() {
+    for (k, p) in planned.iter_mut().enumerate() {
         let (mut all, mut cut) = (Aabb3::EMPTY, Aabb3::EMPTY);
         let mut ranges = vec![(f64::INFINITY, f64::NEG_INFINITY); letters.len()];
         let mut last: Option<Vec3> = None;
@@ -174,7 +240,8 @@ pub(super) fn extents(machine: &Machine, planned: &mut [Planned]) {
                 }
             }
             last = Some(to.tip);
-            if !letters.is_empty()
+            if written.is_none()
+                && !letters.is_empty()
                 && let Ok(j) = inverse(machine, &to, joints.as_ref())
             {
                 for (r, a) in ranges.iter_mut().zip(&j.rotary) {
@@ -183,6 +250,9 @@ pub(super) fn extents(machine: &Machine, planned: &mut [Planned]) {
                 }
                 joints = Some(j);
             }
+        }
+        if let Some(w) = written.as_ref().and_then(|w| w.get(k)) {
+            ranges.clone_from(w);
         }
         let rotary: Vec<RotaryRange> = letters
             .iter()
@@ -205,10 +275,32 @@ pub(super) fn extents(machine: &Machine, planned: &mut [Planned]) {
         for r in &rotary {
             let _ = std::fmt::Write::write_fmt(&mut summary, format_args!("; {} {}°", r.letter, span(r.min_deg, r.max_deg)));
         }
+        let problems = std::mem::take(&mut p.report.extents.problems);
+        for check in ["gouge", "holder"] {
+            let mut of = problems.iter().filter(|q| q.check == check);
+            if let Some(q) = of.next() {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut summary,
+                    format_args!(
+                        "; {check} at X {} Y {} Z {} (move {}, {} mm)",
+                        num(q.at[0]),
+                        num(q.at[1]),
+                        num(q.at[2]),
+                        q.move_index,
+                        num(q.distance)
+                    ),
+                );
+                let more = of.count();
+                if more > 0 {
+                    let _ = std::fmt::Write::write_fmt(&mut summary, format_args!(" and {more} more (extents.problems)"));
+                }
+            }
+        }
         p.report.extents = ToolpathExtents {
             all: if all.is_empty() { [[0.0; 3]; 2] } else { corners(&all) },
             cut: (!cut.is_empty()).then(|| corners(&cut)),
             rotary,
+            problems,
             summary,
         };
     }
@@ -288,6 +380,9 @@ pub(super) fn write(cmd: &str, s: &Session, req: &Request, set: &Setting<'_>, pl
         key: key(set.machine),
         ..ImagesReport::default()
     };
+    if planned.iter().any(|p| !p.report.extents.problems.is_empty()) {
+        report.key.push("red crosses in black rings: where a check failed, a gouge or the holder touching (extents.problems)".into());
+    }
     let every: Vec<usize> = (0..planned.len()).collect();
     if let Some(path) = &req.image {
         let ops = only.map_or_else(|| every.clone(), |i| vec![i]);
@@ -426,6 +521,11 @@ fn picture(
         && let Some(p) = planned.get(i)
     {
         o.tool(p, colour_of(i));
+    }
+    for &i in ops {
+        if let Some(p) = planned.get(i) {
+            o.problems(p);
+        }
     }
     o.rotary_axes(set.machine);
     o.work_zero();
@@ -810,6 +910,19 @@ impl<'a> Overlay<'a> {
                     }
                 }
                 Move5::Dwell { .. } => {}
+            }
+        }
+    }
+
+    /// Where the checks failed along the operation: red crosses in black rings, over everything
+    /// else so a hidden one shows too.
+    fn problems(&mut self, p: &Planned) {
+        for q in &p.report.extents.problems {
+            let Some(s) = self.screen(Vec3::new(q.at[0], q.at[1], q.at[2])) else { continue };
+            self.ink.disc(s, 8.0, [0.0, 0.0, 0.0], 1.0);
+            self.ink.disc(s, 6.5, [1.0, 1.0, 1.0], 1.0);
+            for (dx, dy) in [(1.0, 1.0), (1.0, -1.0)] {
+                self.ink.segment((s.0 - 4.5 * dx, s.1 - 4.5 * dy), (s.0 + 4.5 * dx, s.1 + 4.5 * dy), plain(PROBLEM_COLOUR), 2.4, 1.0);
             }
         }
     }

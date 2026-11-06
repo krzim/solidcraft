@@ -545,3 +545,85 @@ fn a_4axis_view_looks_along_the_a_axis_and_gives_its_range() {
         }
     }
 }
+
+/// The rotary extents are the angles the written program turns through: a long helix on an A
+/// that stops at ±360° is unwound by rewinds, so its range stays within the limits and matches
+/// what `cam.check` reads from the file, operation by operation (chaining the poses' angles
+/// would report thousands of degrees the machine never turns).
+#[test]
+fn rotary_extents_are_what_the_written_program_turns() {
+    let mut s = bar();
+    let dir = Dir::new("unwound");
+    let mut post = run(&mut s, "cam.posts", json!({"name": "mach3"}))["post"].clone();
+    post["rewind"] = json!({"distance": 25.0, "retract_feed": 500.0, "plunge_feed": 250.0});
+    std::fs::write(dir.0.join("rewind.post.json"), post.to_string()).unwrap();
+    let helix = |name: &str| {
+        json!({"name": name, "type": "rotary_finish", "tool": 3, "pattern": {"type": "helix", "pitch": 2},
+               "clearance": 25, "retract": 15, "range": [-15, 15]})
+    };
+    let job = json!({
+        "machine": "4axis_a", "a_limits_deg": [-360, 360], "post_path": "rewind.post.json", "tools": [ball(3, 4.0)],
+        "operations": [helix("first helix"), helix("second helix")]
+    });
+    let job_path = dir.file("helix.cam.json");
+    std::fs::write(&job_path, job.to_string()).unwrap();
+    let out = dir.file("helix.tap");
+    let r = solidcraft_io::vfs::scoped(Some(solidcraft_io::vfs::PathScope::new([dir.0.clone()])), || {
+        run(&mut s, "cam.job", json!({"job_path": job_path, "output": out}))
+    });
+    assert_eq!(r["passed"], true, "{r}");
+    let c = run(&mut s, "cam.check", json!({"path": out}));
+    let file = &c["rotary_ranges"][0];
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for op in r["operations"].as_array().unwrap() {
+        let a = &op["extents"]["rotary"][0];
+        assert_eq!(a["letter"], "A", "{op}");
+        let (a0, a1) = (a["min_deg"].as_f64().unwrap(), a["max_deg"].as_f64().unwrap());
+        assert!(a0 >= -360.0 - 1e-6 && a1 <= 360.0 + 1e-6, "{}: A {a0}..{a1} beyond the limits the program keeps to: {op}", op["name"]);
+        assert!(a1 - a0 >= 330.0, "{op}");
+        (lo, hi) = (lo.min(a0), hi.max(a1));
+    }
+    let (f0, f1) = (file["min_deg"].as_f64().unwrap(), file["max_deg"].as_f64().unwrap());
+    assert!((lo - f0).abs() < 0.01 && (hi - f1).abs() < 0.01, "extents A {lo}..{hi}, the written program A {f0}..{f1}");
+}
+
+/// A dry run of a job that gouges says where: each failing operation's extents list the places
+/// (work coordinates, move, depth), its summary names the first, and the picture marks them
+/// with red crosses an agent can see.
+#[test]
+fn a_gouging_dry_run_shows_where_the_gouges_are() {
+    let mut s = dome();
+    let dir = Dir::new("gouge");
+    let path = dir.file("gouge.png");
+    // A contour round a 10 mm square down to Z 0 runs through the dome.
+    let job = json!({
+        "name": "through the dome", "machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 4.0)],
+        "operations": [{
+            "name": "ring", "type": "contour", "tool": 1, "polygon": [[-5, -5], [5, -5], [5, 5], [-5, 5]],
+            "heights": {"clearance": 30, "retract": 15, "top": 7, "bottom": 0}, "stepdown": 2
+        }]
+    });
+    let r = solidcraft_io::vfs::scoped(Some(solidcraft_io::vfs::PathScope::new([dir.0.clone()])), || {
+        run(&mut s, "cam.view", json!({"job": job, "path": path, "view": "top", "width": 320, "height": 240}))
+    });
+    assert_eq!(r["passed"], false, "{r}");
+    let x = &r["operations"][0]["extents"];
+    let problems = x["problems"].as_array().unwrap_or_else(|| panic!("no problems listed: {x}"));
+    assert!(!problems.is_empty() && problems.len() <= 20, "{x}");
+    let first = &problems[0];
+    assert_eq!(first["check"], "gouge", "{x}");
+    assert!(first["distance"].as_f64().is_some_and(|d| d > 0.0) && first["move_index"].is_u64(), "{x}");
+    let at: Vec<f64> = first["at"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    // The tool's centre runs 2 mm outside the square, inside the dome (radius 12, its top at 7).
+    let out = at[0].abs().max(at[1].abs());
+    assert!(out > 6.0 && out < 8.0 && (0.0..7.0).contains(&at[2]), "{at:?}");
+    assert!(x["summary"].as_str().is_some_and(|t| t.contains("; gouge at X ")), "{x}");
+    assert!(r["image"]["key"].as_array().unwrap().iter().any(|k| k.as_str().is_some_and(|k| k.contains("red crosses"))), "{r}");
+    let (w, h, px) = png_pixels(&path);
+    let (cx, cy) = projected(&r["image"], [at[0], at[1], at[2]], w, h);
+    let red = (0..px.len())
+        .filter(|&i| near(px[i], [255, 0, 0], 25))
+        .filter(|&i| (f64::from(i as u32 % w) - cx).abs() <= 8.0 && (f64::from(i as u32 / w) - cy).abs() <= 8.0)
+        .count();
+    assert!(red >= 6, "{red} red pixels at the first gouge ({cx}, {cy})");
+}

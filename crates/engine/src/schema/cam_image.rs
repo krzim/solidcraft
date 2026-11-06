@@ -79,11 +79,33 @@ pub struct ToolpathExtents {
     /// Lowest and highest tool tip X, Y, Z of the cutting moves (absent with none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cut: Option<[[f64; 3]; 2]>,
-    /// Each rotary axis's lowest and highest angle as the machine turns it along the path,
-    /// degrees (none on a 3-axis machine).
+    /// Each rotary axis's lowest and highest angle as the written program turns it in this
+    /// operation, degrees, rewinds included (`cam.check` reads the same from the file); none on
+    /// a 3-axis machine.
     pub rotary: Vec<RotaryRange>,
-    /// The same in one line, e.g. `cut X -14..14 Y -14..14 Z -1..7; rapids up to Z 30; A 0..0°`.
+    /// Where the checks found the tool cutting into the part or a fixture (`gouge`) or its
+    /// shank or holder touching one (`holder`), in work coordinates: the worst point of each of
+    /// the first moves with a hit. Absent when the checks find none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<ProblemAt>,
+    /// The same in one line, e.g. `cut X -14..14 Y -14..14 Z -1..15; all moves X -14..14 Y
+    /// -14..14 Z -1..30; A 0..360°; gouge at X 2 Y -3 Z -1.4 (move 57, 0.4 mm)`.
     pub summary: String,
+}
+
+/// A place along a toolpath where a check failed.
+#[derive(Debug, Default, Clone, Serialize, JsonSchema)]
+pub struct ProblemAt {
+    /// `gouge` (the cutter cuts into the part or a fixture) or `holder` (its shank or holder
+    /// touches one).
+    pub check: String,
+    /// The move along which it happens (index into the operation's toolpath, from 0).
+    pub move_index: usize,
+    /// The tool tip there, in work coordinates (mm).
+    pub at: [f64; 3],
+    /// A gouge: how far into the part the tool goes (mm). A holder: the gap left to the part,
+    /// 0 or less where they touch (mm).
+    pub distance: f64,
 }
 
 /// The pictures `cam.job` (`image`, `images_dir`) or `cam.view` drew.

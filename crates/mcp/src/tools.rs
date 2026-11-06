@@ -2309,24 +2309,32 @@ fn capture_cam(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<(Vec<u8>, 
         let dir = crate::scratch_dir().unwrap_or_else(vfs::temp_dir);
         dir.join(format!("cam-{n}.png")).to_string_lossy().to_string()
     });
-    let size = |k: &str, d: u64| a.get(k).and_then(Value::as_u64).unwrap_or(d).clamp(16, 4096);
-    let mut params = json!({"path": path, "width": size("width", 960), "height": size("height", 600)});
-    for (from, to) in [("cam_job", "job"), ("cam_job_path", "job_path"), ("cam_op", "op"), ("view", "view")] {
+    // Passed on as given: cam.view refuses a size or view it cannot draw and says why.
+    let mut params = Map::new();
+    params.insert("path".into(), json!(path));
+    for (from, to) in [("cam_job", "job"), ("cam_job_path", "job_path"), ("cam_op", "op"), ("view", "view"), ("width", "width"), ("height", "height")]
+    {
         if let Some(v) = a.get(from).filter(|v| !v.is_null()) {
-            params[to] = v.clone();
+            params.insert(to.into(), v.clone());
         }
     }
+    let params = Value::Object(params);
     let drawn = exec(b, "cam.view", params);
     let read = drawn.as_ref().ok().map(|_| vfs::read(&path, MAX_IMAGE_BYTES).map_err(|e| format!("{path}: {e} (is the app on another machine?)")));
     if keep.is_none() {
         let _ = vfs::remove(&path);
     }
-    let mut info = drawn?;
+    let drawn = drawn?;
     let png = read.unwrap_or_else(|| Err(format!("{path}: no picture")))?;
-    info["path"] = json!(keep);
-    info["source"] = json!("cam");
-    info["bytes"] = json!(png.len());
-    Ok((png, info))
+    // A connected app answers with an object; anything else is kept under `reply`.
+    let mut info = match drawn {
+        Value::Object(m) => m,
+        other => Map::from_iter([("reply".to_string(), other)]),
+    };
+    info.insert("path".into(), json!(keep));
+    info.insert("source".into(), json!("cam"));
+    info.insert("bytes".into(), json!(png.len()));
+    Ok((png, Value::Object(info)))
 }
 
 /// Standard base64 with padding (RFC 4648).

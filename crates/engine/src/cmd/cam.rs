@@ -1033,6 +1033,7 @@ fn run_job(s: &mut Session, cmd: &str, params: CamJobParams, only: Option<&str>)
         if p.gouge_check {
             let cutter = p.tool.cutter().map_err(|e| cam_err(cmd, &format!("operation `{op}`"), e))?;
             let hits = gouges(&surfaces.all, &cutter, &p.poses, tol, step).map_err(|e| cam_err(cmd, &format!("operation `{op}`: gouge check"), e))?;
+            pictures::note_problems(&mut p.report, "gouge", &hits);
             let worst = hits.iter().map(|h| h.distance).fold(0.0, f64::max);
             p.report.gouge = worst;
             gouge.worst = gouge.worst.max(worst);
@@ -1047,6 +1048,7 @@ fn run_job(s: &mut Session, cmd: &str, params: CamJobParams, only: Option<&str>)
         if !p.tool.envelopes().is_empty() {
             let hits = holder_collisions(&surfaces.all, &p.tool, &p.poses, 0.0, step)
                 .map_err(|e| cam_err(cmd, &format!("operation `{op}`: holder check"), e))?;
+            pictures::note_problems(&mut p.report, "holder", &hits);
             p.report.holder_collisions = hits.len();
             *holder_total.get_or_insert(0) += hits.len();
             if !hits.is_empty() {
@@ -1087,7 +1089,7 @@ fn run_job(s: &mut Session, cmd: &str, params: CamJobParams, only: Option<&str>)
         ));
     }
 
-    pictures::extents(&machine, &mut planned);
+    pictures::extents(&machine, &post, &program, &mut planned);
     let mut outputs = Outputs::default();
     if !dry_run {
         if let Some(path) = &output {

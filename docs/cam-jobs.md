@@ -178,15 +178,24 @@ read numbers. Three things let it check a toolpath before it writes G-code.
 coordinates (the design less `origin`): `all` (the tool tip's lowest and highest X, Y, Z over
 every move, rapids included), `cut` (over the feed moves only, each from where it starts, so a
 plunge from the retract height counts), `rotary` (each rotary axis's lowest and highest angle in
-degrees as the machine turns it, chained from one operation to the next as the program runs
-them) and `summary`, the same in one line:
+degrees as the written program turns it in that operation: read back from the program, so the
+rewinds of a post that unwinds a long wrap within the table's limits are in it, and it agrees
+with what `cam.check` reads from the file), `problems` (where a check failed, below) and
+`summary`, the same in one line:
 
 ```text
 cut X -14..14 Y -14..14 Z 0..15; all moves X -14..14 Y -14..14 Z 0..30; A 0..360°
 ```
 
-A cut below the part's floor, rapids lower than the clearance or an A range larger than the
-table allows shows here without a picture.
+A cut below the part's floor or rapids lower than the clearance show here without a picture.
+
+**Where a check failed.** When the gouge or holder check fails (`passed: false` in a dry run),
+the operation's `extents.problems` lists where, up to 20 per check: `check` (`gouge` or
+`holder`), `move_index` (the move along the operation's toolpath, from 0), `at` (the tool tip
+there, in work coordinates) and `distance` (a gouge's depth; a holder's gap to the part, 0 or
+less where they touch). The summary names the first, e.g. `; gouge at X 7 Y -2 Z 3 (move 12,
+0.8 mm)`, and the pictures mark each one with a red cross in a black ring, so an agent sees
+which wall or floor to move the toolpath away from.
 
 **Pictures from `cam.job`.**
 
@@ -214,6 +223,7 @@ no GPU is needed. Drawn over it, with the same camera:
 - work zero's X, Y and Z as red, green and blue arrows;
 - each rotary table's axis as a dark dash-dot line with a ring whose arrow turns as a positive
   angle turns the part (a reversed axis's the other way);
+- where a check failed (`extents.problems`), a red cross in a black ring, over everything else;
 - a legend in the top-left corner: the job's name and view, and each operation with its number,
   type and tool.
 
@@ -230,8 +240,9 @@ name is refused with the job's operation names). It returns `path`, `image` (as 
 
 The MCP `screenshot` tool takes `cam_job` (a job object) or `cam_job_path` (its file), and
 `cam_op`, with `view`, `width`, `height` and `path` as usual: it runs `cam.view` and returns the
-picture as an image with that reply as text. `camera`, `grid`, `axes` and `source` do not go with
-a CAM picture and are refused. A few calls take an agent from a modelled part to checked G-code:
+picture as an image with that reply as text. `width` and `height` go to `cam.view` as given, so a
+size it cannot draw is refused with the range rather than changed. `camera`, `grid`, `axes` and
+`source` do not go with a CAM picture and are refused. A few calls take an agent from a modelled part to checked G-code:
 
 1. `screenshot {cam_job_path: "part.cam.json"}`: look at the toolpaths and read the extents;
 2. change the job until the picture, the extents and `passed` are right;
