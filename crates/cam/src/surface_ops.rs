@@ -201,6 +201,7 @@ pub(crate) fn check_stepdown(stepdown: f64) -> Result<()> {
 /// The tool's cutting end, refused for a tool that cannot mill.
 pub(crate) fn tool_cutter(tool: &Tool) -> Result<Cutter> {
     tool.validate()?;
+    crate::ops::mills(tool)?;
     tool.cutter()
 }
 

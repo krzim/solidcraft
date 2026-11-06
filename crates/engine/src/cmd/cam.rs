@@ -42,6 +42,9 @@ use crate::schema::cam::{
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
 
+#[path = "cam_helical.rs"]
+mod helical;
+
 const JOB_CONTRACT: TypedContract<CamJobParams> = TypedContract::new();
 const POSTS_CONTRACT: TypedContract<CamPostsParams> = TypedContract::new();
 const CHECK_CONTRACT: TypedContract<CamCheckParams> = TypedContract::new();
@@ -57,7 +60,7 @@ pub static COMMANDS: &[CommandSpec] = &[
              (the design point that is work zero; on a 4th axis the A axis is work X through it), bodies?: [names] (default every visible \
              body), fixtures?: [names] (checked against, never cut), tolerance?: mm (default 0.01; bodies are tessellated at half of it), \
              tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | roughing | waterline | indexed \
-             {a_deg, operation} | rotary_finish | rotary_roughing | wrap, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
+             {a_deg, operation} | rotary_finish | rotary_roughing | wrap | bore | thread_mill, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
              and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
              operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, warnings}], \
@@ -221,6 +224,8 @@ fn tool_sample() -> Value {
         shank_diameter: Some(1.0),
         stickout: Some(1.0),
         holder: vec![HolderSection { diameter: 1.0, length: 1.0 }],
+        thread_pitch: Some(1.0),
+        tooth_height: Some(1.0),
         ..Tool::new(1, ToolKind::BullNose, 1.0, 1.0)
     };
     serde_json::to_value(tool).unwrap_or(Value::Null)
@@ -939,6 +944,8 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             let path = wrap_with_step(&flat, o.radius, tol, step).map_err(|e| ctx.bad(c.name, e))?;
             Ok(continuous(c, r, "wrap", path))
         }
+        OperationSpec::Bore(o) => helical::bore_op(ctx, o, arc_tol),
+        OperationSpec::ThreadMill(o) => helical::thread_mill_op(ctx, o, arc_tol),
     }
 }
 

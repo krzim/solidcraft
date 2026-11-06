@@ -26,6 +26,7 @@ mod dropcutter;
 mod frame;
 mod gcode;
 pub mod gcode5;
+pub mod helical;
 pub mod indexed;
 pub mod kinematics;
 mod multiaxis;
@@ -89,6 +90,8 @@ mod collision_tests;
 mod foundation_tests;
 #[cfg(test)]
 mod gcode5_tests;
+#[cfg(test)]
+mod helical_tests;
 #[cfg(test)]
 mod kinematics_tests;
 #[cfg(test)]

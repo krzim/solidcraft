@@ -18,6 +18,10 @@ pub enum ToolKind {
     /// A flat end mill with rounded corners (a torus at the end): see [`Tool::corner_radius`].
     BullNose,
     Drill,
+    /// A thread mill: teeth of a thread's form round a reduced core, single-point (one row of
+    /// teeth, any pitch) or multi-form (rows [`Tool::thread_pitch`] apart). It cuts by helical
+    /// interpolation round a hole or a boss (`crate::helical::thread_mill`).
+    ThreadMill,
 }
 
 impl ToolKind {
@@ -27,6 +31,7 @@ impl ToolKind {
             ToolKind::BallEndmill => "ball end mill",
             ToolKind::BullNose => "bull nose end mill",
             ToolKind::Drill => "drill",
+            ToolKind::ThreadMill => "thread mill",
         }
     }
 }
@@ -71,6 +76,17 @@ pub struct Tool {
     /// The holder from its face up, as stacked cylinders; empty: no holder is checked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holder: Vec<HolderSection>,
+    /// A multi-form thread mill's pitch (mm), the distance between its rows of teeth, which
+    /// span the flute length; left out, a single-point thread mill, which cuts any pitch.
+    /// Thread mills only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_pitch: Option<f64>,
+    /// How far a thread mill's teeth stand out of its core (mm), tips to roots, below the tool
+    /// radius. The gouge check takes a thread mill as a flat cylinder at its roots, since the
+    /// thread its teeth cut is not in the model; left out, the depth of the thread being cut
+    /// (`crate::helical::thread_mill`), or none for other operations. Thread mills only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tooth_height: Option<f64>,
 }
 
 /// One cylinder of a tool holder.
@@ -110,10 +126,14 @@ impl Tool {
             shank_diameter: None,
             stickout: None,
             holder: Vec::new(),
+            thread_pitch: None,
+            tooth_height: None,
         }
     }
 
-    /// The cutting end's shape.
+    /// The cutting end's shape. A thread mill is a flat cylinder at the roots of its teeth (its
+    /// radius less [`Tool::tooth_height`]): the form it cuts is a thread the model does not
+    /// show, so only its core must stay clear of the part.
     pub fn cutter(&self) -> Result<Cutter> {
         let r = self.radius();
         match self.kind {
@@ -121,6 +141,7 @@ impl Tool {
             ToolKind::BallEndmill => Cutter::ball(r),
             ToolKind::BullNose => Cutter::bull(r, self.corner_radius.unwrap_or(0.0)),
             ToolKind::Drill => invalid("a drill cannot mill: it cuts only at its point"),
+            ToolKind::ThreadMill => Cutter::flat(r - self.tooth_height.unwrap_or(0.0)),
         }
     }
 
@@ -158,6 +179,15 @@ impl Tool {
         }
         if self.kind == ToolKind::BullNose && !self.corner_radius.is_some_and(|c| c > 0.0 && c < self.radius()) {
             return invalid("a bull nose's corner radius must be above 0 and below the tool radius");
+        }
+        if self.thread_pitch.is_some_and(|p| !(p > 0.0) || !(p <= self.flute_length)) {
+            return invalid("a thread mill's pitch must be above 0 and at most its flute length");
+        }
+        if self.tooth_height.is_some_and(|h| !(h > 0.0) || !(h < self.radius())) {
+            return invalid("a thread mill's tooth height must be above 0 and below the tool radius");
+        }
+        if self.kind != ToolKind::ThreadMill && (self.thread_pitch.is_some() || self.tooth_height.is_some()) {
+            return invalid("`thread_pitch` and `tooth_height` are for thread mills");
         }
         if self.shank_diameter.is_some_and(|d| !(d > 0.0) || !(d <= MAX_TOOL_DIAMETER)) {
             return invalid("the shank diameter must be above 0 and at most 1000 mm");
