@@ -374,7 +374,10 @@ the final retract. At every sample, in work coordinates:
 
 - the cutter, as a cylinder of its radius without end above its tip (the shank and spindle are
   there too), must not be in the part or a fixture by more than the job's tolerance, and a
-  tool's shank and holder (with holder data) must not touch them;
+  tool's shank and holder (with holder data) must not touch them. In an operation with
+  `gouge_check: false` (it cuts what the model does not show, a deburr of a sharp-edged
+  model), a retract straight up the tool's axis is not held against the part: it leaves the
+  cut its own feed moves made;
 - with a stock, the cutter must not be in the stock. Nothing tracks what earlier operations
   removed, so the stock as given is the bound: a rapid below the stock's top over the stock
   fails, even where an earlier operation has cut it away, except after a `face` (with its
@@ -383,8 +386,10 @@ the final retract. At every sample, in work coordinates:
   axis out of the cut is exempt too: it only passes through room the tool already fills. Keep
   every retract and clearance height above the stock's top (on a 4th axis, outside its radius);
 - a block that turns the A axis (a table about X) must keep the cutter outside the radius the
-  stock sweeps (a box's farthest corner; without a stock, the part's largest radius and the
-  tolerance) all through the turn, wherever the stock or part is level with the tool along X.
+  stock sweeps (a box's farthest corner) all through the turn, wherever the stock is level with
+  the tool along X. Without a stock the part is cut into 128 slices along X, each held to the
+  largest radius of the part over it and the tolerance, so a turn over a slender end of the
+  part is held to that end's radius, as the 4th-axis setup check holds it.
   A post with `clearance_retract` rises to the operation's highest rapid before it turns; a
   low clearance height can still leave the tool inside the swept radius, and this check finds it.
 
