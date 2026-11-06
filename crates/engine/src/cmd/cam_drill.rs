@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use solidcore_record::Vec2;
-use solidcraft_cam::drill::{Cycle, DrillParams, drill};
+use solidcraft_cam::drill::{Cycle, DrillParams, check_approach, drill};
 use solidcraft_cam::{Frame, Surface, Toolpath};
 use solidcraft_geom::prelude::*;
 use solidcraft_sketch::CurveKind;
@@ -59,6 +59,16 @@ pub(super) fn plan(ctx: &Ctx<'_>, o: &DrillOp, frame: &Frame) -> Result<(Toolpat
         part_top: if stay_at_retract { highest(ctx.all, frame) } else { None },
     };
     let path = drill(&points, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
+    // The tool comes down to R at rapid over every hole: nothing of the part or the fixtures may
+    // be above R round one (a hole in a boss drilled with the plate's heights).
+    let turned;
+    let all = if *frame == Frame::IDENTITY {
+        ctx.all
+    } else {
+        turned = ctx.all.in_frame(frame).map_err(|e| ctx.bad(c.name, e))?;
+        &turned
+    };
+    check_approach(all, &r.tool, &points, params.heights.retract, ctx.tol).map_err(|e| ctx.bad(c.name, e))?;
     Ok((path, r))
 }
 

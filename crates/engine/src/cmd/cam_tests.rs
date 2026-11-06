@@ -660,3 +660,46 @@ fn hostile_drilling_jobs_are_refused_without_panics() {
     job["operations"][0]["type"] = json!("drill");
     assert!(s.execute("cam.job", &json!({"job": job, "dry_run": true})).is_err(), "a drill operation has no polygon");
 }
+
+#[test]
+fn drilling_refuses_an_r_height_below_the_part_round_a_hole() {
+    // A plate, its top at Z 0, with a 20 × 20 boss 10 high round (15, 0), and 6 mm holes 12 deep
+    // into the plate at (-15, 0) and through the boss into the plate at (15, 0).
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 20, "corner": [-30, -20, -20], "body_name": "Plate"}));
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 10, "corner": [5, -10, 0], "operation": "join"}));
+    for [x, y] in [[-15, 0], [15, 0]] {
+        run(&mut s, "solid.cylinder", json!({"diameter": 6, "height": 25, "base": [x, y, -12], "operation": "cut"}));
+    }
+    let job = |points: Value, top: f64, retract: f64| {
+        let op = json!({
+            "name": "holes", "type": "drill", "tool": 3, "points": points,
+            "heights": {"clearance": 25, "retract": retract, "top": top, "bottom": -10}
+        });
+        json!({"job": drill_job(op), "dry_run": true})
+    };
+    // Both holes with the plate's heights: the drill would rapid from clearance down to R 2
+    // through 8 mm of the boss. The gouge check cannot see it (the finished part has the hole).
+    let e = s.execute("cam.job", &job(json!([[-15, 0], [15, 0]]), 0.0, 2.0)).unwrap_err();
+    assert!(e.to_string().contains("(15, 0)") && e.to_string().contains("retract"), "{e}");
+    // The plate's hole alone, and the boss's from the boss's top, are clean.
+    assert_clean(&run(&mut s, "cam.job", job(json!([[-15, 0]]), 0.0, 2.0)));
+    assert_clean(&run(&mut s, "cam.job", job(json!([[15, 0]]), 10.0, 12.0)));
+    // Indexed: the part is checked in the operation's frame. At A 90 the block's +Y face (work Y
+    // 15) is under the tool; an R height of 12 is inside the block.
+    let mut b = Session::default();
+    run(&mut b, "solid.box", json!({"length": 40, "width": 30, "height": 30, "corner": [-20, -15, -15], "body_name": "Block"}));
+    run(&mut b, "solid.cylinder", json!({"diameter": 5, "height": 9, "base": [0, 7, 0], "axis": "Y", "operation": "cut"}));
+    let side = |retract: f64| {
+        json!({"job": {
+            "machine": "4axis_a", "post": "mach3_4axis", "tools": [drill_tool(4, 5.0)],
+            "operations": [{"type": "indexed", "a_deg": 90, "operation": {
+                "name": "side", "type": "drill", "tool": 4, "points": [[0, 0]],
+                "heights": {"clearance": 40, "retract": retract, "top": 10, "bottom": 8}
+            }}]
+        }, "dry_run": true})
+    };
+    let e = b.execute("cam.job", &side(12.0)).unwrap_err();
+    assert!(e.to_string().contains("Z 15") && e.to_string().contains("retract"), "{e}");
+    assert_clean(&run(&mut b, "cam.job", side(18.0)));
+}

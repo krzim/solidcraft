@@ -8,8 +8,8 @@ use solidcore_record::{Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
 use crate::drill::{
-    Cycle, DEFAULT_POINT_ANGLE_DEG, DrillParams, MAX_HOLES, check_drilling_tool, drill, hole_bottoms, order_holes, peck_depths, tip_length,
-    tool_gouges,
+    Cycle, DEFAULT_POINT_ANGLE_DEG, DrillParams, MAX_HOLES, check_approach, check_drilling_tool, drill, hole_bottoms, order_holes, peck_depths,
+    tip_length, tool_gouges,
 };
 use crate::{CamError, Frame, Heights, Move, Surface, Tool, ToolKind, Toolpath, Toolpath5, verify};
 
@@ -281,4 +281,64 @@ fn hostile_drilling_settings_are_refused_without_panics() {
     assert!(tool_gouges(&surface, &d, &plunge(0.0), 0.01, 0.0).is_err());
     // A tiny tolerance caps the steps instead of making millions of checks.
     assert!(tool_gouges(&surface, &d, &plunge(0.0), 1e-9, 0.5).is_ok());
+}
+
+/// Flat squares at heights: each `[x0, y0, x1, y1, z]`.
+fn flats(squares: &[[f64; 5]]) -> Surface {
+    let mut tris = Vec::new();
+    for &[x0, y0, x1, y1, z] in squares {
+        let (a, b, c, d) = (Vec3::new(x0, y0, z), Vec3::new(x1, y0, z), Vec3::new(x1, y1, z), Vec3::new(x0, y1, z));
+        tris.push([a, b, c]);
+        tris.push([a, c, d]);
+    }
+    Surface::new(tris).unwrap()
+}
+
+#[test]
+fn many_gouging_pecks_are_gouge_checked_in_linear_time() {
+    // 2400 holes chip-broken 10 mm into a part that shows no holes: every feed gouges, and each
+    // of the point's steps finds a hit on it to merge with the others'.
+    let pts: Vec<Vec2> = (0..2400).map(|i| v(f64::from(i % 40) * 8.0, f64::from(i / 40) * 8.0)).collect();
+    let p = params(Cycle::ChipBreak { peck: 0.5, back_off: 0.3 });
+    let path = drill(&pts, &drill_tool(6.0), &p).unwrap();
+    let feeds = path.moves.iter().filter(|m| matches!(m, Move::Feed { .. })).count();
+    assert_eq!(feeds, 2400 * 20);
+    let poses = Toolpath5::from_frame(&path, &Frame::IDENTITY, 0.01).unwrap();
+    let surface = flats(&[[-10.0, -10.0, 330.0, 490.0, 0.0]]);
+    let start = std::time::Instant::now();
+    let hits = tool_gouges(&surface, &drill_tool(6.0), &poses, 0.01, 1.5).unwrap();
+    let took = start.elapsed();
+    assert_eq!(hits.len(), feeds, "one hit per feed, every feed below the top");
+    assert!(hits.windows(2).all(|w| w[0].index < w[1].index), "in move order");
+    // The deepest at the narrowest step, just above the tip at the bottom.
+    let deepest = hits.iter().map(|h| h.distance).fold(0.0, f64::max);
+    close(deepest, 10.0 - tip_length(&drill_tool(6.0)) / 64.0, 0.02);
+    assert!(took.as_secs_f64() < 20.0, "the merge of the steps' hits is not quadratic: {took:?}");
+}
+
+#[test]
+fn the_tool_never_rapids_down_into_the_part_round_a_hole() {
+    let d = drill_tool(6.0);
+    // The part's top at Z 0 round the hole: the rapid down to R 2 is in the air.
+    assert!(check_approach(&flats(&[[-50.0, -50.0, 50.0, 50.0, 0.0]]), &d, &[v(0.0, 0.0)], 2.0, 0.01).is_ok());
+    // A boss up to Z 10 round a hole whose `top` was given as the plate's, 0: the drill would
+    // rapid from clearance down to R through 8 mm of it.
+    let boss = flats(&[[-50.0, -50.0, 50.0, 50.0, 0.0], [10.0, -10.0, 30.0, 10.0, 10.0]]);
+    assert!(check_approach(&boss, &d, &[v(0.0, 0.0)], 2.0, 0.01).is_ok(), "a hole away from the boss");
+    let e = check_approach(&boss, &d, &[v(0.0, 0.0), v(20.0, 0.0)], 2.0, 0.01).unwrap_err();
+    assert!(e.to_string().contains("(20, 0)") && e.to_string().contains("Z 10") && e.to_string().contains("retract"), "{e}");
+    assert!(check_approach(&boss, &d, &[v(20.0, 0.0)], 12.0, 0.01).is_ok(), "R above the boss");
+    assert!(check_approach(&boss, &d, &[v(20.0, 0.0)], 9.995, 0.01).is_ok(), "within the tolerance");
+    // A wall beside the hole is not over it; a rim within a tenth of the radius past the
+    // hole's edge is.
+    assert!(check_approach(&flats(&[[4.0, -50.0, 50.0, 50.0, 10.0]]), &d, &[v(0.0, 0.0)], 2.0, 0.01).is_ok());
+    assert!(check_approach(&flats(&[[3.2, -50.0, 50.0, 50.0, 10.0]]), &d, &[v(0.0, 0.0)], 2.0, 0.01).is_err());
+    // Hostile values are refused, not looped over or panicked on.
+    let plane = flats(&[[-50.0, -50.0, 50.0, 50.0, 0.0]]);
+    assert!(check_approach(&plane, &d, &[v(0.0, 0.0)], f64::NAN, 0.01).is_err());
+    assert!(check_approach(&plane, &d, &[v(0.0, 0.0)], 2.0, f64::NAN).is_err());
+    assert!(check_approach(&plane, &d, &[v(f64::NAN, 0.0)], 2.0, 0.01).is_err());
+    assert!(check_approach(&plane, &Tool { diameter: 0.0, ..d.clone() }, &[v(0.0, 0.0)], 2.0, 0.01).is_err());
+    assert!(check_approach(&plane, &Tool { diameter: 1000.0, ..d.clone() }, &[v(0.0, 0.0)], 2.0, 1.0).is_ok(), "the widest tool");
+    assert!(check_approach(&plane, &d, &vec![v(0.0, 0.0); MAX_HOLES + 1], 2.0, 0.01).is_err());
 }

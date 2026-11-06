@@ -212,3 +212,10 @@ fixtures in the operation's frame.
 from the point's length up, and the point as stepped cylinders inscribed in its cone (within the
 job's tolerance along the axis, at most 64 steps). Model the holes as cut bodies; drilled into a
 part that shows no hole, the operation gouges and the job is refused.
+
+The tool comes down from the clearance height to the R height at rapid over every hole, and the
+gouge check cannot see material there (the finished part already has the hole). So the operation
+is refused when the part or a fixture within the tool's radius and a tenth more of a hole's axis
+(the rim of a hole of the tool's size) is above the R height by more than the tolerance: a hole in
+a boss drilled with the heights of the plate under it, say. Drill holes whose tops are at
+different heights in separate operations, each with its own `top` and `retract`.

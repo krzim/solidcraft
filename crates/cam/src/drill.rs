@@ -21,6 +21,9 @@
 //! its full diameter. The gouge check ([`tool_gouges`]) holds the drill's real shape against
 //! the part: the cylinder above the point and the cone, inscribed by stepped cylinders.
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+
 use serde::{Deserialize, Serialize};
 use solidcore_record::{Vec2, Vec3};
 use solidcraft_geom::prelude::*;
@@ -28,11 +31,12 @@ use solidcraft_geom::prelude::*;
 use crate::check::verify;
 use crate::collision::{Hit, gouges};
 use crate::cutter::Cutter;
+use crate::dropcutter::drop_z;
 use crate::multiaxis::{Move5, Pose, Toolpath5};
 use crate::ops::Heights;
 use crate::path::{MAX_MOVES, Move, Toolpath};
 use crate::surface::Surface;
-use crate::tool::{Tool, ToolKind};
+use crate::tool::{MAX_TOOL_DIAMETER, Tool, ToolKind};
 use crate::{CamError, Result, invalid};
 
 /// Most holes one drilling operation drills.
@@ -340,21 +344,75 @@ pub fn tool_gouges(surface: &Surface, tool: &Tool, path: &Toolpath5, tol: f64, s
         return gouges(surface, &Cutter::flat(r)?, path, tol, sample_step);
     }
     let steps = ((length / tol.max(1e-6)).ceil().max(1.0) as usize).min(MAX_POINT_STEPS);
-    let mut hits: Vec<Hit> = Vec::new();
+    // The deepest hit of every step on each move, keyed by the move: one lookup per hit, not a
+    // search through every hit found so far (which made a part with many gouging pecks
+    // quadratic in them).
+    let mut hits: BTreeMap<usize, Hit> = BTreeMap::new();
     for k in 1..=steps {
         let t = k as f64 / steps as f64;
         let h = length * t;
         for mut hit in gouges(surface, &Cutter::flat(r * t)?, &raised(path, h), tol, sample_step)? {
             hit.pose = Pose::new(hit.pose.up(-h), hit.pose.axis);
-            match hits.iter_mut().find(|x| x.index == hit.index) {
-                Some(x) if hit.distance > x.distance => *x = hit,
-                Some(_) => {}
-                None => hits.push(hit),
+            match hits.entry(hit.index) {
+                Entry::Occupied(mut x) if hit.distance > x.get().distance => {
+                    x.insert(hit);
+                }
+                Entry::Occupied(_) => {}
+                Entry::Vacant(x) => {
+                    x.insert(hit);
+                }
             }
         }
     }
-    hits.sort_by_key(|h| h.index);
-    Ok(hits)
+    Ok(hits.into_values().collect())
+}
+
+/// How far past a hole's edge, as a share of the tool's radius, [`check_approach`] looks for
+/// the part: far enough to rest on the rim of a hole of the tool's own size.
+const RIM: f64 = 0.1;
+
+/// Refuses holes the tool cannot come down to at rapid: at each of `holes` it comes straight
+/// down from the clearance height to `retract` (the R height), so nothing of `surface` (the part
+/// and fixtures, in the operation's frame) may be above the R height, by more than `tol`, within
+/// the tool's radius and a tenth more of the hole's axis. The gouge check holds the tool against
+/// the finished part, where the hole is already there; this is the check that catches a hole in
+/// a boss drilled with the heights of the plate under it, where the drill would rapid into the
+/// boss.
+pub fn check_approach(surface: &Surface, tool: &Tool, holes: &[Vec2], retract: f64, tol: f64) -> Result<()> {
+    tool.validate()?;
+    if !(retract.is_finite() && retract.abs() <= MAX_COORD) {
+        return invalid("the retract height must be a finite number");
+    }
+    if !(0.0..=1.0).contains(&tol) {
+        return invalid("the tolerance must be from 0 to 1 mm");
+    }
+    if holes.len() > MAX_HOLES {
+        return Err(CamError::TooLarge(format!("more than {MAX_HOLES} holes in one drilling operation")));
+    }
+    if holes.iter().any(|p| !p.is_finite() || p.x.abs() > MAX_COORD || p.y.abs() > MAX_COORD) {
+        return invalid("the hole positions must be finite numbers within 1000 m");
+    }
+    let ring = Cutter::flat((tool.radius() * (1.0 + RIM) + tol).min(MAX_TOOL_DIAMETER * 0.5))?;
+    for p in holes {
+        if let Some(z) = drop_z(surface, &ring, p.x, p.y)
+            && z > retract + tol
+        {
+            return invalid(format!(
+                "the part round the hole at ({}, {}) reaches Z {}, above the retract (R) height {}: the tool would rapid down into it; give \
+                 `top` and `retract` at or above the part round every hole, or drill holes at different heights in separate operations",
+                mm(p.x),
+                mm(p.y),
+                mm(z),
+                mm(retract)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `v` to the micrometre, for messages (no `-0`).
+fn mm(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0 + 0.0
 }
 
 /// The tip positions of the holes in `path` (for reports): where each feed into a new hole ends
