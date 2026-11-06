@@ -67,7 +67,7 @@ pub(super) fn check_below_stock(planned: &[Planned], stock: &Stock, machine: &Ma
             .fold(f64::INFINITY, f64::min);
         if lowest.is_finite() && lowest < min.z - tol {
             failures.push(format!(
-                "below the stock: operation `{}` cuts down to Z{}, {} mm below the stock's bottom (Z{}), into what holds the stock                  (parallels, the vise's floor or the table): raise its bottom to Z{} or above, or give a stock that reaches as deep as                  the cut (set on a spoil board or on parallels clear of the cut)",
+                "below the stock: operation `{}` cuts down to Z{}, {} mm below the stock's bottom (Z{}), into what holds the stock (parallels, the vise's floor or the table): raise its bottom to Z{} or above, or give a stock that reaches as deep as the cut (set on a spoil board or on parallels clear of the cut)",
                 p.report.name,
                 num(lowest),
                 num(min.z - lowest),

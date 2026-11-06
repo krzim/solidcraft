@@ -2,18 +2,22 @@
 
 use serde_json::{Value, json};
 
-use super::{CamCheckParams, CamCheckReply, CamJobParams, CamJobReply, CamPostsParams, CamPostsReply};
 use crate::Session;
 use crate::schema::tests::{assert_keys, conforms};
 use crate::schema::{ParamCheck, input_schema_for, output_schema_for};
 
+use super::{CamCheckParams, CamCheckReply, CamJobParams, CamPostsParams, CamPostsReply};
+use crate::schema::cam_agent::CamJobOutput;
 fn run(s: &mut Session, id: &str, p: Value) -> Value {
     s.execute(id, &p).unwrap_or_else(|e| panic!("{id} {p}: {e}"))
 }
 
 #[test]
 fn schemas_and_the_key_check_agree() {
-    assert_keys(input_schema_for::<CamJobParams>(), &["allow_unsafe", "dry_run", "job", "job_path", "output", "preview", "setup_sheet", "simulate"]);
+    assert_keys(
+        input_schema_for::<CamJobParams>(),
+        &["allow_unsafe", "compact", "dry_run", "job", "job_path", "output", "preview", "setup_sheet", "simulate"],
+    );
     assert_keys(input_schema_for::<CamPostsParams>(), &["name"]);
     assert_keys(input_schema_for::<CamCheckParams>(), &["path", "rapid_rate"]);
 }
@@ -49,7 +53,19 @@ fn replies_match_the_output_schemas() {
     });
     let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
     assert_eq!(r["passed"], true, "{r}");
-    matches(output_schema_for::<CamJobReply>(), &r);
+    matches(output_schema_for::<CamJobOutput>(), &r);
+    // The compact reply, and one that leaves heights out and asks for a tool by what it is.
+    let mut short = job.clone();
+    if let Some(o) = short["operations"][0].as_object_mut() {
+        o.remove("heights");
+    }
+    short["operations"][0]["tool"] = json!({"kind": "flat_endmill", "max_diameter": 4});
+    let c = run(&mut s, "cam.job", json!({"job": short, "dry_run": true, "compact": true}));
+    assert_eq!(c["compact"], true, "{c}");
+    matches(output_schema_for::<CamJobOutput>(), &c);
+    let full = run(&mut s, "cam.job", json!({"job": short, "dry_run": true}));
+    assert!(full["derived_heights"].is_array() && full["tool_choices"].is_array(), "{full}");
+    matches(output_schema_for::<CamJobOutput>(), &full);
     matches(output_schema_for::<CamPostsReply>(), &run(&mut s, "cam.posts", json!({})));
     matches(output_schema_for::<CamPostsReply>(), &run(&mut s, "cam.posts", json!({"name": "grblhal"})));
     let dir = solidcraft_io::vfs::temp_dir().join(format!("solidcraft-cam-schema-{}", std::process::id()));

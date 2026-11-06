@@ -593,6 +593,14 @@ fn text_result(v: &Value, is_error: bool, opts: Options) -> Value {
             .or_else(|| v.get("failed").and_then(|failed| failed.get("panel_error")).cloned())
         {
             r["structuredContent"] = json!({"panel_error":reason});
+        } else if let Some(refusals) = v
+            .as_str()
+            .or_else(|| v.get("failed").and_then(|failed| failed.get("error")).and_then(Value::as_str))
+            .and_then(solidcraft_engine::schema::cam_agent::refusals_in)
+        {
+            // A refused `cam.job`, alone or as a batch step: every refusal's operation, check,
+            // place and fix.
+            r["structuredContent"] = refusals;
         }
     }
     r

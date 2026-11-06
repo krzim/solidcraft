@@ -760,7 +760,7 @@ fn finish_levels(tool: &Tool, top: f64, bottom: f64) -> Result<Vec<f64>> {
     }
     if tool.shank_diameter.is_some_and(|s| s > tool.diameter + 1e-9) {
         return invalid(format!(
-            "the finishing passes run down a {depth:.3} mm wall, deeper than tool {}'s {flutes:.3} mm flutes, and its shank is wider than              its cutter, so it would rub the finished wall above each step: use a tool whose flutes reach the depth, or no finishing passes",
+            "the finishing passes run down a {depth:.3} mm wall, deeper than tool {}'s {flutes:.3} mm flutes, and its shank is wider than its cutter, so it would rub the finished wall above each step: use a tool whose flutes reach the depth, or no finishing passes",
             tool.number
         ));
     }

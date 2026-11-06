@@ -55,8 +55,9 @@ pub struct AroundPartSpec {
 pub struct FaceOp {
     /// The operation's name, written as a comment in the program.
     pub name: String,
-    /// The `number` of the tool it cuts with: a face mill, a flat end mill or a bull nose.
-    pub tool: u32,
+    /// The `number` of the tool it cuts with (a face mill, a flat end mill or a bull nose), or
+    /// what the tool must be (`{kind?, diameter?, max_diameter?, …}`).
+    pub tool: super::cam_agent::ToolRef,
     /// Spindle speed, rev/min. Default: the tool's `spindle_rpm`.
     #[serde(default)]
     pub spindle_rpm: Option<f64>,
@@ -109,7 +110,7 @@ impl FaceOp {
     pub fn common(&self) -> Common<'_> {
         Common {
             name: &self.name,
-            tool: self.tool,
+            tool: &self.tool,
             spindle_rpm: self.spindle_rpm,
             feeds: self.feeds,
             coolant: self.coolant.unwrap_or(false),
