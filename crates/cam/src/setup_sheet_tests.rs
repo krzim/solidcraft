@@ -390,10 +390,11 @@ fn each_operation_reaches_what_the_written_program_says() {
     assert!((r0.rotary[0].0 - FRAC_PI_2).abs() < 1e-9 && (r0.rotary[0].1 - FRAC_PI_2).abs() < 1e-9, "{r0:?}");
     assert!((r1.rotary[0].0 + FRAC_PI_2).abs() < 1e-9 && (r1.rotary[0].1 + FRAC_PI_2).abs() < 1e-9, "{r1:?}");
     assert!((r0.z_min - 10.0).abs() < 1e-9 && (r1.z_min - 10.0).abs() < 1e-9, "{r:?}");
-    // The cut round the bar: 270° of A, at the bar's radius.
+    // The cut round the bar: 270° of A, at the bar's radius. Its poses are 10° apart and the
+    // post splits each move along its chord, so the written radius dips to 10 cos 5° between them.
     let (lo, hi) = r2.rotary[0];
     assert!(((hi - lo).to_degrees() - 270.0).abs() < 1e-3, "{r2:?}");
-    assert!((r2.z_min - 10.0).abs() < 1e-3, "{r2:?}");
+    assert!(r2.z_min <= 10.0 + 1e-9 && r2.z_min >= 10.0 * 5f64.to_radians().cos() - 1e-3, "{r2:?}");
     // Every range is within what the whole program turns through at feed.
     let angles: Vec<f64> = parse5(&text, &a.letters())
         .unwrap()
