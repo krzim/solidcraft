@@ -392,3 +392,314 @@ fn hostile_jobs_are_refused_without_panics() {
     assert!(s.execute("cam.check", &json!({"path": junk, "rapid_rate": -1})).is_err());
     assert!(s.execute("cam.posts", &json!({"name": "nope"})).is_err());
 }
+
+// Drilling.
+
+fn drill_tool(number: u32, diameter: f64) -> Value {
+    json!({
+        "number": number, "kind": "drill", "diameter": diameter, "flute_length": 30, "point_angle_deg": 118,
+        "spindle_rpm": 6000, "feed": 300, "plunge_feed": 250
+    })
+}
+
+/// The Z words of a program, in order.
+fn z_words(text: &str) -> Vec<f64> {
+    text.lines().flat_map(|l| l.split_whitespace().filter_map(|w| w.strip_prefix('Z')?.parse::<f64>().ok())).collect()
+}
+
+fn count_z(text: &str, z: f64) -> usize {
+    z_words(text).into_iter().filter(|w| (w - z).abs() < 1e-6).count()
+}
+
+/// A 60 × 40 × 20 plate, its top at Z 0, with four 6 mm holes `depth` deep at (-15, 0),
+/// (15, 0), (0, 10) and (0, -10), and a sketch `Holes` on its top: 6 mm circles at the first
+/// three, a 30 mm circle round the middle (no hole), and a point at the fourth.
+fn drilled_plate(depth: f64) -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 20, "corner": [-30, -20, -20], "body_name": "Plate"}));
+    for [x, y] in [[-15, 0], [15, 0], [0, 10], [0, -10]] {
+        run(&mut s, "solid.cylinder", json!({"diameter": 6, "height": depth + 1.0, "base": [x, y, -depth], "operation": "cut"}));
+    }
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Holes"}));
+    for [x, y] in [[-15, 0], [15, 0], [0, 10]] {
+        run(&mut s, "sketch.circle.center", json!({"center": [x, y], "diameter": 6}));
+    }
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "diameter": 30}));
+    run(&mut s, "sketch.point", json!({"point": [0, -10]}));
+    run(&mut s, "sketch.finish", json!({}));
+    s
+}
+
+fn drill_job(op: Value) -> Value {
+    json!({"machine": "3axis", "post": "mach3_4axis", "tools": [drill_tool(3, 6.0)], "operations": [op]})
+}
+
+fn peck_op() -> Value {
+    json!({
+        "name": "holes", "type": "drill", "tool": 3, "sketch": "Holes", "diameter_range": [5, 7],
+        "heights": {"clearance": 15, "retract": 2, "top": 0, "bottom": -10}, "cycle": "peck", "peck": 3
+    })
+}
+
+#[test]
+fn drilling_takes_the_holes_from_a_sketch_pecks_exactly_and_reads_back() {
+    let mut s = drilled_plate(10.0);
+    let dir = Dir::new("drill");
+    let out = dir.file("holes.tap");
+    let r = solidcraft_io::vfs::scoped(Some(solidcraft_io::vfs::PathScope::new([dir.0.clone()])), || {
+        run(&mut s, "cam.job", json!({"job": drill_job(peck_op()), "output": out}))
+    });
+    assert_clean(&r);
+    let op = &r["operations"][0];
+    assert_eq!(op["kind"], "drill", "{r}");
+    // Four holes (three circles in the range and the point; not the 30 mm circle), each:
+    // over it, down to R, four pecks to -3, -6, -9 and -10 with a full retract and a return to
+    // 0.5 mm above the depth after the first three, out to R and up to clearance.
+    assert_eq!(op["moves"], 4 * 14, "{r}");
+    assert!((op["cut_length"].as_f64().unwrap() - 4.0 * (12.0 + 1.5)).abs() < 1e-9, "{r}");
+    let text = std::fs::read_to_string(&out).unwrap();
+    for (z, n) in [(-3.0, 4), (-6.0, 4), (-9.0, 4), (-10.0, 4), (-2.5, 4), (-5.5, 4), (-8.5, 4)] {
+        assert_eq!(count_z(&text, z), n, "Z{z}: {text}");
+    }
+    assert!(z_words(&text).iter().all(|z| *z >= -10.0 - 1e-9), "never below the bottom: {text}");
+    for canned in ["G73", "G81", "G82", "G83"] {
+        assert!(!text.contains(canned), "expanded moves, no {canned}: {text}");
+    }
+    let c = run(&mut s, "cam.check", json!({"path": out}));
+    assert!(c["errors"].as_array().is_some_and(Vec::is_empty), "{c}");
+    assert_eq!(c["bounds"], json!([[-15.0, -10.0, -10.0], [15.0, 10.0, 15.0]]), "{c}");
+    // The drill feeds at its plunge feed.
+    assert!(text.lines().any(|l| l.contains("F250")), "{text}");
+}
+
+#[test]
+fn a_drills_point_is_gouge_checked_and_full_diameter_depth_goes_deeper_by_it() {
+    let full = |bottom: f64| {
+        let mut op = peck_op();
+        op["to_full_diameter"] = json!(true);
+        op["heights"]["bottom"] = json!(bottom);
+        drill_job(op)
+    };
+    // The holes are modelled flat-bottomed 10 mm deep: to full diameter at -10 the point is
+    // 1.8 mm into their floors.
+    let r = run(&mut drilled_plate(10.0), "cam.job", json!({"job": full(-10.0), "dry_run": true}));
+    assert_eq!(r["passed"], false, "{r}");
+    assert!(r["gouge"]["worst"].as_f64().is_some_and(|w| w > 1.5 && w < 2.1), "{r}");
+    assert!(r["failures"].as_array().unwrap().iter().any(|f| f.as_str().unwrap_or_default().contains("gouge")), "{r}");
+    // Modelled 12 deep, the point (to -11.8) clears the floor.
+    let r = run(&mut drilled_plate(12.0), "cam.job", json!({"job": full(-10.0), "dry_run": true}));
+    assert_clean(&r);
+    // No holes in the model: the drill cuts where the part shows material.
+    let mut solid = Session::default();
+    run(&mut solid, "solid.box", json!({"length": 60, "width": 40, "height": 20, "corner": [-30, -20, -20]}));
+    run(&mut solid, "sketch.create", json!({"plane": "XY", "name": "Holes"}));
+    run(&mut solid, "sketch.circle.center", json!({"center": [0, 0], "diameter": 6}));
+    run(&mut solid, "sketch.finish", json!({}));
+    let r = run(&mut solid, "cam.job", json!({"job": drill_job(peck_op()), "dry_run": true}));
+    assert_eq!(r["passed"], false, "{r}");
+    assert!(r["gouge"]["worst"].as_f64().is_some_and(|w| w > 9.0), "{r}");
+    // A flat end mill may plunge the holes; a ball end mill may not drill.
+    let mut job = drill_job(peck_op());
+    job["tools"] = json!([flat(3, 6.0)]);
+    assert_clean(&run(&mut drilled_plate(10.0), "cam.job", json!({"job": job, "dry_run": true})));
+    job["tools"] = json!([ball(3, 6.0)]);
+    let e = drilled_plate(10.0).execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("drill, or a flat end mill"), "{e}");
+}
+
+#[test]
+fn a_drill_indexed_at_90_degrees_drills_the_blocks_side() {
+    // A block 40 × 30 × 30 about the X axis with two 5 mm holes 8 deep into its +Y face, and a
+    // sketch on that face (its y running down work Z) with circles at them.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 30, "corner": [-20, -15, -15], "body_name": "Block"}));
+    for [x, z] in [[-8, 0], [8, 4]] {
+        run(&mut s, "solid.cylinder", json!({"diameter": 5, "height": 9, "base": [x, 7, z], "axis": "Y", "operation": "cut"}));
+    }
+    let side = json!({"plane": {"origin": [0, 15, 0], "x_dir": [1, 0, 0], "y_dir": [0, 0, -1]}, "name": "Side holes"});
+    run(&mut s, "sketch.create", side.clone());
+    for [x, y] in [[-8, 0], [8, -4]] {
+        run(&mut s, "sketch.circle.center", json!({"center": [x, y], "diameter": 5}));
+    }
+    run(&mut s, "sketch.finish", json!({}));
+    let job = |sketch: &str| {
+        json!({
+            "machine": "4axis_a", "post": "mach3_4axis", "tools": [drill_tool(4, 5.0)],
+            "operations": [{"type": "indexed", "a_deg": 90, "operation": {
+                "name": "side holes", "type": "drill", "tool": 4, "sketch": sketch,
+                "heights": {"clearance": 40, "retract": 18, "top": 15, "bottom": 7},
+                "cycle": "chip_break", "peck": 2.5, "back_off": 0.3
+            }}]
+        })
+    };
+    let r = run(&mut s, "cam.job", json!({"job": job("Side holes"), "dry_run": true}));
+    assert_clean(&r);
+    let op = &r["operations"][0];
+    assert_eq!(op["kind"], "indexed drill", "{r}");
+    assert_eq!(op["a_deg"].as_f64(), Some(90.0), "{r}");
+    assert!((op["max_tilt_deg"].as_f64().unwrap() - 90.0).abs() < 1e-6, "the drill comes in along work +Y: {r}");
+    // Two holes, each: over it, to R, four pecks (to 12.5, 10, 7.5 and 7) with three
+    // back-offs, out to R, up to clearance.
+    assert_eq!(op["moves"], 2 * 11, "{r}");
+    let head: Vec<&str> = r["program_head"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(head.iter().any(|l| l.contains("A90")), "{head:?}");
+    // The holes are where the sketch says only if the frame maps them right: drilled into the
+    // solid side, the same job gouges.
+    let mut solid = Session::default();
+    run(&mut solid, "solid.box", json!({"length": 40, "width": 30, "height": 30, "corner": [-20, -15, -15]}));
+    run(&mut solid, "sketch.create", side);
+    run(&mut solid, "sketch.circle.center", json!({"center": [-8, 0], "diameter": 5}));
+    run(&mut solid, "sketch.finish", json!({}));
+    let r = run(&mut solid, "cam.job", json!({"job": job("Side holes"), "dry_run": true}));
+    assert_eq!(r["passed"], false, "{r}");
+    // A sketch on the top is not square to the indexed tool axis.
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Top"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "diameter": 5}));
+    run(&mut s, "sketch.finish", json!({}));
+    let e = s.execute("cam.job", &json!({"job": job("Top"), "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("not on a plane square"), "{e}");
+}
+
+#[test]
+fn drilling_stays_at_the_r_height_only_above_the_part_and_its_fixtures() {
+    let mut s = drilled_plate(10.0);
+    // A vise jaw beside the plate, 5 mm above its top.
+    run(&mut s, "solid.box", json!({"length": 60, "width": 8, "height": 25, "corner": [-30, -30, -20], "operation": "new", "body_name": "Jaw"}));
+    let job = |retract: f64| {
+        let mut op = peck_op();
+        op["stay_at_retract"] = json!(true);
+        op["heights"]["retract"] = json!(retract);
+        let mut j = drill_job(op);
+        j["fixtures"] = json!(["Jaw"]);
+        j
+    };
+    let e = s.execute("cam.job", &json!({"job": job(2.0), "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("stay_at_retract"), "{e}");
+    let r = run(&mut s, "cam.job", json!({"job": job(8.0), "dry_run": true}));
+    assert_clean(&r);
+    // From hole to hole at R: no rise to clearance and back, except at the start and the end.
+    assert_eq!(r["operations"][0]["moves"], 13 + 12 + 12 + 13, "{r}");
+}
+
+#[test]
+fn hostile_drilling_jobs_are_refused_without_panics() {
+    let mut s = drilled_plate(10.0);
+    let with = |f: &dyn Fn(&mut Value)| {
+        let mut op = peck_op();
+        f(&mut op);
+        json!({"job": drill_job(op), "dry_run": true})
+    };
+    let points_op = |extra: Value| {
+        let mut op = json!({"name": "p", "type": "drill", "tool": 3, "heights": {"clearance": 15, "retract": 2, "top": 0, "bottom": -10}});
+        if let (Some(o), Value::Object(e)) = (op.as_object_mut(), extra) {
+            o.extend(e);
+        }
+        json!({"job": drill_job(op), "dry_run": true})
+    };
+    let cases = [
+        (with(&|o| o["sketch"] = json!("Nope")), "Nope"),
+        (with(&|o| o["points"] = json!([[0, 0]])), "not both"),
+        (points_op(json!({})), "give a `sketch`"),
+        (points_op(json!({"points": []})), "no holes"),
+        (points_op(json!({"points": [[1e308, 0]]})), "finite"),
+        (points_op(json!({"points": [[0, 0]], "circles": true})), "go with `sketch`"),
+        (with(&|o| o["diameter_range"] = json!([7, 5])), "smallest first"),
+        (with(&|o| o["diameter_range"] = json!([-1, 5])), "smallest first"),
+        (with(&|o| o["diameter_range"] = json!([0, 1e308])), "finite"),
+        (
+            with(&|o| {
+                o["diameter_range"] = json!([50, 60]);
+                o["sketch_points"] = json!(false);
+            }),
+            "no circles in `diameter_range`",
+        ),
+        (
+            with(&|o| {
+                o["circles"] = json!(false);
+                o["sketch_points"] = json!(false);
+            }),
+            "no holes",
+        ),
+        (with(&|o| o["cycle"] = json!("simple")), "`peck` goes with"),
+        (with(&|o| o["dwell_seconds"] = json!(1)), "`dwell_seconds` goes with"),
+        (with(&|o| o["back_off"] = json!(1)), "`back_off` goes with"),
+        (with(&|o| o["peck"] = json!(1e-9)), "pecks"),
+        (with(&|o| o["peck"] = json!(-1)), "peck"),
+        (with(&|o| o["peck_clearance"] = json!(0)), "clearance"),
+        (with(&|o| o["cycle"] = json!("pecking")), "pecking"),
+        (with(&|o| o["pek"] = json!(1)), "pek"),
+        (
+            with(&|o| {
+                o["stay_at_retract"] = json!(true);
+                o["heights"]["retract"] = json!(0);
+            }),
+            "stay_at_retract",
+        ),
+        (with(&|o| o["heights"]["bottom"] = json!(-40)), "flutes"),
+        (with(&|o| o["heights"]["bottom"] = json!(5)), "ordered"),
+        (with(&|o| o["heights"]["bottom"] = json!(0)), "no depth"),
+        (with(&|o| o["feeds"] = json!({"cut": 100, "plunge": -1})), "feed"),
+    ];
+    for (p, word) in &cases {
+        match s.execute("cam.job", p) {
+            Err(EngineError::Internal(_, msg)) => panic!("{p}: panicked: {msg}"),
+            Err(e) => assert!(e.to_string().contains(word), "{p}: {e}"),
+            Ok(v) => panic!("{p}: accepted: {v}"),
+        }
+    }
+    // A drill's point angle is checked; a drill still cannot mill.
+    let mut job = drill_job(peck_op());
+    job["tools"][0]["point_angle_deg"] = json!(0);
+    assert!(s.execute("cam.job", &json!({"job": job, "dry_run": true})).is_err());
+    let mut job = drill_job(json!({
+        "name": "c", "type": "contour", "tool": 3, "polygon": [[-10, -10], [10, -10], [10, 10], [-10, 10]],
+        "heights": {"clearance": 15, "retract": 2, "top": 0, "bottom": -1}
+    }));
+    let e = s.execute("cam.job", &json!({"job": job.clone(), "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("cannot mill"), "{e}");
+    job["operations"][0]["type"] = json!("drill");
+    assert!(s.execute("cam.job", &json!({"job": job, "dry_run": true})).is_err(), "a drill operation has no polygon");
+}
+
+#[test]
+fn drilling_refuses_an_r_height_below_the_part_round_a_hole() {
+    // A plate, its top at Z 0, with a 20 × 20 boss 10 high round (15, 0), and 6 mm holes 12 deep
+    // into the plate at (-15, 0) and through the boss into the plate at (15, 0).
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 20, "corner": [-30, -20, -20], "body_name": "Plate"}));
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 10, "corner": [5, -10, 0], "operation": "join"}));
+    for [x, y] in [[-15, 0], [15, 0]] {
+        run(&mut s, "solid.cylinder", json!({"diameter": 6, "height": 25, "base": [x, y, -12], "operation": "cut"}));
+    }
+    let job = |points: Value, top: f64, retract: f64| {
+        let op = json!({
+            "name": "holes", "type": "drill", "tool": 3, "points": points,
+            "heights": {"clearance": 25, "retract": retract, "top": top, "bottom": -10}
+        });
+        json!({"job": drill_job(op), "dry_run": true})
+    };
+    // Both holes with the plate's heights: the drill would rapid from clearance down to R 2
+    // through 8 mm of the boss. The gouge check cannot see it (the finished part has the hole).
+    let e = s.execute("cam.job", &job(json!([[-15, 0], [15, 0]]), 0.0, 2.0)).unwrap_err();
+    assert!(e.to_string().contains("(15, 0)") && e.to_string().contains("retract"), "{e}");
+    // The plate's hole alone, and the boss's from the boss's top, are clean.
+    assert_clean(&run(&mut s, "cam.job", job(json!([[-15, 0]]), 0.0, 2.0)));
+    assert_clean(&run(&mut s, "cam.job", job(json!([[15, 0]]), 10.0, 12.0)));
+    // Indexed: the part is checked in the operation's frame. At A 90 the block's +Y face (work Y
+    // 15) is under the tool; an R height of 12 is inside the block.
+    let mut b = Session::default();
+    run(&mut b, "solid.box", json!({"length": 40, "width": 30, "height": 30, "corner": [-20, -15, -15], "body_name": "Block"}));
+    run(&mut b, "solid.cylinder", json!({"diameter": 5, "height": 9, "base": [0, 7, 0], "axis": "Y", "operation": "cut"}));
+    let side = |retract: f64| {
+        json!({"job": {
+            "machine": "4axis_a", "post": "mach3_4axis", "tools": [drill_tool(4, 5.0)],
+            "operations": [{"type": "indexed", "a_deg": 90, "operation": {
+                "name": "side", "type": "drill", "tool": 4, "points": [[0, 0]],
+                "heights": {"clearance": 40, "retract": retract, "top": 10, "bottom": 8}
+            }}]
+        }, "dry_run": true})
+    };
+    let e = b.execute("cam.job", &side(12.0)).unwrap_err();
+    assert!(e.to_string().contains("Z 15") && e.to_string().contains("retract"), "{e}");
+    assert_clean(&run(&mut b, "cam.job", side(18.0)));
+}

@@ -497,6 +497,10 @@ operation! {
     }
 }
 
+#[path = "cam_drill.rs"]
+mod drill;
+pub use drill::{DrillCycleSpec, DrillOp};
+
 /// A 3-axis operation, as an indexed operation runs it.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -506,6 +510,7 @@ pub enum Op3Spec {
     Parallel(ParallelOp),
     Roughing(RoughingOp),
     Waterline(WaterlineOp),
+    Drill(DrillOp),
 }
 
 /// A 3-axis operation run with the A axis held at `a_deg` (3+1): its heights, boundary and
@@ -515,7 +520,7 @@ pub enum Op3Spec {
 pub struct IndexedOp {
     /// The A angle, degrees.
     pub a_deg: f64,
-    /// The 3-axis operation (`contour`, `pocket`, `parallel`, `roughing` or `waterline`).
+    /// The 3-axis operation (`contour`, `pocket`, `parallel`, `roughing`, `waterline` or `drill`).
     pub operation: Box<Op3Spec>,
 }
 
@@ -528,6 +533,7 @@ pub enum OperationSpec {
     Parallel(ParallelOp),
     Roughing(RoughingOp),
     Waterline(WaterlineOp),
+    Drill(DrillOp),
     Indexed(IndexedOp),
     RotaryFinish(RotaryFinishOp),
     RotaryRoughing(RotaryRoughingOp),
