@@ -73,15 +73,16 @@ pub static COMMANDS: &[CommandSpec] = &[
              {bottom, top?, retract?, clearance?, stepdown?, stepover?, angle_deg?, zigzag?, overhang?, rect?}, tool: number, spindle_rpm?, \
              feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
-             and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
+             and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails; \
+             simulate?: also run the written program through cam.simulate's stock model (a gouge or a rapid in material fails) → \
              operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, warnings}], \
              program_lines, program_head, readback: {max_tip_deviation, max_axis_deviation_deg, allowed_tip, allowed_axis_deg, \
              cut_minutes, pass}, cut_minutes, rapid_minutes?, machine_time?: {cut_minutes, written_cut_minutes, rapid_minutes, \
              spindle_minutes, total_minutes, slowed_blocks, rotary_over, feed_over, peak_rotary_deg_min?, peak_feed_mm_min?, \
              spindle_out_of_range, span_mm, warnings}, gouge: {worst, tolerance, hits, skipped, pass}, holder_collisions, rapids: \
              {checked, hits, worst, pass, from_unknown, first: [{line, operation?, kind, depth, at}]}, travel: {checked, violation?, pass} \
-             | null, stock, passed, failures, dry_run, outputs: {gcode?, preview?}, notes. Without dry_run or allow_unsafe a failed check \
-             refuses and nothing is written",
+             | null, stock, passed, failures, dry_run, outputs: {gcode?, preview?}, notes, simulation? (as cam.simulate). Without \
+             dry_run or allow_unsafe a failed check refuses and nothing is written",
         ),
     CommandSpec::new("cam.posts", "CAM Posts", crate::checked!("cam.posts", posts))
         .noundo()
@@ -103,7 +104,22 @@ pub static COMMANDS: &[CommandSpec] = &[
              errors: [{line, message}] (the first line the reader cannot read; it reads the G-code SolidCraft's posts write, others on a \
              best-effort basis)",
         ),
+    CommandSpec::new("cam.simulate", "Simulate G-code", crate::checked!("cam.simulate", sim::simulate))
+        .noundo()
+        .contract(&sim::CONTRACT)
+        .output(output_schema_for::<crate::schema::cam_sim::CamSimulateReply>)
+        .params(
+            "path: G-code file; job: {…} | job_path: .json (the job it was written for: machine, tools, bodies, origin, tolerance); \
+             resolution?: cell mm (default 5 × tolerance, at most 20 M cells); stock_stl?: STL path for the stock left → stock: {kind: \
+             box | cylinder, min?, max?, x_range?, radius?, derived}, resolution, cells, gouge: {worst, cells}, rapids_in_material: \
+             [{line, volume, depth}], leftover: {max, mean, cells}, removed_volume, minutes, slot_moves, passed, failures, warnings, \
+             notes, stock_stl?. The stock is swept by every block (3-axis: a heightfield; 4th axis: radii over x and A) and compared \
+             with the part; a failure is reported, not refused",
+        ),
 ];
+
+#[path = "cam_sim.rs"]
+mod sim;
 
 /// Largest job, post or tool library file read (bytes).
 const MAX_JSON_BYTES: usize = 16 << 20;
@@ -1147,6 +1163,21 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     gouge.pass = gouge.hits == 0;
     // Every rapid of the program as written, and every position against the machine's travel.
     let (rapids, travel) = cam_stock::check_motion(cmd, &job, &text, &program, &post, &machine, &surfaces, stock.as_ref(), tol, &mut failures)?;
+    let simulation = if params.simulate.unwrap_or(false) {
+        let deliberate = planned.iter().any(|p| !p.gouge_check);
+        match sim::check_program(cmd, &text, &machine, &tools, &surfaces.part, tol, None, deliberate) {
+            Ok((reply, _)) => {
+                failures.extend(reply.failures.iter().cloned());
+                Some(reply)
+            }
+            Err(e) => {
+                failures.push(format!("simulation: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let readback = ReadbackReport {
         max_tip_deviation: rb.max_tip_deviation,
         max_axis_deviation_deg: rb.max_axis_deviation.to_degrees(),
@@ -1221,6 +1252,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         dry_run,
         outputs,
         notes,
+        simulation,
         param_warnings: Vec::new(),
     };
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))

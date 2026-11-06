@@ -47,6 +47,7 @@ mod readback;
 pub mod readback5;
 pub mod rotary;
 pub mod stock;
+pub mod sim;
 pub mod strategies5;
 mod surface;
 pub mod surface_ops;
@@ -130,6 +131,8 @@ mod machine_time_tests;
 mod rapids_tests;
 #[cfg(test)]
 mod rotary_tests;
+#[cfg(test)]
+mod sim_tests;
 #[cfg(test)]
 mod stock_tests;
 #[cfg(test)]

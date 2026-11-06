@@ -1,7 +1,7 @@
 # CAM jobs
 
 A CAM job turns a design's bodies into G-code for one machine. It is a JSON file kept next to
-the design (or an object passed inline); nothing of it is saved in the `.sc` file. Three commands
+the design (or an object passed inline); nothing of it is saved in the `.sc` file. Four commands
 work with jobs, from scripts, the CLI and MCP alike:
 
 | Command | What it does |
@@ -9,6 +9,7 @@ work with jobs, from scripts, the CLI and MCP alike:
 | `cam.job` | Plans every operation, writes the program through the job's post, reads it back and checks it, and writes the G-code (and an HTML preview) |
 | `cam.posts` | Lists the built-in posts, or returns one as JSON to copy into a post file |
 | `cam.check` | Reads a G-code file and reports lengths, time, the rotary range, inverse-time blocks and the first line it cannot read |
+| `cam.simulate` | Runs a G-code file through a model of the stock and compares what is left with the part: gouges, rapids through material, leftover, slots (see "Stock-removal simulation") |
 
 Units are millimetres and mm/min. Angles in a job are degrees (`a_deg`, `angle_deg`, …).
 
@@ -26,6 +27,7 @@ Units are millimetres and mm/min. Angles in a job are degrees (`a_deg`, `angle_d
 | `preview` | An HTML page of the part and every toolpath: self-contained (no network), one view per operation and one for the whole job, orbit and zoom, a slider that plays the moves, rapids dashed. |
 | `dry_run` | Plan and check, write nothing; the reply says whether the checks pass instead of refusing. |
 | `allow_unsafe` | Write the program even when a check fails. |
+| `simulate` | Also run the program as written through the stock-removal simulation (below): a gouge or a rapid through material fails the job like the other checks, and the reply carries `simulation`. |
 
 Every file is read and written through the session's file access, so an MCP server's
 `--allow-path` folders apply; every path is checked before anything is computed or written.
@@ -680,3 +682,79 @@ Moves to and from the machine's home (`G28`) are in machine coordinates and are 
   lines, before its first turn of A. A post with `"coolant_after_turn": true` switches it on
   right after that turn (`G0 A90.` then `M8`). Coolant that goes off, and an operation that
   turns nothing at its start, are written the same either way.
+## Stock-removal simulation
+
+`cam.simulate` checks a written program independently of the toolpaths it came from: it reads
+the G-code as the controller would, sweeps each tool through a model of the stock along every
+block (rapids included), and compares what is left with the part. `cam.job` runs the same check
+on the program it has just written when given `simulate: true`.
+
+```json
+{"path": "C:/parts/bracket.tap", "job_path": "C:/parts/bracket.cam.json", "resolution": 0.05, "stock_stl": "C:/parts/bracket-stock.stl"}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `path` | The G-code file, in the job's work coordinates. |
+| `job` / `job_path` | The job the program was written for: its machine, tools (by `T` number; `T… M6` loads one), part bodies, `origin` and `tolerance`. |
+| `resolution` | The cell size in mm. Default: five times the tolerance, coarser when that would be more than 4 million cells. More than 20 million cells is refused. |
+| `stock_stl` | Write the stock the program leaves as a binary STL file (its top surface, or its round surface on a 4th axis), for a preview. |
+
+The reply: `stock` (`kind`: `box` or `cylinder`, its size, and `derived`), `resolution`,
+`cells`, `gouge: {worst, cells}` (the deepest cut into the part beyond the tolerance, and how many
+cells), `rapids_in_material: [{line, volume, depth}]` (rapids that cut more than the tolerance
+into the stock: a crash on the machine), `leftover: {max, mean, cells}` (material left above the
+part over the cells the program cut), `removed_volume` (mm³), `minutes` (at feed, as the
+controller times it), `slot_moves` (cuts at the tool's full width, also listed in `warnings`:
+keep their depth and feed low on a light machine), `passed` (no gouge and no rapid in material),
+`failures`, `warnings`, `notes` and `stock_stl`. A program with no move the simulation can
+follow (on a 4th axis, one that never writes A: no block's position is known) fails rather than
+passing with nothing checked. A failed simulation is reported, never refused;
+inside `cam.job` its failures join the job's. When an operation of the job has `gouge_check:
+false` (an engraving), the simulation's gouges are warned about, not failed.
+
+**The stock.** A job without a stock starts from one taken from the part: on a 3-axis machine
+the part's box, on a 4th axis the cylinder about work X through the part's farthest point from
+the axis, over the part's length. A program whose rapids are safe for a block-shaped part may
+then cut that round bar at its retract height, which is what the bar would do on the machine.
+
+**3-axis.** The stock is a heightfield over the box: one top height per cell, at the cell's
+centre. Every block lowers each cell to the tool's lowest point over it along the whole move,
+found exactly, not at sampled positions: along a straight move the tool's height over a cell is
+convex in the position along the move, so its least value is found in closed form (flat end
+mill, ball, drill point at 118°) or by bisection on its slope to rounding (bull nose). A level arc
+is exact as well; an arc that also moves in Z (a helix) is followed as chords at most a quarter
+of the tolerance inside it. An arc whose end is written at its start is a whole turn, as the
+controller runs it. An arc in the XZ plane (`G18`, centre from `I K`, `G2` clockwise seen from
++Y) or the YZ plane (`G19`, centre from `J K`, `G2` clockwise seen from +X), as some posts write
+lead-ins, is followed about its own centre, as chords at most a quarter of the tolerance inside
+it. The tool is its cutting end with its diameter carried on up, so a cut
+deeper than the flutes still removes material.
+
+**4th axis (A about X).** The stock is a grid over (x, A) holding how far out the material
+reaches along the ray from the axis. A block that turns A while X moves is a helix in the work
+frame, so the tool is placed at points along each block (every axis moving evenly, as written),
+close enough that the cusps between them are at most half the tolerance: at most √(4·r·tol)
+apart for a tool with corner radius r (a ball's is its radius), √(4·R·tol) for a flat end mill of
+radius R, tol / slope for a drill point, counting both the tip's travel and the cutting end's as
+the axis turns. At each point every ray near the tool is cut where it first enters the tool,
+when the tool reaches out of the material along it. A ray holds one stretch of material, so a cut
+that crosses a ray inside the material without reaching out of it (an indexed pocket in the
+part's side does this to the rays at a slant through it) is left out of that ray and counted in
+a warning; `cam.job`'s own gouge check, against the exact cutter, still covers those cuts.
+
+**Against the part.** Each cell's part height (or radius) is where a ray from above (from
+outside) first meets the part's facets. A cell cut below the part by more than the tolerance is
+measured again in 3D, as the distance from the bottom and the middle of the cut column to the
+part's surface, so a cut beside a steep wall within the tolerance of the wall is not a gouge.
+Leftover is measured along Z (along the ray), so material beside a steep wall counts its full
+height. The position is lost at a return home or a move in machine coordinates (`G28`, `G30`,
+`G53`); the next block is taken as coming straight down the tool axis from above the stock,
+where those moves leave the tool, and so is the program's first.
+
+**Time.** The grid is split into bands of rows (of angles on a 4th axis), each running the whole
+program on a thread of its own, one per core up to sixteen (one on the web); the result does not
+depend on how many. A 50 × 50 mm dome finished with a 6 mm ball in parallel passes 0.5 mm apart
+(about 21,000 blocks) simulates on a million cells (0.05 mm) in about 7 seconds on one thread and
+under a second on eight; a 4th-axis finish on a 16 mm long, 20 mm diameter barrel, 1° apart, on
+414,000 cells in about 3 seconds on one thread and under a second on eight.
