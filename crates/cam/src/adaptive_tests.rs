@@ -257,13 +257,13 @@ fn a_low_limit_under_a_heavy_load_still_clears_the_pocket() {
 fn the_helix_is_refused_without_room() {
     // 7 mm wide: the 6 mm tool's centre has a 1 mm strip, no room for a 4.8 mm helix.
     let slot = region(&[(0.0, 0.0), (40.0, 0.0), (40.0, 7.0), (0.0, 7.0)], &[]);
-    let e = adaptive(&[slot.clone()], &flat(6.0), &params(), &cut(0.0, -3.0)).unwrap_err();
+    let e = adaptive(std::slice::from_ref(&slot), &flat(6.0), &params(), &cut(0.0, -3.0)).unwrap_err();
     assert!(matches!(&e, CamError::Invalid(m) if m.contains("no room for the entry helix")), "{e}");
     // 10 mm wide: room for a 2 mm helix, not for the 4.8 mm one.
     let wide = region(&[(0.0, 0.0), (40.0, 0.0), (40.0, 10.0), (0.0, 10.0)], &[]);
-    assert!(adaptive(&[wide.clone()], &flat(6.0), &params(), &cut(0.0, -1.0)).is_err());
+    assert!(adaptive(std::slice::from_ref(&wide), &flat(6.0), &params(), &cut(0.0, -1.0)).is_err());
     let p = AdaptiveParams { helix_diameter: 2.0, ..params() };
-    let a = adaptive(&[wide.clone()], &flat(6.0), &p, &cut(0.0, -1.0)).unwrap();
+    let a = adaptive(std::slice::from_ref(&wide), &flat(6.0), &p, &cut(0.0, -1.0)).unwrap();
     assert!(a.helices >= 1);
     let e = measure(&[wide], &a, 3.0, 0.0);
     assert!(e.max_deg <= 60.0 + ENGAGEMENT_TOL, "{e:?}");

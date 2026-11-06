@@ -320,7 +320,7 @@ pub fn program_reach(text: &str, post: &Post5, machine: &Machine, ops: &[(&str, 
         .into_iter()
         .map(|a| {
             let has_cut = a.cut.iter().all(|r| r.0 <= r.1);
-            a.any.then(|| Reach { z_min: a.z_min, rotary: if has_cut { a.cut } else { a.all }, last: None })
+            a.any.then_some(Reach { z_min: a.z_min, rotary: if has_cut { a.cut } else { a.all }, last: None })
         })
         .collect();
     Ok(Some(reaches))
