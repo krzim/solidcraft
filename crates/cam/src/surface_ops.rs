@@ -35,7 +35,7 @@ use solidcore_record::{Region2, Vec2, Vec3};
 use solidcraft_geom::Ring;
 use solidcraft_geom::prelude::*;
 
-use crate::check::verify;
+use crate::check::{verify, verify_over};
 use crate::cutter::Cutter;
 use crate::dropcutter::drop_z;
 use crate::ops::{Feeds, Heights};
@@ -544,6 +544,13 @@ impl<'a> Field<'a> {
         })
     }
 
+    /// Where the tip rests on the surface at `p` (the stock to leave included), the boundary
+    /// aside; `None` where nothing is under the cutter.
+    pub(crate) fn rest(&self, p: Vec2) -> Result<Option<f64>> {
+        self.budget.spend()?;
+        Ok(drop_z(self.surface, &self.cutter, p.x, p.y).map(|z| z + self.leave))
+    }
+
     /// The highest the tip can rest anywhere within reach of the rectangle; `None` when no
     /// triangle is in reach.
     fn top(&self, r: &Rect) -> Option<f64> {
@@ -808,6 +815,20 @@ impl Out3 {
         verify(&path, &self.h)?;
         Ok(path)
     }
+
+    /// [`Out3::finish`] for a finishing path, whose `heights.top` may be below the part: its
+    /// rapids are checked against where the cutter rests on `field`'s surface instead
+    /// ([`verify_over`]).
+    pub(crate) fn finish_over(mut self, field: &Field) -> Result<Toolpath> {
+        if let Some(q) = self.pos
+            && q.z < self.h.clearance
+        {
+            self.push(Move::Rapid { to: Vec3::new(q.x, q.y, self.h.clearance) })?;
+        }
+        let path = Toolpath { moves: self.moves };
+        verify_over(&path, &self.h, &|p| field.rest(p))?;
+        Ok(path)
+    }
 }
 
 /// The way the tool feeds from `a` to `b` (no longer than `max_len` seen from above): the
@@ -927,7 +948,7 @@ pub fn parallel(surface: &Surface, tool: &Tool, p: &ParallelParams) -> Result<To
             out.span(&s, &link, None)?;
         }
     }
-    out.finish()
+    out.finish_over(&field)
 }
 
 /// What is under the cutter over a set of samples (a pass, a grid), to skip the levels that
@@ -1105,7 +1126,7 @@ pub fn waterline(surface: &Surface, tool: &Tool, p: &WaterlineParams) -> Result<
             }
         }
     }
-    out.finish()
+    out.finish_over(&field)
 }
 
 /// Whether the tip resting at `t` is above `level`: the material the tool must stay out of.

@@ -158,8 +158,15 @@ pub fn check_drilling_tool(tool: &Tool) -> Result<()> {
     }
 }
 
+/// A last peck shorter than this share of the peck is merged into the one before it: a sliver
+/// of a peck (0.002 mm where the depth is a hair over a whole number of pecks) is a retract and
+/// a re-entry for nothing.
+pub const SHORT_PECK: f64 = 0.1;
+
 /// The depths (operation Z) a hole from `top` to `bottom` is fed to, one per peck: `peck`
-/// apart from the top, the last at `bottom`. `None` for a peck: one feed to `bottom`.
+/// apart from the top, the last at `bottom`. A last peck shorter than [`SHORT_PECK`] of `peck`
+/// is merged into the one before (that one goes a little deeper than `peck`). `None` for a
+/// peck: one feed to `bottom`.
 pub fn peck_depths(top: f64, bottom: f64, peck: Option<f64>) -> Result<Vec<f64>> {
     if !(top.is_finite() && bottom.is_finite() && top > bottom) {
         return invalid("the hole has no depth: its bottom must be below its top");
@@ -168,7 +175,11 @@ pub fn peck_depths(top: f64, bottom: f64, peck: Option<f64>) -> Result<Vec<f64>>
     if !(peck > 0.0) || !(peck <= MAX_COORD) {
         return invalid("the peck depth must be above 0");
     }
-    let n = ((top - bottom) / peck - 1e-9).ceil().max(1.0);
+    let depth = top - bottom;
+    let mut n = (depth / peck - 1e-9).ceil().max(1.0);
+    if n > 1.0 && depth - peck * (n - 1.0) < SHORT_PECK * peck {
+        n -= 1.0;
+    }
     if !(n <= MAX_PECKS as f64) {
         return Err(CamError::TooLarge(format!("more than {MAX_PECKS} pecks into one hole; use a larger peck")));
     }

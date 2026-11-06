@@ -30,8 +30,8 @@ use solidcraft_cam::rotary::{RotaryParams, RotaryPattern, RotaryRoughingParams, 
 use solidcraft_cam::surface_ops::{Boundary, ParallelParams, RoughingParams, WaterlineParams, parallel, roughing, waterline};
 use solidcraft_cam::{
     CamError, Compaction, ContourParams, Cut, DEFAULT_DESCENT_LIMIT, DEFAULT_MAX_ANGLE_STEP, Feeds, Frame, Heights, HolderSection, LineNumbers, Move,
-    Operation5, PocketParams, SafeRetract, Side, Surface, Tool, ToolKind, Toolpath, Toolpath5, arc_sweep, compact, contour_with, limit_descents,
-    pocket_with,
+    Operation5, PocketParams, SafeRetract, Side, Surface, Tool, ToolKind, Toolpath, Toolpath5, arc_sweep, compact, contour_with, lift_entries,
+    limit_descents, pocket_with,
 };
 use solidcraft_geom::Mesh;
 use solidcraft_geom::prelude::*;
@@ -729,8 +729,57 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
     };
     let b = &ctx.post.base;
     let feed_step = 10f64.powi(-i32::from(b.feed_decimals)) * b.units.mm();
+    // The ways down at rapid stop above where the material may reach, not only above the
+    // operation's own top.
+    if let Some(top) = material_top(ctx, frame) {
+        lift_entries(&mut path, top);
+    }
     limit_descents(&mut path, r.feeds.plunge, r.feeds.cut, b.decimals, b.units.mm(), feed_step).map_err(|e| ctx.bad(name, e))?;
     Ok((path, r, kind))
+}
+
+/// Where the material may reach in `frame` (the highest Z of the operation's coordinates): the
+/// stock's top seen from there; without a stock, on a machine with rotaries, the round bar
+/// through the part's farthest point from the A axis (as the simulation takes the stock);
+/// otherwise not known (the operations' heights say).
+fn material_top(ctx: &Ctx<'_>, frame: &Frame) -> Option<f64> {
+    use solidcraft_cam::stock::Stock;
+    let highest = |lo: Vec3, hi: Vec3| -> f64 {
+        let mut top = f64::NEG_INFINITY;
+        for i in 0..8 {
+            let c = Vec3::new(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z });
+            top = top.max(frame.to_local(c).z);
+        }
+        top
+    };
+    // A round bar about work X: its radius where the frame looks square to X.
+    let bar = |radius: f64, x0: f64, x1: f64| -> f64 {
+        if frame.z.x.abs() <= 1e-9 {
+            radius - frame.origin.dot(frame.z)
+        } else {
+            highest(Vec3::new(x0, -radius, -radius), Vec3::new(x1, radius, radius))
+        }
+    };
+    let top = match ctx.stock {
+        Some(Stock::Box { min, max }) => highest(*min, *max),
+        Some(Stock::Cylinder { radius, x_min, x_max }) => bar(*radius, *x_min, *x_max),
+        None if !ctx.machine.rotaries.is_empty() => {
+            let (mut reach, mut x0, mut x1) = (0.0f64, f64::INFINITY, f64::NEG_INFINITY);
+            for t in ctx.part.triangles() {
+                for p in t {
+                    reach = reach.max(p.y.hypot(p.z));
+                    x0 = x0.min(p.x);
+                    x1 = x1.max(p.x);
+                }
+            }
+            if !(x0 <= x1) {
+                return None;
+            }
+            bar(reach, x0, x1)
+        }
+        None => return None,
+    };
+    top.is_finite().then_some(top)
 }
 
 /// The share of a 3D operation's budget it plans within, and the share its moves may then move
@@ -1389,6 +1438,10 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     gouge.pass = gouge.hits == 0;
+    // Every operation's lowest cut against the stock's bottom.
+    if let Some(st) = stock.as_ref() {
+        cam_stock::check_below_stock(&planned, st, &machine, tol, &mut failures);
+    }
     // Every rapid of the program as written, and every position against the machine's travel.
     let unchecked: Vec<bool> = planned.iter().map(|p| !p.gouge_check).collect();
     let (rapids, travel) =

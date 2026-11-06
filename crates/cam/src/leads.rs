@@ -40,6 +40,8 @@ use crate::{CamError, Result, invalid};
 pub const MAX_TABS: usize = 200;
 /// Most finishing passes of one contour.
 pub const MAX_FINISH_PASSES: usize = 20;
+/// Most depth steps a finishing pass is taken down in.
+const MAX_FINISH_STEPS: usize = 1000;
 /// Largest lead radius or line (mm).
 const MAX_LEAD: f64 = 1.0e4;
 /// Smallest helix and lead radius (mm): smaller arcs are lost to the rounding of the program.
@@ -744,6 +746,34 @@ fn cut_profile(b: &mut Builder, lp: &[Piece], knots: &[(f64, f64)]) -> Result<()
     Ok(())
 }
 
+/// The depths a finishing pass runs at: the bottom alone where the wall from `top` to
+/// `bottom` is within the tool's flutes; else steps down from the top, evenly and no deeper
+/// apart than the flutes reach, the last at the bottom. A finishing pass takes its stepover
+/// off the whole wall below it, so deeper than the flutes the shank above them would rub (or
+/// cut with) the wall; stepped, the wall above each step is already finished at the pass's
+/// offset, and a shank no wider than the cutter passes it. A shank wider than the cutter
+/// would rub that finished wall: refused.
+fn finish_levels(tool: &Tool, top: f64, bottom: f64) -> Result<Vec<f64>> {
+    let (depth, flutes) = (top - bottom, tool.flute_length);
+    if !(depth > flutes + 1e-9) {
+        return Ok(vec![bottom]);
+    }
+    if tool.shank_diameter.is_some_and(|s| s > tool.diameter + 1e-9) {
+        return invalid(format!(
+            "the finishing passes run down a {depth:.3} mm wall, deeper than tool {}'s {flutes:.3} mm flutes, and its shank is wider than              its cutter, so it would rub the finished wall above each step: use a tool whose flutes reach the depth, or no finishing passes",
+            tool.number
+        ));
+    }
+    let n = (depth / flutes - 1e-9).ceil();
+    if !(n <= MAX_FINISH_STEPS as f64) {
+        return Err(CamError::TooLarge(format!(
+            "the finishing passes need more than {MAX_FINISH_STEPS} steps down the wall; use a tool with longer flutes"
+        )));
+    }
+    let n = n as usize;
+    Ok((1..=n).map(|k| if k == n { bottom } else { top - depth * k as f64 / n as f64 }).collect())
+}
+
 /// Round the pass at `z` (its tabs where they stand above `z`), leads included.
 fn cut_pass(b: &mut Builder, pass: &Pass, z: f64, plan: Option<&TabPlan>) -> Result<()> {
     b.cut_loop(&pass.lead_in, z)?;
@@ -844,6 +874,7 @@ pub fn contour_with(
     let down = Down { entry, geo: &geo, plan: plan.as_ref(), away_left };
     let margin = 2.0 * r;
     let levels = cut.levels()?;
+    let steps = if n > 0 { finish_levels(tool, top, bottom)? } else { vec![bottom] };
     let mut b = Builder::new(cut);
     for (i, raw) in loops.iter().enumerate() {
         let mut lp = orient(raw);
@@ -872,25 +903,31 @@ pub fn contour_with(
         }
         let mut cut_so_far: Vec<Piece> = rough.pieces().copied().collect();
         let mut last = rough;
-        let finish = |b: &mut Builder, pass: Pass, d: f64, cut_so_far: &mut Vec<Piece>| -> Result<Pass> {
+        // Round `pass` (`d` out from the wall) at each of `steps`, down from the top.
+        let finish = |b: &mut Builder, pass: Pass, d: f64, steps: &[f64], cut_so_far: &mut Vec<Piece>| -> Result<Pass> {
             let to = pass.entry();
-            let at_bottom = b.pos.filter(|q| (q.z - bottom).abs() <= 1e-9);
-            match at_bottom {
-                Some(q) if pass.lead_in.is_empty() && geo.link_in_band(xy(q), to, d, rough_d) => b.cut_to(to, bottom)?,
-                _ => {
-                    hop(b, to, opts.linking, above)?;
-                    // Down where the depth passes cut, or into the material by the entry.
-                    if cut_so_far.iter().any(|piece| piece.dist(to) <= 0.9 * r) {
-                        b.descend_to(bottom, top)?;
-                    } else if entry == Entry::Plunge {
-                        return invalid("a finishing pass would plunge where the depth passes did not cut: give it a smaller lead, or an entry");
-                    } else {
-                        b.descend_to(top, top)?;
-                        down.enter(b, &pass, bottom)?;
+            for (j, &z) in steps.iter().enumerate() {
+                let at_z = b.pos.filter(|q| (q.z - z).abs() <= 1e-9);
+                // Back at the pass's start after the step above: straight on down.
+                let on_down = j > 0 && pass.lead_in.is_empty() && b.at(to) && b.pos.is_some_and(|q| q.z > z);
+                match at_z {
+                    Some(q) if pass.lead_in.is_empty() && geo.link_in_band(xy(q), to, d, rough_d) => b.cut_to(to, z)?,
+                    _ if on_down => b.plunge_to(z)?,
+                    _ => {
+                        hop(b, to, opts.linking, above)?;
+                        // Down where the depth passes cut, or into the material by the entry.
+                        if cut_so_far.iter().any(|piece| piece.dist(to) <= 0.9 * r) {
+                            b.descend_to(z, top)?;
+                        } else if entry == Entry::Plunge {
+                            return invalid("a finishing pass would plunge where the depth passes did not cut: give it a smaller lead, or an entry");
+                        } else {
+                            b.descend_to(top, top)?;
+                            down.enter(b, &pass, z)?;
+                        }
                     }
                 }
+                cut_pass(b, &pass, z, plan.as_ref())?;
             }
-            cut_pass(b, &pass, bottom, plan.as_ref())?;
             cut_so_far.extend(pass.pieces().copied());
             Ok(pass)
         };
@@ -924,12 +961,13 @@ pub fn contour_with(
                     }
                 }
                 let pass = make_pass(lp, tabs, opts.lead, &geo, away_left)?;
-                last = finish(&mut b, pass, *d, &mut cut_so_far)?;
+                last = finish(&mut b, pass, *d, &steps, &mut cut_so_far)?;
             }
         }
         if opts.spring_pass {
             let d = if n > 0 { away } else { rough_d };
-            finish(&mut b, last, d, &mut cut_so_far)?;
+            // At the bottom alone: it takes nothing off the wall the last pass finished.
+            finish(&mut b, last, d, &[bottom], &mut cut_so_far)?;
         }
         if opts.linking == Linking::Clearance {
             b.retract()?;

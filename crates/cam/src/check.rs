@@ -7,6 +7,7 @@ use solidcraft_geom::prelude::*;
 
 use crate::ops::Heights;
 use crate::path::{MAX_MOVES, Move, Toolpath};
+use crate::surface_ops::ENTRY_GAP;
 use crate::{CamError, Result};
 
 const TOL: f64 = 1e-6;
@@ -74,6 +75,58 @@ impl Swept {
     }
 }
 
+/// Raises every rapid of `path` straight down that stops below `top` + [`ENTRY_GAP`] where
+/// the path has not yet cut through that point lower down, to there (no higher than it
+/// started): `top` is where the material may reach (the stock's top, which may be above the
+/// operation's own `heights.top`), and the feed after it then comes down the rest of the way.
+/// A rapid down into what the path has already cut (a level coming down through the levels
+/// above it) is left as it is.
+pub fn lift_entries(path: &mut Toolpath, top: f64) {
+    if !top.is_finite() {
+        return;
+    }
+    let air = top + ENTRY_GAP;
+    let mut swept = Swept::default();
+    let mut pos: Option<Vec3> = None;
+    let mut keep = vec![true; path.moves.len()];
+    for (i, m) in path.moves.iter_mut().enumerate() {
+        match m {
+            Move::Rapid { to } => {
+                if let Some(from) = pos
+                    && xy(from).dist(xy(*to)) <= 1e-9
+                    && to.z < from.z
+                    && to.z < air - 1e-9
+                    && !swept.below(xy(*to), to.z)
+                {
+                    to.z = air.min(from.z);
+                    if to.z >= from.z - 1e-12
+                        && let Some(k) = keep.get_mut(i)
+                    {
+                        *k = false;
+                    }
+                }
+            }
+            Move::Feed { to, .. } => {
+                if let Some(from) = pos {
+                    swept.add(from, *to);
+                }
+            }
+            Move::Arc { to, .. } => {
+                if let Some(from) = pos {
+                    swept.add(from, from);
+                }
+                swept.add(*to, *to);
+            }
+            Move::Dwell { .. } => {}
+        }
+        if let Some(t) = m.target() {
+            pos = Some(t);
+        }
+    }
+    let mut k = keep.iter();
+    path.moves.retain(|_| k.next().copied().unwrap_or(true));
+}
+
 /// Checks the rules:
 /// - every coordinate is finite and every feed is above zero;
 /// - the path starts with a rapid to the clearance height or above;
@@ -85,6 +138,30 @@ impl Swept {
 /// - no move goes below the bottom height;
 /// - an arc starts and ends at the same distance from its centre.
 pub fn verify(path: &Toolpath, h: &Heights) -> Result<()> {
+    verify_against(path, h, None)
+}
+
+/// Where a cutter resting on the part at a point (seen from above) has its tip: `None` where
+/// nothing is under it.
+pub(crate) type RestAt<'a> = &'a dyn Fn(Vec2) -> Result<Option<f64>>;
+
+/// [`verify`] for a finishing path whose `heights.top` says nothing of where the material is
+/// (a parallel or waterline finish, whose top may be below the part): a rapid below the
+/// retract height that is not back into a cut must stop at or above where the cutter rests on
+/// the part there (`rest`), not merely at or above `heights.top`.
+pub(crate) fn verify_over(path: &Toolpath, h: &Heights, rest: RestAt<'_>) -> Result<()> {
+    verify_against(path, h, Some(rest))
+}
+
+fn verify_against(path: &Toolpath, h: &Heights, rest: Option<RestAt<'_>>) -> Result<()> {
+    // Whether a rapid stopping at `p` stops in the material: below `heights.top`, or with
+    // `rest`, below where the cutter rests on the part.
+    let in_material = |p: Vec3| -> Result<bool> {
+        Ok(match rest {
+            None => p.z < h.top - TOL,
+            Some(f) => f(xy(p))?.is_some_and(|z| p.z < z - TOL),
+        })
+    };
     if path.moves.len() > MAX_MOVES {
         return Err(CamError::TooLarge(format!("the toolpath has more than {MAX_MOVES} moves")));
     }
@@ -115,7 +192,7 @@ pub fn verify(path: &Toolpath, h: &Heights) -> Result<()> {
                         return fail(i, "a rapid moves sideways below the retract height");
                     }
                     cut_here = None;
-                } else if to.z < h.retract - TOL && to.z < h.top - TOL && !cut_here.is_some_and(|z| to.z > z + 1e-9) && !swept.below(xy(to), to.z) {
+                } else if to.z < h.retract - TOL && !cut_here.is_some_and(|z| to.z > z + 1e-9) && !swept.below(xy(to), to.z) && in_material(to)? {
                     return fail(i, "a rapid goes down into material that has not been cut");
                 }
             }

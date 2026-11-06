@@ -504,7 +504,8 @@ fn check_block(
         }
     }
     if !tool.envelopes().is_empty() {
-        let hits = holder_collisions_in(obstacles, tool, &path, 0.0, 0.0, step, Moves::All)?;
+        // A shank no wider than the cutter may come as close as the cutter may (`tol`).
+        let hits = holder_collisions_in(obstacles, tool, &path, 0.0, tol, step, Moves::All)?;
         if let Some(h) = hits.iter().min_by(|a, b| a.distance.total_cmp(&b.distance)) {
             out.hit(RapidHit { line, operation: op, kind: RapidHitKind::Holder, depth: (-h.distance).max(0.0), at: h.pose.tip });
         }

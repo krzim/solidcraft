@@ -9,7 +9,7 @@ use solidcraft_cam::indexed::{IndexedOperation, frame_for_index};
 use solidcraft_cam::kinematics::Machine;
 use solidcraft_cam::rapids::{RAPID_STEP, check_rapids_staged, check_travel};
 use solidcraft_cam::stock::{FaceParams, Stock, default_face_overhang, default_face_stepover, face};
-use solidcraft_cam::{Frame, Heights, Toolpath};
+use solidcraft_cam::{Frame, Heights, Move5, Toolpath};
 
 use super::{Ctx, Planned, Surfaces, cam_err, finite_point, num, v3};
 use crate::Result;
@@ -46,6 +46,38 @@ pub(super) fn stock_of(cmd: &str, job: &CamJob, surfaces: &Surfaces, tol: f64, n
 }
 
 /// The stock as the reply shows it.
+/// Fails each operation whose lowest cut goes below a box stock's bottom by more than `tol` on
+/// a machine without rotaries: below it are the parallels, the vise's floor or the table that
+/// hold the stock. The deepest point of every cutting move with the tool upright counts (a
+/// drill's point included); facing is refused earlier, when it is planned.
+pub(super) fn check_below_stock(planned: &[Planned], stock: &Stock, machine: &Machine, tol: f64, failures: &mut Vec<String>) {
+    let Stock::Box { min, .. } = *stock else { return };
+    if !machine.rotaries.is_empty() {
+        return;
+    }
+    for p in planned {
+        let lowest = p
+            .poses
+            .moves
+            .iter()
+            .filter_map(|m| match m {
+                Move5::Feed { to, .. } if to.axis.z >= 1.0 - 1e-9 => Some(to.tip.z),
+                _ => None,
+            })
+            .fold(f64::INFINITY, f64::min);
+        if lowest.is_finite() && lowest < min.z - tol {
+            failures.push(format!(
+                "below the stock: operation `{}` cuts down to Z{}, {} mm below the stock's bottom (Z{}), into what holds the stock                  (parallels, the vise's floor or the table): raise its bottom to Z{} or above, or give a stock that reaches as deep as                  the cut (set on a spoil board or on parallels clear of the cut)",
+                p.report.name,
+                num(lowest),
+                num(min.z - lowest),
+                num(min.z),
+                num(min.z)
+            ));
+        }
+    }
+}
+
 pub(super) fn stock_report(stock: &Stock) -> StockReport {
     match *stock {
         Stock::Box { min, max } => {

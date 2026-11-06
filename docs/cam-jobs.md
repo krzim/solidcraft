@@ -339,7 +339,7 @@ written.
 | --- | --- |
 | `simple` | Feed from the R height to the bottom, rapid out to R. |
 | `dwell` | The same, with a pause of `dwell_seconds` at the bottom. |
-| `peck` | Feed `peck` deeper at a time, counted from `top` (the last peck ends at the bottom); after each peck rapid right out to R, then rapid back down to `peck_clearance` above the depth reached. |
+| `peck` | Feed `peck` deeper at a time, counted from `top` (the last peck ends at the bottom; a last peck shorter than a tenth of `peck` is merged into the one before); after each peck rapid right out to R, then rapid back down to `peck_clearance` above the depth reached. |
 | `chip_break` | Feed `peck` deeper at a time; after each peck rapid back `back_off` (staying in the hole) to break the chip, then feed on. |
 
 **Depth.** `bottom` is where the tip goes. With `to_full_diameter: true` it is where the drill

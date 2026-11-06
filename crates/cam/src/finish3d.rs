@@ -926,7 +926,7 @@ impl Plan<'_> {
                 }
             }
         }
-        out.finish()
+        out.finish_over(&self.field)
     }
 }
 

@@ -1172,11 +1172,14 @@ fn facing_a_box_stock_enters_beside_it_and_reads_back() {
 }
 
 /// A finish whose retract height is below the stock's top rapids through the stock: refused.
-/// A machine whose travel ends below the clearance height: refused, naming the line.
+/// (Its passes all run one way, so it lifts to the retract height and crosses there between
+/// them; its ways down stop above the stock's top.) A machine whose travel ends below the
+/// clearance height: refused, naming the line.
 #[test]
 fn rapids_through_the_stock_and_beyond_the_travel_are_refused() {
     let mut s = dome();
     let mut job = dome_job();
+    job["operations"][0]["zigzag"] = json!(false);
     job["stock"] = json!({"box": {"min": [-20, -20, -20], "max": [20, 20, 18]}});
     let e = s.execute("cam.job", &json!({"job": job, "output": Dir::new("stock").file("d.tap")})).unwrap_err();
     assert!(e.to_string().contains("through the stock"), "{e}");
@@ -1312,8 +1315,9 @@ fn facing_down_into_the_stock_or_below_it_is_refused() {
 }
 
 /// Faced all over from Z 0 down to the block's top at -1, the stock is lower for the pocket
-/// after it: the pocket's retract height of -0.5, below the stock's first top, is above what is
-/// left. Without the face, or with a face over half the top, its rapids run through the stock.
+/// after it: the pocket's clearance and retract heights, -0.4 and -0.5, below the stock's first
+/// top, are above what is left. Without the face, or with a face over half the top, its rapids
+/// across at the clearance height run through the stock.
 #[test]
 fn rapids_after_a_face_are_held_against_the_faced_stock() {
     let mut s = Session::default();
@@ -1321,7 +1325,7 @@ fn rapids_after_a_face_are_held_against_the_faced_stock() {
     run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 1, "corner": [-5, -5, -2], "operation": "cut"}));
     let face = json!({"name": "face", "type": "face", "tool": 1, "bottom": -1, "stepdown": 0.5});
     let pocket = json!({"name": "pocket", "type": "pocket", "tool": 2, "polygon": [[-5, -5], [5, -5], [5, 5], [-5, 5]],
-                        "heights": {"clearance": 5, "retract": -0.5, "top": -1, "bottom": -2}, "stepover": 2});
+                        "heights": {"clearance": -0.4, "retract": -0.5, "top": -1, "bottom": -2}, "stepover": 2});
     let job = |ops: Value| {
         json!({"job": {
             "machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 10.0), flat(2, 4.0)],
@@ -2705,13 +2709,15 @@ fn the_simulation_runs_on_a_4th_axis() {
     assert_eq!(sim["gouge"]["cells"], 0, "{sim}");
     assert!(sim["leftover"]["max"].as_f64().is_some_and(|m| m < 0.01), "the stock is the bar itself: {sim}");
     // The block is cut from round bar through its corners (radius 15√2 ≈ 21.2): the pocket's
-    // retract at 20 is inside that bar, so its rapids there cut material.
+    // retract at 20 is inside that bar, but its ways down stop 1 mm above the bar (they used
+    // to stop at the retract height, cutting material at rapid), and it feeds from there.
     let mut s = pocketed_block();
     let r = run(&mut s, "cam.job", json!({"job": side_pocket_job(), "dry_run": true, "simulate": true}));
     let sim = &r["simulation"];
     assert!((sim["stock"]["radius"].as_f64().unwrap() - 15.0 * 2f64.sqrt()).abs() < 1e-6, "{sim}");
-    assert_eq!(r["passed"], false, "{r}");
-    assert!(sim["rapids_in_material"].as_array().is_some_and(|r| !r.is_empty()), "{sim}");
+    assert_clean(&r);
+    assert!(sim["rapids_in_material"].as_array().is_some_and(Vec::is_empty), "{sim}");
+    assert!(r["program_head"].as_array().unwrap().iter().any(|l| l == "G0 Z22.2132"), "{r}");
     assert_eq!(sim["gouge"]["cells"], 0, "{sim}");
     // Retracting outside the bar it passes.
     let mut job = side_pocket_job();
@@ -3242,7 +3248,13 @@ fn every_example_in_the_cam_jobs_doc_is_accepted() {
     assert!(blocks.len() >= 2, "{blocks:?}");
     let mut jobs = 0;
     for block in blocks {
-        let v: Value = serde_json::from_str(block).unwrap_or_else(|e| panic!("{e}: {block}"));
+        // A block of a job's keys alone is read inside braces.
+        let v: Value = serde_json::from_str(block)
+            .or_else(|_| serde_json::from_str::<Value>(&format!("{{{block}}}")).map(|_| json!({})))
+            .unwrap_or_else(|e| panic!("{e}: {block}"));
+        if v.as_object().is_some_and(serde_json::Map::is_empty) {
+            continue;
+        }
         if v.get("operations").is_some() {
             serde_json::from_value::<crate::schema::cam::CamJob>(v.clone()).unwrap_or_else(|e| panic!("{e}: {block}"));
             // Planned on a part with a built-in post in place of the example's post file.
@@ -3254,6 +3266,12 @@ fn every_example_in_the_cam_jobs_doc_is_accepted() {
             let r = pocketed_block().execute("cam.job", &json!({"job": job.clone(), "dry_run": true})).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(r["operations"].as_array().map(Vec::len), job["operations"].as_array().map(Vec::len), "{r}");
             jobs += 1;
+        } else if v.get("path").is_some() {
+            // `cam.simulate`'s parameters.
+            serde_json::from_value::<crate::schema::cam_sim::CamSimulateParams>(v).unwrap_or_else(|e| panic!("{e}: {block}"));
+        } else if v.get("type").is_some() {
+            // One operation of a job.
+            serde_json::from_value::<crate::schema::cam::OperationSpec>(v).unwrap_or_else(|e| panic!("{e}: {block}"));
         } else {
             serde_json::from_value::<crate::schema::cam::CamJobParams>(v).unwrap_or_else(|e| panic!("{e}: {block}"));
         }
@@ -3273,4 +3291,54 @@ fn every_example_in_the_cam_jobs_doc_is_accepted() {
     job["operations"][0].as_object_mut().unwrap().remove("name");
     let e = dome().execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
     assert!(e.to_string().contains("needs a `name`"), "{e}");
+}
+
+/// Below the stock's bottom are the parallels, the vise's floor or the table that hold it: a
+/// contour cut through past the bottom, or holes drilled past it, are refused naming the
+/// operation, how deep and the fix (it used to be checked for `face` alone). Down to the bottom
+/// is fine, and without a stock nothing says where the bottom is.
+#[test]
+fn cutting_below_the_stocks_bottom_is_refused_for_every_operation() {
+    let mut s = drilled_plate(20.0);
+    let stock = json!({"box": {"min": [-35, -25, -20], "max": [35, 25, 0]}});
+    let contour = |bottom: f64| {
+        json!({
+            "name": "outline", "type": "contour", "tool": 1, "polygon": [[-30, -20], [30, -20], [30, 20], [-30, 20]],
+            "heights": {"clearance": 15, "retract": 2, "top": 0, "bottom": bottom}, "stepdown": 5
+        })
+    };
+    let holes = |bottom: f64| {
+        json!({
+            "name": "holes", "type": "drill", "tool": 3, "sketch": "Holes", "diameter_range": [5, 7],
+            "heights": {"clearance": 15, "retract": 2, "top": 0, "bottom": bottom}
+        })
+    };
+    let job = |ops: Value, stock: Option<&Value>| {
+        let mut j = json!({"machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 6.0), drill_tool(3, 6.0)], "operations": ops});
+        if let Some(st) = stock {
+            j["stock"] = st.clone();
+        }
+        json!({"job": j, "dry_run": true})
+    };
+    let below = |r: &Value| -> Vec<String> {
+        r["failures"].as_array().unwrap().iter().filter_map(Value::as_str).filter(|f| f.starts_with("below the stock")).map(str::to_string).collect()
+    };
+    let r = run(&mut s, "cam.job", job(json!([contour(-21.0), holes(-22.5)]), Some(&stock)));
+    let found = below(&r);
+    assert_eq!(found.len(), 2, "{r}");
+    assert!(found[0].contains("`outline`") && found[0].contains("1 mm below") && found[0].contains("Z-20"), "{found:?}");
+    assert!(found[1].contains("`holes`") && found[1].contains("2.5 mm below"), "{found:?}");
+    assert!(found.iter().all(|f| f.contains("raise")), "{found:?}");
+    assert_eq!(r["passed"], false, "{r}");
+    // Without a dry run it is refused, nothing written.
+    let mut refused = job(json!([contour(-21.0)]), Some(&stock));
+    refused["dry_run"] = json!(false);
+    refused["output"] = json!(solidcraft_io::vfs::temp_dir().join("never-written.tap").to_string_lossy());
+    let e = s.execute("cam.job", &refused).unwrap_err();
+    assert!(e.to_string().contains("below the stock") && e.to_string().contains("outline"), "{e}");
+    // Down to the bottom, and without a stock: no such failure.
+    let r = run(&mut s, "cam.job", job(json!([contour(-20.0), holes(-20.0)]), Some(&stock)));
+    assert!(below(&r).is_empty(), "{r}");
+    let r = run(&mut s, "cam.job", job(json!([contour(-21.0), holes(-22.5)]), None));
+    assert!(below(&r).is_empty(), "{r}");
 }

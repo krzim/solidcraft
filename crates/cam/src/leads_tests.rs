@@ -672,3 +672,49 @@ fn the_entry_decides_whether_a_face_mill_may_pocket_or_contour() {
         assert!(e.to_string().contains(why), "{:?}: {e}", t.kind);
     }
 }
+
+/// The depths of the cuts that run level on the wall (`d` out from the rectangle), highest first.
+fn levels_on_wall(path: &Toolpath, d: f64) -> Vec<f64> {
+    let mut pos: Option<Vec3> = None;
+    let mut zs: Vec<f64> = Vec::new();
+    for m in &path.moves {
+        if let (Some(a), Move::Feed { to, .. } | Move::Arc { to, .. }) = (pos, *m)
+            && (a.z - to.z).abs() < 1e-9
+            && (outside_rect(v(to.x, to.y), 0.0, 0.0, 40.0, 30.0) - d).abs() < 1e-6
+            && !zs.iter().any(|z| (z - to.z).abs() < 1e-9)
+        {
+            zs.push(to.z);
+        }
+        pos = m.target().or(pos);
+    }
+    zs.sort_by(|a, b| b.total_cmp(a));
+    zs
+}
+
+/// A finishing pass takes its stepover off the whole wall below it: on a wall deeper than the
+/// tool's flutes it goes down in steps no deeper than the flutes, the last at the bottom (the
+/// wall above each step already finished at its offset); within the flutes, once at the
+/// bottom. A shank wider than the cutter would rub the finished wall above a step: refused.
+#[test]
+fn finishing_passes_deeper_than_the_flutes_step_down_within_them() {
+    let regions = [rect(0.0, 0.0, 40.0, 30.0)];
+    let c = cut(0.0, -30.0, 3.0);
+    let opts = ContourOptions { finish_passes: 1, finish_stepover: 0.25, spring_pass: true, ..ContourOptions::default() };
+    let short = Tool::new(1, ToolKind::FlatEndmill, 6.0, 12.0);
+    let path = contour_with(&regions, &short, &outside(true), &opts, &c, &never).unwrap();
+    // The finishing pass runs on the wall, 3 mm out (the spring pass again at the bottom).
+    assert_eq!(levels_on_wall(&path, 3.0), [-10.0, -20.0, -30.0]);
+    let (steep, _) = steepest(&path, 0.0);
+    assert!(steep <= PI / 2.0 + 1e-9);
+    // With flutes that reach the bottom, once at the bottom.
+    let long = Tool::new(1, ToolKind::FlatEndmill, 6.0, 35.0);
+    let path = contour_with(&regions, &long, &outside(true), &opts, &c, &never).unwrap();
+    assert_eq!(levels_on_wall(&path, 3.0), [-30.0]);
+    // A shank wider than the cutter.
+    let wide = Tool { shank_diameter: Some(8.0), stickout: Some(40.0), ..short.clone() };
+    let e = contour_with(&regions, &wide, &outside(true), &opts, &c, &never).unwrap_err();
+    assert!(e.to_string().contains("flutes") && e.to_string().contains("shank"), "{e}");
+    // The depth passes alone are not stepped this way (each is a stepdown deep).
+    let rough = ContourOptions::default();
+    assert!(contour_with(&regions, &short, &outside(true), &rough, &c, &never).is_ok());
+}

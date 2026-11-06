@@ -966,3 +966,47 @@ fn a_link_between_two_clear_points_rises_over_a_corner_between_them() {
     }
     assert!(worst <= 0.5 * tol + 1e-9, "the link is {worst} mm into the corner");
 }
+
+/// A parallel or waterline finish's `heights.top` may be below the part (a parallel finish does
+/// not use it): a rapid that stops above that top but inside the part is refused by the check
+/// against where the cutter rests on the part, which the plain check (at or above `top`) lets
+/// through. A finish over a dome with such a top is planned and passes it.
+#[test]
+fn a_finishing_rapid_is_held_to_the_part_not_to_the_top_height() {
+    // A dome whose top is at Z 6.
+    let s = sphere(Vec3::new(0.0, 0.0, -6.0), 12.0, 96);
+    let h = Heights { clearance: 30.0, retract: 15.0, top: -3.0, bottom: -4.0 };
+    let tool = ball(4.0);
+    let field = crate::surface_ops::Field::new(&s, &tool.cutter().unwrap(), 0.0, None, 0.01).unwrap();
+    let rest = |p: Vec2| field.rest(p);
+    let down_to = |z: f64| Toolpath {
+        moves: vec![
+            Move::Rapid { to: Vec3::new(0.0, 0.0, 30.0) },
+            Move::Rapid { to: Vec3::new(0.0, 0.0, 15.0) },
+            Move::Rapid { to: Vec3::new(0.0, 0.0, z) },
+            Move::Feed { to: Vec3::new(0.0, 0.0, z - 0.5), feed: 100.0 },
+            Move::Rapid { to: Vec3::new(0.0, 0.0, 30.0) },
+        ],
+    };
+    // Down at rapid to Z 2, 4 mm into the dome.
+    verify(&down_to(2.0), &h).unwrap();
+    let e = crate::check::verify_over(&down_to(2.0), &h, &rest).unwrap_err();
+    assert!(e.to_string().contains("material"), "{e}");
+    // Down to 1 mm above where the ball rests on its top.
+    crate::check::verify_over(&down_to(7.0), &h, &rest).unwrap();
+    // Parallel and waterline finishes with that top.
+    let path = parallel(&s, &tool, &ParallelParams { stepover: 1.0, ..par(h, rect(-8.0, -8.0, 8.0, 8.0)) }).unwrap();
+    crate::check::verify_over(&path, &h, &rest).unwrap();
+    let w = WaterlineParams {
+        heights: Heights { top: 5.0, ..h },
+        feeds: feeds(),
+        stepdown: 1.0,
+        boundary: rect(-14.0, -14.0, 14.0, 14.0),
+        stock_to_leave: 0.0,
+        step: 0.5,
+        tolerance: 0.01,
+        climb: true,
+    };
+    let path = waterline(&s, &tool, &w).unwrap();
+    crate::check::verify_over(&path, &w.heights, &rest).unwrap();
+}

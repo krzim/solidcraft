@@ -57,7 +57,7 @@ mod tool;
 pub mod wrapped;
 
 pub use chamfer::{ChamferGeometry, ChamferParams, DEFAULT_TIP_OFFSET, chamfer, chamfer_geometry};
-pub use check::verify;
+pub use check::{lift_entries, verify};
 pub use compact::{Compaction, compact, limit_descents};
 pub use cutter::{Cone, Cutter};
 pub use dropcutter::{drop_along, drop_triangle, drop_z};

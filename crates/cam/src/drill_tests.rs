@@ -75,6 +75,11 @@ fn pecks_are_a_peck_apart_from_the_top_and_the_last_ends_at_the_bottom() {
     assert_eq!(peck_depths(0.0, -10.0, Some(3.0)).unwrap(), [-3.0, -6.0, -9.0, -10.0]);
     assert_eq!(peck_depths(0.0, -10.0, Some(2.5)).unwrap(), [-2.5, -5.0, -7.5, -10.0], "no sliver of a last peck");
     assert_eq!(peck_depths(0.0, -10.0, Some(12.0)).unwrap(), [-10.0]);
+    // A last peck of a hair (0.002 mm) is merged into the one before; a tenth of a peck or
+    // more is kept.
+    assert_eq!(peck_depths(0.0, -9.002, Some(3.0)).unwrap(), [-3.0, -6.0, -9.002]);
+    assert_eq!(peck_depths(0.0, -3.002, Some(3.0)).unwrap(), [-3.002]);
+    assert_eq!(peck_depths(0.0, -9.3, Some(3.0)).unwrap(), [-3.0, -6.0, -9.0, -9.3]);
     assert_eq!(peck_depths(5.0, 1.0, None).unwrap(), [1.0]);
     assert!(peck_depths(0.0, 0.0, Some(1.0)).is_err());
     assert!(peck_depths(0.0, 1.0, Some(1.0)).is_err());
