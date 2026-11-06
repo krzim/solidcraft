@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -50,20 +50,26 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.job", "CAM Job", crate::checked!("cam.job", job))
         .noundo()
         .contract(&JOB_CONTRACT)
-        .output(output_schema_for::<CamJobReply>)
+        .output(output_schema_for::<crate::schema::cam_agent::CamJobOutput>)
         .params(
-            "job: {…} | job_path: .json (the CAM job, docs/cam-jobs.md: name?, machine: \"3axis\" | \"4axis_a\" | Machine JSON, a_reversed?, \
+            "job: {…} | job_path: .json (the CAM job, docs/cam-jobs.md: profile_path?: a machine profile (machine, post, tool libraries, \
+             default heights and feeds; the job's keys win), name?, machine: \"3axis\" | \"4axis_a\" | Machine JSON, a_reversed?, \
              a_limits_deg?: [min, max], post: built-in name (cam.posts) | post_path: Post5 JSON file, work_offset?: 1-6, origin?: [x,y,z] \
              (the design point that is work zero; on a 4th axis the A axis is work X through it), bodies?: [names] (default every visible \
              body), fixtures?: [names] (checked against, never cut), tolerance?: mm (default 0.01; bodies are tessellated at half of it), \
-             tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | roughing | waterline | indexed \
-             {a_deg, operation} | rotary_finish | rotary_roughing | wrap, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
+             tools: [Tool JSON] | tool_library_path | tool_library_paths (+ tool_library to pick one), operations: [{name, type: contour | \
+             pocket | parallel | roughing | waterline | indexed {a_deg, operation} | rotary_finish | rotary_roughing | wrap, tool: number | \
+             {kind?, diameter?, max_diameter?, min_flute_length?, …} (the best match is picked), heights?: {clearance?, retract?, top?, \
+             bottom?} (left out: worked out from the part), spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
-             and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
+             and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails; compact?: a short reply \
+             (passed, failures with fixes, one line per operation, outputs, tools, total_minutes) →
              operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, warnings}], \
              program_lines, program_head, readback: {max_tip_deviation, max_axis_deviation_deg, allowed_tip, allowed_axis_deg, \
              cut_minutes, pass}, gouge: {worst, tolerance, hits, skipped, pass}, holder_collisions, passed, failures, dry_run, outputs: \
-             {gcode?, preview?}, notes. Without dry_run or allow_unsafe a failed check refuses and nothing is written",
+             {gcode?, preview?}, notes, failure_details: [{error, op: {index, name}, check, at: [x,y,z], line?, fix}], tool_choices, \
+             derived_heights. Without dry_run or allow_unsafe a failed check refuses and nothing is written; every refusal names the \
+             operation, check, place and a fix, and ends `refusals: [...]` (JSON)",
         ),
     CommandSpec::new("cam.posts", "CAM Posts", crate::checked!("cam.posts", posts))
         .noundo()
@@ -293,7 +299,10 @@ fn v3(p: [f64; 3]) -> Vec3 {
 /// The job's machine.
 fn machine_of(cmd: &str, job: &CamJob) -> Result<Machine> {
     let a_options = job.a_reversed.is_some() || job.a_limits_deg.is_some();
-    let machine = match &job.machine {
+    let Some(spec) = &job.machine else {
+        return Err(bad(cmd, "the job needs a `machine` (`3axis`, `4axis_a` or Machine JSON), a `machine_path` or a `profile_path` that gives one"));
+    };
+    let machine = match spec {
         MachineSpec::Preset(name) => match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "3axis" | "3_axis" | "three_axis" => {
                 if a_options {
@@ -552,30 +561,18 @@ struct Ctx<'a> {
     part: &'a Surface,
     origin: Vec3,
     tol: f64,
+    /// Profiles, defaults, tool picks and structured refusals (`cam_agent.rs`).
+    agent: &'a agent::Agent,
 }
 
 impl Ctx<'_> {
     fn bad(&self, op: &str, why: impl std::fmt::Display) -> EngineError {
+        self.agent.name_op(op);
         bad(self.cmd, format!("operation `{op}`: {why}"))
     }
 
     fn resolve(&self, c: &Common<'_>) -> Result<Resolved> {
-        let Some(tool) = self.tools.iter().find(|t| t.number == c.tool) else {
-            return Err(self.bad(c.name, format!("no tool number {}", c.tool)));
-        };
-        let rpm =
-            c.spindle_rpm.or(tool.spindle_rpm).ok_or_else(|| self.bad(c.name, format!("give `spindle_rpm` (tool {} has none)", tool.number)))?;
-        if !(rpm > 0.0 && rpm <= 200_000.0) {
-            return Err(self.bad(c.name, "the spindle speed must be above 0 and at most 200000 rev/min"));
-        }
-        let feeds = match (c.feeds, tool.feed, tool.plunge_feed) {
-            (Some(f), ..) => Feeds { cut: f.cut, plunge: f.plunge },
-            (None, Some(cut), Some(plunge)) => Feeds { cut, plunge },
-            (None, Some(cut), None) => Feeds { cut, plunge: cut },
-            _ => return Err(self.bad(c.name, format!("give `feeds` (tool {} has no feed)", tool.number))),
-        };
-        feeds.validate().map_err(|e| self.bad(c.name, e))?;
-        Ok(Resolved { tool: tool.clone(), rpm, feeds })
+        agent::resolve(self, c, None)
     }
 
     fn tolerance(&self, op: &str, t: Option<f64>) -> Result<f64> {
@@ -645,50 +642,59 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
     match op {
         Op3Spec::Contour(o) => {
             let c = o.common();
-            let r = ctx.resolve(&c)?;
             let regions = ctx.regions(c.name, o.sketch.as_ref(), o.profiles.as_deref(), o.polygon.as_deref(), frame)?;
-            let cut = Cut { heights: heights(&o.heights), feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
+            let side = match o.side.unwrap_or(SideSpec::Outside) {
+                SideSpec::Outside => Side::Outside,
+                SideSpec::Inside => Side::Inside,
+                SideSpec::On => Side::On,
+            };
+            let (leave, tol) = (o.stock_to_leave.unwrap_or(0.0), ctx.tolerance(c.name, o.tolerance)?);
+            let fit = |t: &Tool| agent::fits(&regions, t, leave, tol);
+            let r = agent::resolve(ctx, &c, if side == Side::Inside { Some(&fit) } else { None })?;
+            let region = if side == Side::Outside { agent::Region::Part } else { agent::Region::Floor(&regions) };
+            let h = agent::heights(ctx, c.name, o.heights.as_ref(), region, frame, tol)?;
+            let cut = Cut { heights: h, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
             let params = ContourParams {
-                side: match o.side.unwrap_or(SideSpec::Outside) {
-                    SideSpec::Outside => Side::Outside,
-                    SideSpec::Inside => Side::Inside,
-                    SideSpec::On => Side::On,
-                },
+                side,
                 climb: o.climb.unwrap_or(true),
-                stock_to_leave: o.stock_to_leave.unwrap_or(0.0),
-                tolerance: ctx.tolerance(c.name, o.tolerance)?,
+                stock_to_leave: leave,
+                tolerance: tol,
                 ramp_angle: ctx.degrees(c.name, o.ramp_angle_deg.unwrap_or(0.0), "`ramp_angle_deg`")?,
             };
-            let path = contour(&regions, &r.tool, &params, &cut).map_err(|e| ctx.bad(c.name, e))?;
+            let path = contour(&regions, &r.tool, &params, &cut).map_err(|e| agent::fit_error(ctx, c.name, &regions, &r.tool, leave, tol, e))?;
             Ok((path, r, "contour"))
         }
         Op3Spec::Pocket(o) => {
             let c = o.common();
-            let r = ctx.resolve(&c)?;
             let regions = ctx.regions(c.name, o.sketch.as_ref(), o.profiles.as_deref(), o.polygon.as_deref(), frame)?;
-            let cut = Cut { heights: heights(&o.heights), feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
+            let (leave, tol) = (o.stock_to_leave.unwrap_or(0.0), ctx.tolerance(c.name, o.tolerance)?);
+            let fit = |t: &Tool| agent::fits(&regions, t, leave, tol);
+            let r = agent::resolve(ctx, &c, Some(&fit))?;
+            let h = agent::heights(ctx, c.name, o.heights.as_ref(), agent::Region::Floor(&regions), frame, tol)?;
+            let cut = Cut { heights: h, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
             let params = PocketParams {
                 stepover: or_tool(o.stepover, r.tool.stepover, r.tool.diameter * 0.4),
                 climb: o.climb.unwrap_or(true),
-                stock_to_leave: o.stock_to_leave.unwrap_or(0.0),
-                tolerance: ctx.tolerance(c.name, o.tolerance)?,
+                stock_to_leave: leave,
+                tolerance: tol,
                 ramp_angle: ctx.degrees(c.name, o.ramp_angle_deg.unwrap_or(0.0), "`ramp_angle_deg`")?,
             };
-            let path = pocket(&regions, &r.tool, &params, &cut).map_err(|e| ctx.bad(c.name, e))?;
+            let path = pocket(&regions, &r.tool, &params, &cut).map_err(|e| agent::fit_error(ctx, c.name, &regions, &r.tool, leave, tol, e))?;
             Ok((path, r, "pocket"))
         }
         Op3Spec::Parallel(o) => {
             let c = o.common();
             let r = ctx.resolve(&c)?;
+            let tol = ctx.tolerance(c.name, o.tolerance)?;
             let params = ParallelParams {
-                heights: heights(&o.heights),
+                heights: agent::heights(ctx, c.name, o.heights.as_ref(), agent::Region::Part, frame, tol)?,
                 feeds: r.feeds,
                 stepover: or_tool(o.stepover, r.tool.stepover, r.tool.diameter * 0.1),
                 angle: ctx.degrees(c.name, o.angle_deg.unwrap_or(0.0), "`angle_deg`")?,
                 boundary: ctx.boundary(c.name, o.boundary.as_ref())?,
                 stock_to_leave: o.stock_to_leave.unwrap_or(0.0),
                 step: o.step.unwrap_or(r.tool.diameter * 0.25),
-                tolerance: ctx.tolerance(c.name, o.tolerance)?,
+                tolerance: tol,
                 zigzag: o.zigzag.unwrap_or(true),
             };
             let path = parallel(surface, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
@@ -697,8 +703,9 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
         Op3Spec::Roughing(o) => {
             let c = o.common();
             let r = ctx.resolve(&c)?;
+            let tol = ctx.tolerance(c.name, o.tolerance)?;
             let params = RoughingParams {
-                heights: heights(&o.heights),
+                heights: agent::heights(ctx, c.name, o.heights.as_ref(), agent::Region::Part, frame, tol)?,
                 feeds: r.feeds,
                 stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5),
                 stepover: or_tool(o.stepover, r.tool.stepover, r.tool.diameter * 0.4),
@@ -706,7 +713,7 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
                 boundary: ctx.boundary(c.name, o.boundary.as_ref())?,
                 stock_to_leave: o.stock_to_leave.unwrap_or(0.25),
                 step: o.step.unwrap_or(r.tool.diameter * 0.25),
-                tolerance: ctx.tolerance(c.name, o.tolerance)?,
+                tolerance: tol,
                 zigzag: o.zigzag.unwrap_or(true),
             };
             let path = roughing(surface, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
@@ -715,14 +722,15 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
         Op3Spec::Waterline(o) => {
             let c = o.common();
             let r = ctx.resolve(&c)?;
+            let tol = ctx.tolerance(c.name, o.tolerance)?;
             let params = WaterlineParams {
-                heights: heights(&o.heights),
+                heights: agent::heights(ctx, c.name, o.heights.as_ref(), agent::Region::Part, frame, tol)?,
                 feeds: r.feeds,
                 stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.25),
                 boundary: ctx.boundary(c.name, o.boundary.as_ref())?,
                 stock_to_leave: o.stock_to_leave.unwrap_or(0.0),
                 step: o.step.unwrap_or(r.tool.diameter * 0.25),
-                tolerance: ctx.tolerance(c.name, o.tolerance)?,
+                tolerance: tol,
                 climb: o.climb.unwrap_or(true),
             };
             let path = waterline(surface, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
@@ -966,16 +974,9 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(bad(cmd, "`output` and `preview` must be different files"));
         }
     }
-    let (job, base): (CamJob, Option<PathBuf>) = match (params.job, &params.job_path) {
-        (Some(_), Some(_)) => return Err(bad(cmd, "give `job` or `job_path`, not both")),
-        (None, None) => return Err(bad(cmd, "give the `job` (an object) or a `job_path` (a .json file)")),
-        (Some(j), None) => (j, None),
-        (None, Some(path)) => {
-            let v = read_json(cmd, path, "job_path")?;
-            (parse(cmd, &v, &format!("job_path {path}"))?, Path::new(path).parent().map(Path::to_path_buf))
-        }
-    };
-    let base = base.as_deref();
+    let loaded = agent::load_job(cmd, p, &params)?;
+    let job: CamJob = loaded.job.clone();
+    let base = loaded.base.as_deref();
     if job.operations.is_empty() || job.operations.len() > MAX_OPERATIONS {
         return Err(bad(cmd, format!("a job has 1 to {MAX_OPERATIONS} operations")));
     }
@@ -1001,14 +1002,25 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let tools = tools_of(cmd, &job, base)?;
     let surfaces = surfaces_of(cmd, s, &job, origin, tol)?;
     let mut notes = surfaces.notes.clone();
+    notes.extend(loaded.notes.iter().cloned());
+    let geometry = agent::Geometry::of(s, &job, origin, &mut notes)?;
+    let agent = agent::Agent::new(cmd, &job, geometry, &loaded)?;
     if job.work_offset.is_some() && !post.base.writes_work_offset() {
         notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
     }
 
-    let ctx = Ctx { cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, origin, tol };
+    let ctx = Ctx { cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, origin, tol, agent: &agent };
     let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
-    for spec in &job.operations {
-        planned.push(plan(&ctx, spec, post.base.arc_tolerance)?);
+    let mut refused = Vec::new();
+    for (i, spec) in job.operations.iter().enumerate() {
+        agent.start(i);
+        match plan(&ctx, spec, post.base.arc_tolerance) {
+            Ok(p) => planned.push(p),
+            Err(e) => refused.push(agent.refusal_of(e)),
+        }
+    }
+    if !refused.is_empty() {
+        return Err(agent::refuse(cmd, "the job was not planned", &refused, "Nothing was written."));
     }
 
     let program = MachineProgram { name: name.clone(), operations: planned.iter().map(|p| p.op.clone()).collect(), work_offset: job.work_offset };
@@ -1017,9 +1029,11 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
 
     // Gouges and holder collisions, along every cutting move.
     let mut failures: Vec<String> = Vec::new();
+    let mut details = Vec::new();
+    let has_fixtures = job.fixtures.as_ref().is_some_and(|f| !f.is_empty());
     let mut gouge = GougeReport { tolerance: tol, ..GougeReport::default() };
     let mut holder_total: Option<usize> = None;
-    for p in &mut planned {
+    for (i, p) in planned.iter_mut().enumerate() {
         let step = (p.tool.radius() * 0.5).clamp(0.1, 2.0);
         let op = p.report.name.clone();
         if p.gouge_check {
@@ -1031,6 +1045,8 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
             gouge.hits += hits.len();
             if !hits.is_empty() {
                 failures.push(format!("gouge: operation `{op}` cuts up to {} mm into the part or a fixture along {} moves", num(worst), hits.len()));
+                let on_part = !has_fixtures || !matches!(gouges(&surfaces.part, &cutter, &p.poses, tol, step), Ok(h) if h.is_empty());
+                details.push(agent.gouge_refusal(i, p, &hits, on_part, &text, &machine));
             }
         } else {
             gouge.skipped.push(op.clone());
@@ -1044,6 +1060,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
             if !hits.is_empty() {
                 failures
                     .push(format!("holder: operation `{op}`: the tool's shank or holder touches the part or a fixture along {} moves", hits.len()));
+                details.push(agent.holder_refusal(i, p, &hits, &text, &machine));
             }
         }
     }
@@ -1067,15 +1084,15 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
                 num(readback.allowed_axis_deg)
             ),
         );
+        details.insert(0, agent::readback_refusal(&readback, &post));
     }
     let passed = failures.is_empty();
     if !passed && !dry_run && !allow_unsafe {
-        return Err(bad(
+        return Err(agent::refuse(
             cmd,
-            format!(
-                "nothing was written: {}. Fix the job, run it with `dry_run: true` to see the report, or pass `allow_unsafe: true`",
-                failures.join("; ")
-            ),
+            "nothing was written: checks failed",
+            &details,
+            "Fix the job, run it with `dry_run: true` to see the report, or pass `allow_unsafe: true`.",
         ));
     }
 
@@ -1099,7 +1116,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
             outputs.preview = Some(path.clone());
         }
     }
-    let reply = CamJobReply {
+    let mut reply = CamJobReply {
         name,
         machine: machine.name.clone(),
         post: post_name,
@@ -1115,8 +1132,11 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         outputs,
         notes,
         param_warnings: Vec::new(),
+        failure_details: details,
+        ..CamJobReply::default()
     };
-    serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
+    agent.finish(&mut reply);
+    agent::reply_value(reply, params.compact.unwrap_or(false))
 }
 
 /// `text` safe to put inside HTML.
@@ -1364,6 +1384,8 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
 
+#[path = "cam_agent.rs"]
+mod agent;
 #[cfg(test)]
 #[path = "cam_tests.rs"]
 mod tests;

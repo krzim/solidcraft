@@ -3916,3 +3916,21 @@ fn compact_output_follows_the_apps_preference() {
     let mut s = Server::new(app(vec![not_running])).with_options(crate::Options { compact: true });
     assert!(inspect_design_is_compact(&mut s));
 }
+
+/// A refused `cam.job` returns every refusal's operation, check, place and fix as structured
+/// content, alone and as a batch step.
+#[test]
+fn a_refused_cam_job_returns_its_refusals_as_structured_content() {
+    let mut s = server();
+    tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20, "corner": [-20, -15, 0]}}));
+    let job = json!({"machine": "3axis", "post": "mach3", "tools": [{"number": 4, "kind": "flat_endmill", "diameter": 4, "flute_length": 12, "spindle_rpm": 12000, "feed": 800}],
+        "operations": [{"name": "p", "type": "pocket", "tool": 7, "polygon": [[-8, -5], [8, -5], [8, 5], [-8, 5]]}]});
+    let params = json!({"job": job, "dry_run": true});
+    let r = raw_tool(&mut s, "execute", json!({"command": "cam.job", "params": params}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let refusal = &r["result"]["structuredContent"]["cam_refusals"][0];
+    assert_eq!((refusal["op"]["index"].as_u64(), refusal["check"].as_str()), (Some(0), Some("tool")), "{r}");
+    assert!(refusal["fix"].as_str().is_some_and(|f| f.contains("4 (4 mm flat end mill)")), "{r}");
+    let r = raw_tool(&mut s, "batch", json!({"commands": [{"command": "cam.job", "params": params}]}));
+    assert_eq!(r["result"]["structuredContent"]["cam_refusals"][0]["check"], "tool", "{r}");
+}

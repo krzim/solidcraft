@@ -168,3 +168,88 @@ rotary letter's lowest and highest angle), `bounds` and `errors` (the first line
 cannot read). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
 elsewhere are read on a best-effort basis and stop at the first block it cannot follow
 (incremental coordinates, for one).
+
+## Profiles, defaults and refusals
+
+These are what let an agent (or a person) go from a modelled part to checked G-code in one or
+two calls: the machine's setup lives in a profile, the numbers that follow from the part are
+worked out from it, and every refusal says what to change.
+
+```json
+{"job": {"profile_path": "C:/cam/profiles/mill-3axis.profile.json",
+         "operations": [{"name": "pocket", "type": "pocket", "tool": {"kind": "flat_endmill", "max_diameter": 6},
+                         "polygon": [[-10, -6], [10, -6], [10, 6], [-10, 6]]}]},
+ "output": "C:/cam/part.tap", "compact": true}
+```
+
+### Profiles
+
+`profile_path` names a JSON file with what every job on one machine shares. Its keys are a
+job's (`machine` or `machine_path`, `a_reversed`, `a_limits_deg`, `post` or `post_path`,
+`work_offset`, `tolerance`, `origin`, `fixtures`, `tools`, `tool_library_path`,
+`tool_library_paths`, `tool_library`, `default_heights`, `default_feeds`) plus `name` and
+`description`, which are not written anywhere; it refuses keys it does not know. Relative paths
+in it are read from its own folder; a relative `profile_path` in a job file from the job's.
+
+The job's own keys win: a job's `machine` or `machine_path` replaces the profile's machine and
+its A-axis options, a job's `post` or `post_path` the profile's post, and a job's `tools`,
+`tool_library_path` or `tool_library_paths` its tools. `default_heights` and `default_feeds` are
+merged key by key.
+
+| Key | Meaning |
+| --- | --- |
+| `machine_path` | The machine as a `Machine` JSON file (a job may give it too). |
+| `tool_library_paths` | Several tool library files. A tool number found in two of them with different tools is refused with the clashing numbers listed, unless the job picks one library with `tool_library` (its path, file name, or file name without `.json`). The same tool in two libraries is no clash. A library tool this build cannot read (a kind or key it does not know) is left out with a note, and an operation that asks for its number is told why. |
+| `default_heights` | `{clearance_above, retract_above}` (10 and 2 mm): how far above the part the heights an operation leaves out go. |
+| `default_feeds` | `{cut_scale?, plunge_scale?, max_cut?, max_plunge?, spindle_rpm_range?: [min, max], fallback?: {cut, plunge, spindle_rpm}}`. A tool's feeds are scaled (0.05 to 2) and then held to the limits, and the reply's notes say so; an operation's own `feeds` or `spindle_rpm` beyond a limit is refused. `fallback` is for tools without cutting data. |
+
+### Heights worked out from the part
+
+A `contour`, `pocket`, `parallel`, `roughing` or `waterline` (also inside `indexed`) may leave
+`heights` out, or any of its four keys. In the operation's frame:
+
+- `top`: the part's top, from the bodies' exact boxes. In an indexed frame whose axes are not
+  along the design's, the box's corners are turned into the frame, which puts `top` at or
+  above the part.
+- `bottom`: for a `pocket` and an `inside` or `on` contour, the lowest floor of the part inside
+  the profiles: the exact B-rep is classified down columns spread over the region (flat floors
+  found exactly at their face's height, curved ones within a quarter of the tolerance, from
+  above), and the part's bottom where the region goes through the part. For an `outside`
+  contour and the 3D operations, the part's bottom. A region where the part is solid up to
+  the top is refused: there is nothing to cut.
+- `retract`: `top` + `default_heights.retract_above` (2).
+- `clearance`: the higher of `top`, the part's top and the fixtures' top, plus
+  `default_heights.clearance_above` (10), and at least `retract`.
+
+The reply's `derived_heights` lists each such operation's heights, which were worked out and
+from what. Given or worked out, a clearance at or below the part's or fixtures' top is refused
+when that top is exact.
+
+### Tools by what they are
+
+An operation's `tool` may be `{kind?, diameter?, max_diameter?, min_diameter?,
+min_flute_length?, min_stickout?}` instead of a number. The tools that meet every key match (with
+no `kind`, any tool but a drill); a `pocket` or an `inside` contour also needs the tool to fit its
+profiles. Of the matches, one of exactly `diameter` if given, else the largest diameter, then the
+shortest flutes, then the lowest number is picked. The reply's `tool_choices` gives every
+operation's tool and why (`given by number`, or the rule and the other matches).
+
+### Refusals
+
+Every refusal names the operation (its index in `operations`, from 0, and its name), the check
+(`heights`, `clearance`, `tool`, `feeds`, `fit`, `region`, `plan`, `gouge`, `holder`, `readback`,
+`tools`), the place in work coordinates and the program line when there is one, and a fix: the
+widest tool that fits a pocket, the clearance that clears the part, the stickout a holder
+collision needs, the library to pick on a tool-number clash. All the operations are planned
+before a refusal, so one call reports every operation that cannot be planned. The message has a
+line per problem and ends with `refusals: ` and the same as JSON,
+`[{error, op: {index, name} | null, check, at: [x, y, z] | null, line?, fix}]`; the MCP server
+returns it as the error's `structuredContent.cam_refusals`. A dry run's reply has them as
+`failure_details`.
+
+### Compact replies
+
+`compact: true` replies `{compact: true, passed, dry_run, failures, operations, tools,
+total_minutes, program_lines, outputs}`: the failures with their fixes, one line per operation
+(index, name, kind, tool, moves, minutes, heights worked out, gouges, warnings), every
+operation's tool and why, and the program's time at feed as the controller times it.

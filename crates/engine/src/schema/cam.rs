@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::cam_agent::{DerivedHeights, FeedsPolicy, HeightsInput, HeightsPolicy, Refusal, ToolChoice, ToolRef};
 use super::types::SketchRef;
 
 /// Plan and check a CAM job and write its G-code: toolpaths for every operation on the design's
@@ -43,6 +44,10 @@ pub struct CamJobParams {
     /// which). Default: false.
     #[serde(default)]
     pub allow_unsafe: Option<bool>,
+    /// Reply with only what an agent needs: passed, the failures with their fixes, one line per
+    /// operation, the outputs, the tools and the total minutes. Default: false.
+    #[serde(default)]
+    pub compact: Option<bool>,
 }
 
 /// A CAM job: what is machined, on which machine, through which post, with which tools.
@@ -52,9 +57,17 @@ pub struct CamJob {
     /// The program's name, written in its header. Default: the design's name.
     #[serde(default)]
     pub name: Option<String>,
+    /// A machine profile (docs/cam-jobs.md): a JSON file with the machine, post, tool libraries,
+    /// work offset, tolerance and default heights and feeds; the job's own keys win.
+    #[serde(default)]
+    pub profile_path: Option<String>,
     /// `3axis`, `4axis_a` (a rotary table about +X, the A axis, through work zero), or a whole
-    /// machine as the CAM crate's `Machine` JSON.
-    pub machine: MachineSpec,
+    /// machine as the CAM crate's `Machine` JSON. Required unless the profile gives it.
+    #[serde(default)]
+    pub machine: Option<MachineSpec>,
+    /// The machine as a `Machine` JSON file. Give this or `machine`.
+    #[serde(default)]
+    pub machine_path: Option<String>,
     /// With `4axis_a`: the controller's positive A turns the table the other way. Default: false.
     #[serde(default)]
     pub a_reversed: Option<bool>,
@@ -95,6 +108,20 @@ pub struct CamJob {
     /// A JSON file holding an array of tools, as `tools`.
     #[serde(default)]
     pub tool_library_path: Option<String>,
+    /// Several tool library files. A number in two of them with different tools is refused
+    /// unless `tool_library` picks one.
+    #[serde(default)]
+    pub tool_library_paths: Option<Vec<String>>,
+    /// Which of `tool_library_paths` (the job's or its profile's) the tools come from: its path,
+    /// file name, or file name without `.json`.
+    #[serde(default)]
+    pub tool_library: Option<String>,
+    /// How far above the part heights left out of an operation go.
+    #[serde(default)]
+    pub default_heights: Option<HeightsPolicy>,
+    /// Feeds and speeds of operations and tools that give none, and the machine's limits.
+    #[serde(default)]
+    pub default_feeds: Option<FeedsPolicy>,
     /// The operations, run and written in this order.
     pub operations: Vec<OperationSpec>,
 }
@@ -187,8 +214,9 @@ macro_rules! operation {
         pub struct $name {
             /// The operation's name, written as a comment in the program.
             pub name: String,
-            /// The `number` of the tool it cuts with.
-            pub tool: u32,
+            /// The `number` of the tool it cuts with, or what the tool must be (`{kind?,
+            /// diameter?, max_diameter?, min_diameter?, min_flute_length?, min_stickout?}`).
+            pub tool: ToolRef,
             /// Spindle speed, rev/min. Default: the tool's `spindle_rpm`.
             #[serde(default)]
             pub spindle_rpm: Option<f64>,
@@ -210,7 +238,7 @@ macro_rules! operation {
             pub fn common(&self) -> Common<'_> {
                 Common {
                     name: &self.name,
-                    tool: self.tool,
+                    tool: &self.tool,
                     spindle_rpm: self.spindle_rpm,
                     feeds: self.feeds,
                     coolant: self.coolant.unwrap_or(false),
@@ -225,7 +253,7 @@ macro_rules! operation {
 #[derive(Clone, Copy, Debug)]
 pub struct Common<'a> {
     pub name: &'a str,
-    pub tool: u32,
+    pub tool: &'a ToolRef,
     pub spindle_rpm: Option<f64>,
     pub feeds: Option<FeedsSpec>,
     pub coolant: bool,
@@ -245,8 +273,9 @@ operation! {
         /// One closed polygon [[x, y], ...] in the operation's XY.
         #[serde(default)]
         pub polygon: Option<Vec<[f64; 2]>>,
-        /// The Z levels.
-        pub heights: HeightsSpec,
+        /// The Z levels. Default: worked out from the part.
+        #[serde(default)]
+        pub heights: Option<HeightsInput>,
         /// Most depth per pass, mm. Default: the tool's `stepdown`, else half its diameter.
         #[serde(default)]
         pub stepdown: Option<f64>,
@@ -281,8 +310,9 @@ operation! {
         /// One closed polygon [[x, y], ...] in the operation's XY.
         #[serde(default)]
         pub polygon: Option<Vec<[f64; 2]>>,
-        /// The Z levels.
-        pub heights: HeightsSpec,
+        /// The Z levels. Default: worked out from the part.
+        #[serde(default)]
+        pub heights: Option<HeightsInput>,
         /// Most depth per pass, mm. Default: the tool's `stepdown`, else half its diameter.
         #[serde(default)]
         pub stepdown: Option<f64>,
@@ -308,8 +338,9 @@ operation! {
 operation! {
     /// 3D raster finishing: passes side by side following the part's surface.
     ParallelOp {
-        /// The Z levels: `bottom` is the floor, `top` is not used.
-        pub heights: HeightsSpec,
+        /// The Z levels: `bottom` is the floor, `top` is not used. Default: worked out from the part.
+        #[serde(default)]
+        pub heights: Option<HeightsInput>,
         /// Distance between passes, mm. Default: the tool's `stepover`, else 10% of its diameter.
         #[serde(default)]
         pub stepover: Option<f64>,
@@ -338,8 +369,9 @@ operation! {
 operation! {
     /// 3D roughing of a stock box in levels, staying `stock_to_leave` clear of the part.
     RoughingOp {
-        /// The Z levels: `top` is the stock's top, `bottom` the lowest level.
-        pub heights: HeightsSpec,
+        /// The Z levels: `top` is the stock's top, `bottom` the lowest level. Default: worked out from the part.
+        #[serde(default)]
+        pub heights: Option<HeightsInput>,
         /// Most material per level, mm. Default: the tool's `stepdown`, else half its diameter.
         #[serde(default)]
         pub stepdown: Option<f64>,
@@ -371,8 +403,9 @@ operation! {
 operation! {
     /// 3D z-level finishing: round the part at each level, for steep walls.
     WaterlineOp {
-        /// The Z levels: from `top` down to `bottom`, both included.
-        pub heights: HeightsSpec,
+        /// The Z levels: from `top` down to `bottom`, both included. Default: worked out from the part.
+        #[serde(default)]
+        pub heights: Option<HeightsInput>,
         /// Most distance between levels, mm. Default: the tool's `stepdown`, else a quarter of
         /// its diameter.
         #[serde(default)]
@@ -569,6 +602,18 @@ pub struct CamJobReply {
     /// In the warn parameter-check mode: what the call's parameters got wrong.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub param_warnings: Vec<String>,
+    /// Every failed check, with the operation, the place, the program line and a fix.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_details: Vec<Refusal>,
+    /// The tool of every operation, and why (a tool asked for by what it is: how it was picked).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_choices: Vec<ToolChoice>,
+    /// The heights of operations that left some out, as worked out from the part.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_heights: Vec<DerivedHeights>,
+    /// The profile the job was read with (`profile_path`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// One operation of a `cam.job` reply.

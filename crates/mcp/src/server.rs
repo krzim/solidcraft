@@ -56,6 +56,9 @@ back (volume, errors, cylinder axes), or change them in one `batch` with `coales
 then set them back the same way before saving.\n\n\
 Fix, don't rebuild: a wrong number in a feature is changed with `timeline.edit` or `parameters.change` on its input \
 (`parameters.list {\"filter\":\"feature\"}` names them); `edit.checkpoint` and `edit.restore_checkpoint` go back exactly.\n\n\
+CAM: `cam.job` turns the modelled part into checked G-code (docs/cam-jobs.md: a `profile_path` brings the machine, post and \
+tools; heights left out are worked out from the part; a tool may be asked for as `{kind, diameter}`; `compact: true`); every \
+refusal names the operation, check, place and fix. `cam.posts` lists the posts, `cam.check` reads a G-code file.\n\n\
 A call whose error starts `still running:` was not cancelled: don't send it again; `pending` waits for its result.";
 
 pub struct Server {

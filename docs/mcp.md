@@ -479,6 +479,18 @@ IDs under `created` and omit only identical top-level `points`, `curves`,
 inspection commands still return their complete results. Compaction uses the
 engine's reply directly, without an additional design-inspection request.
 
+## CAM over MCP
+
+`execute` runs the CAM commands like any other: `cam.job` plans a job, checks it (read-back,
+gouges, holders) and writes the G-code, `cam.posts` lists the posts and `cam.check` reads a
+G-code file ([cam-jobs.md](cam-jobs.md)). For an agent the short route is a job with only
+`profile_path` (the machine, post and tool libraries) and `operations`, heights left out and tools
+asked for by what they are (`tool: {kind: "flat_endmill", max_diameter: 6}`), run with
+`dry_run: true, compact: true` first. A refused `cam.job` names, for every problem, the
+operation (index and name), the check, the place in work coordinates, the program line and a fix;
+the tool result carries them as `structuredContent.cam_refusals`
+(`[{error, op: {index, name}, check, at, line?, fix}]`).
+
 ## Demo: an enclosure built over MCP
 
 `examples/demo/enclosure_mcp.py` is a small MCP client. It drives a running app (`solidcraft
