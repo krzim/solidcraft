@@ -220,9 +220,11 @@ frame, so the tool is placed at points along each block (every axis moving evenl
 close enough that the cusps between them are at most half the tolerance: at most √(4·r·tol)
 apart for a tool with corner radius r (a ball's is its radius), √(4·R·tol) for a flat end mill of
 radius R, tol / slope for a drill point, counting both the tip's travel and the cutting end's as
-the axis turns. At each point every ray near the tool is cut where it first enters the tool. A
-ray the tool crosses without reaching out to its end loses the material beyond too: the model
-never removes less than the tool, so no gouge is hidden.
+the axis turns. At each point every ray near the tool is cut where it first enters the tool,
+when the tool reaches out of the material along it. A ray holds one stretch of material, so a cut
+that crosses a ray inside the material without reaching out of it (an indexed pocket in the
+part's side does this to the rays at a slant through it) is left out of that ray and counted in
+a warning; `cam.job`'s own gouge check, against the exact cutter, still covers those cuts.
 
 **Against the part.** Each cell's part height (or radius) is where a ray from above (from
 outside) first meets the part's facets. A cell cut below the part by more than the tolerance is

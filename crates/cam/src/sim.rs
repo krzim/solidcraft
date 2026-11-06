@@ -22,9 +22,10 @@
 //!   as the axis turns), for a flat end mill √(4·R·tol) (the scallop its rim leaves sideways),
 //!   for a drill point tol / (its slope). At each point the ray of every cell near the tool is
 //!   cut where it first enters the tool (closed form for flat and ball, bisection for the
-//!   others). Where the tool would leave material further out along a ray (a cut beside the
-//!   ray rather than across it), the material beyond is taken as removed too: the model may
-//!   remove a little more than the tool does, never less, so a gouge is never hidden.
+//!   others). A ray holds one stretch of material, so a cut that crosses a ray inside the
+//!   material without reaching out of it (beside the ray, as an indexed pocket in the part's
+//!   side does to the rays at a slant through it) is left out of that ray, and counted in a
+//!   warning: that ray neither loses the material beyond the cut nor is checked for it.
 //!
 //! The tool is its cutting end with an endless cylinder of its diameter above (a cut deeper
 //! than the flutes still removes material). A block before which the position is not known
@@ -706,6 +707,9 @@ struct Radii {
     sin: Vec<f64>,
     cos: Vec<f64>,
     visits: Arc<AtomicU64>,
+    tol: f64,
+    /// Cells a tool position cut beside their ray, inside the material (not modelled).
+    tunnels: u64,
 }
 
 impl Radii {
@@ -773,6 +777,15 @@ impl Radii {
                 let cx = self.x0 + (i as f64 + 0.5) * self.dx;
                 if let Some(at) = p.ray_entry(cx - x, y, z, s, c, have) {
                     let at = at.max(0.0);
+                    // The tool must reach out to (within half the tolerance of) the material's
+                    // end along the ray: a cut that passes beside the ray inside the material
+                    // (an indexed feature in the side of the part) is not one dexel can hold.
+                    let outer = (have - 0.5 * self.tol).max(at);
+                    let d = hyp(cx - x, outer * s - y);
+                    if !(d <= p.radius + 1e-9 && outer * c >= z + p.height(d) - 1e-9) {
+                        self.tunnels += 1;
+                        continue;
+                    }
                     if at < have {
                         out.volume += (have * have - at * at) * area;
                         out.depth = out.depth.max(have - at);
@@ -854,7 +867,7 @@ impl Grid {
     }
 
     /// Rows (angles) `from..to` of the stock as it starts.
-    fn band(&self, from: usize, to: usize, visits: &Arc<AtomicU64>) -> Model {
+    fn band(&self, from: usize, to: usize, visits: &Arc<AtomicU64>, tol: f64) -> Model {
         let n = to.saturating_sub(from);
         match *self {
             Grid::Heights { x0, y0, dx, dy, nx, bottom, top, .. } => {
@@ -875,6 +888,8 @@ impl Grid {
                     sin,
                     cos,
                     visits: Arc::clone(visits),
+                    tol,
+                    tunnels: 0,
                 })
             }
         }
@@ -1104,18 +1119,18 @@ fn run_bands(grid: &Grid, steps: &[Step], machine: &Machine, part: &Surface, tol
     let range = |b: usize| (b * lines / bands, (b + 1) * lines / bands);
     if bands <= 1 {
         let (from, to) = range(0);
-        return Ok(vec![run_band(grid.band(from, to, &visits), steps, machine, part, tol, initial, refine)?]);
+        return Ok(vec![run_band(grid.band(from, to, &visits, tol), steps, machine, part, tol, initial, refine)?]);
     }
     std::thread::scope(|scope| {
         let mut pending = Vec::with_capacity(bands);
         for b in 0..bands {
             let (from, to) = range(b);
             let v = Arc::clone(&visits);
-            let job = move || run_band(grid.band(from, to, &v), steps, machine, part, tol, initial, refine);
+            let job = move || run_band(grid.band(from, to, &v, tol), steps, machine, part, tol, initial, refine);
             match std::thread::Builder::new().name(format!("cam-sim-{b}")).spawn_scoped(scope, job) {
                 Ok(h) => pending.push(Err(h)),
                 // No thread to be had: this band runs here.
-                Err(_) => pending.push(Ok(run_band(grid.band(from, to, &visits), steps, machine, part, tol, initial, refine))),
+                Err(_) => pending.push(Ok(run_band(grid.band(from, to, &visits, tol), steps, machine, part, tol, initial, refine))),
             }
         }
         pending
@@ -1297,6 +1312,14 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
     }
     if cmp.unrefined > 0 {
         warnings.push(format!("{} gouged cells were measured along Z (or the radius) only: too many to measure in 3D", cmp.unrefined));
+    }
+    let tunnels: u64 = runs.iter().map(|r| if let Model::Radii(m) = &r.model { m.tunnels } else { 0 }).sum();
+    if tunnels > 0 {
+        warnings.push(format!(
+            "{tunnels} times the tool cut beside a ray from the A axis without reaching out of the material along it (a feature in \
+             the side of the part): the round stock model leaves those cuts out, so they are not checked here (the job's gouge check \
+             covers them)"
+        ));
     }
     let stock_grid = match grid {
         Grid::Heights { x0, y0, dx, dy, nx, ny, bottom, top } => {
