@@ -190,7 +190,7 @@ fn check_stepover(stepover: f64, tool: &Tool) -> Result<()> {
     if stepover > 0.0 && stepover <= tool.diameter { Ok(()) } else { invalid("the stepover must be above 0 and at most the tool diameter") }
 }
 
-fn check_angle(angle: f64) -> Result<()> {
+pub(crate) fn check_angle(angle: f64) -> Result<()> {
     if finite_in(angle, -1000.0, 1000.0) { Ok(()) } else { invalid("the pass angle must be a finite number of radians") }
 }
 
@@ -444,29 +444,29 @@ pub(crate) fn spans(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Rect {
-    min: Vec2,
-    max: Vec2,
+pub(crate) struct Rect {
+    pub(crate) min: Vec2,
+    pub(crate) max: Vec2,
 }
 
 /// The region of a boundary as polylines, for fast containment.
-struct Fence {
+pub(crate) struct Fence {
     outer: Ring<Vec2>,
     holes: Vec<Ring<Vec2>>,
 }
 
 impl Fence {
-    fn new(region: &Region2, tol: f64) -> Fence {
+    pub(crate) fn new(region: &Region2, tol: f64) -> Fence {
         Fence { outer: region.outer.polyline(tol), holes: region.holes.iter().map(|h| h.polyline(tol)).collect() }
     }
 
-    fn contains(&self, p: Vec2) -> bool {
+    pub(crate) fn contains(&self, p: Vec2) -> bool {
         self.outer.contains(p) && !self.holes.iter().any(|h| h.contains(p))
     }
 }
 
 impl Boundary {
-    fn resolve(&self, surface: &Surface) -> Result<Rect> {
+    pub(crate) fn resolve(&self, surface: &Surface) -> Result<Rect> {
         let (min, max) = match self.rect {
             Some([a, b]) => (a, b),
             None => {
@@ -488,19 +488,19 @@ impl Boundary {
 }
 
 /// The surface seen by a vertical cutter: what is under it at each point of the plane.
-struct Field<'a> {
+pub(crate) struct Field<'a> {
     surface: &'a Surface,
     /// The cutter grown by the stock to leave.
-    cutter: Cutter,
+    pub(crate) cutter: Cutter,
     leave: f64,
     fence: Option<Fence>,
     budget: Budget,
     /// The longest stretch of a pass taken as straight ([`stretch_cap`]).
-    stretch: f64,
+    pub(crate) stretch: f64,
 }
 
 impl<'a> Field<'a> {
-    fn new(surface: &'a Surface, cutter: &Cutter, leave: f64, region: Option<&Region2>, tol: f64) -> Result<Field<'a>> {
+    pub(crate) fn new(surface: &'a Surface, cutter: &Cutter, leave: f64, region: Option<&Region2>, tol: f64) -> Result<Field<'a>> {
         let grown = cutter.grown(leave)?;
         Ok(Field {
             surface,
@@ -512,7 +512,7 @@ impl<'a> Field<'a> {
         })
     }
 
-    fn at(&self, p: Vec2) -> Result<Tip> {
+    pub(crate) fn at(&self, p: Vec2) -> Result<Tip> {
         if self.fence.as_ref().is_some_and(|f| !f.contains(p)) {
             return Ok(Tip::Out);
         }
@@ -544,7 +544,7 @@ impl<'a> Field<'a> {
     }
 
     /// Refuses a retract height a sideways rapid at it could hit the part from.
-    fn check_retract(&self, r: &Rect, retract: f64) -> Result<()> {
+    pub(crate) fn check_retract(&self, r: &Rect, retract: f64) -> Result<()> {
         match self.top(r) {
             Some(top) if retract < top - 1e-9 => {
                 invalid(format!("the retract height {retract} is below the top of the surface ({top}, stock to leave included)"))
@@ -661,7 +661,7 @@ fn raster(r: &Rect, angle: f64, stepover: f64, step: f64) -> Result<Vec<Line>> {
 }
 
 /// Collects moves, keeping where the tool is.
-struct Out3 {
+pub(crate) struct Out3 {
     moves: Vec<Move>,
     pos: Option<Vec3>,
     /// Whether the tool is down in the material at the end of a cut it may link on from.
@@ -671,7 +671,7 @@ struct Out3 {
 }
 
 impl Out3 {
-    fn new(h: Heights, feeds: Feeds) -> Out3 {
+    pub(crate) fn new(h: Heights, feeds: Feeds) -> Out3 {
         Out3 { moves: Vec::new(), pos: None, down: false, h, feeds }
     }
 
@@ -687,7 +687,7 @@ impl Out3 {
     }
 
     /// Straight up to the retract height, if below it.
-    fn lift(&mut self) -> Result<()> {
+    pub(crate) fn lift(&mut self) -> Result<()> {
         self.down = false;
         match self.pos {
             Some(q) if q.z < self.h.retract => self.push(Move::Rapid { to: Vec3::new(q.x, q.y, self.h.retract) }),
@@ -728,7 +728,7 @@ impl Out3 {
     /// allows and from above otherwise. Every move that goes down (a link, the tool stepping
     /// off the part's reach into the stock below, or following a wall down) is slowed by
     /// [`descent_feed`] so the tool never goes down faster than the plunge feed.
-    fn span(&mut self, pts: &[Vec3], link: &dyn Fn(Vec3, Vec3) -> Result<bool>) -> Result<()> {
+    pub(crate) fn span(&mut self, pts: &[Vec3], link: &dyn Fn(Vec3, Vec3) -> Result<bool>) -> Result<()> {
         let Some(&first) = pts.first() else { return Ok(()) };
         let from = self.pos.filter(|_| self.down);
         match from {
@@ -743,7 +743,7 @@ impl Out3 {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Toolpath> {
+    pub(crate) fn finish(mut self) -> Result<Toolpath> {
         if let Some(q) = self.pos
             && q.z < self.h.clearance
         {
@@ -761,7 +761,7 @@ impl Out3 {
 /// the tolerance, so a step in it between two samples (the edge of a part beside the passes)
 /// is found; the link must then be within the other half of every point of it. A link that
 /// needs more than [`MAX_LINK_SAMPLES`] points is not taken.
-fn link_clear(field: &Field, a: Vec3, b: Vec3, max_len: f64, spacing: f64, tol: f64) -> Result<bool> {
+pub(crate) fn link_clear(field: &Field, a: Vec3, b: Vec3, max_len: f64, spacing: f64, tol: f64) -> Result<bool> {
     let len = (a.x - b.x).hypot(a.y - b.y);
     if !(len <= max_len) {
         return Ok(false);

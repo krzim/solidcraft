@@ -149,6 +149,10 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `parallel` | `heights` (`bottom` is the floor); `stepover` (tool's, else 10% of its diameter); `angle_deg` (0); `boundary?: {rect?: [[x, y], [x, y]], polygon?}` (the part's extent); `stock_to_leave` (0); `step` (a quarter of the diameter); `tolerance`; `zigzag` (true) |
 | `roughing` | `heights` (`top` is the stock's top); `stepdown`; `stepover`; `angle_deg`; `boundary`; `stock_to_leave` (0.25); `step`; `tolerance`; `zigzag` |
 | `waterline` | `heights` (levels from `top` to `bottom`); `stepdown` (tool's, else a quarter of its diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` (true) |
+| `scallop` | `heights` (`bottom` is the floor); `scallop_height` or `stepover` (tool's, else 10% of its diameter; along the surface); `direction`: `inward` \| `outward` (inward); `boundary`; `stock_to_leave` (0); `step` (a tenth of the diameter: the grid and the samples); `tolerance`; `climb` (true). See "3D finishing strategies". |
+| `steep_shallow` | As `scallop`, with `threshold_deg` (40), `overlap` (a tenth of the diameter), `stepdown` (the spacing × sin threshold), `shallow`: `scallop` \| `parallel` (scallop), `angle_deg` (with `parallel`; 0) |
+| `pencil` | `heights`; `min_angle_deg` (30); `passes` (0: the crease alone); `stepover` (tool's, else 10% of its diameter); `min_length` (the tool's radius); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` |
+| `rest_finish` | `heights`; `previous_tool` (a tool number of the job); `threshold` (twice the tolerance); `scallop_height` or `stepover`; `overlap` (a quarter of the diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` |
 | `drill` | `sketch` (circle centres, `circles` (true), filtered by `diameter_range: [min, max]`, and lone points, `sketch_points` (true)) or `points: [[x, y], …]`; `heights` (`retract` is the R height, `top` the hole's top, `bottom` its depth); `cycle`: `simple` \| `dwell` \| `peck` \| `chip_break` (simple); `peck` (tool's stepdown, else its diameter); `peck_clearance` (0.5); `back_off` (0.5); `dwell_seconds` (0.5); `to_full_diameter` (false); `stay_at_retract` (false). See [Drilling](#drilling). |
 | `adaptive` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown` (tool's, else its diameter); `optimal_load` (tool's `stepover`, else 10% of its diameter); `min_engagement_deg`, `max_engagement_deg` (from the load: see [Adaptive clearing](#adaptive-clearing)); `helix_diameter` (80% of the tool's); `ramp_angle_deg` (2); `climb`; `stock_to_leave` (0); `tolerance`; `compare` (true) |
 | `adaptive_roughing` | `heights` (`top` is the stock's top); `stepdown`; `optimal_load`; `min_engagement_deg`, `max_engagement_deg`; `helix_diameter`; `ramp_angle_deg`; `climb`; `boundary` (the stock's extent; the part's extent); `stock_to_leave` (0.25); `flats` (true); `tolerance` |
@@ -476,3 +480,69 @@ Ring by ring a pocket is cut from the inside out: a ring only after the rings ne
 otherwise the nearest ring first, so that the rooms of a pocket are cleared one after the other.
 The vertical leads some posts write (an arc in the plane of the cut's normal and Z, `G18`/`G19`)
 are not written: the program reader and the read-back follow arcs in the XY plane only.
+## 3D finishing strategies
+
+`scallop`, `steep_shallow`, `pencil` and `rest_finish` place their passes by the shape of the
+surface as the cutter meets it, where `parallel` and `waterline` use straight lines and flat
+levels. All four start from a grid of drop-cutter samples `step` apart over the boundary (the
+tip's height where the cutter rests, never below the floor `heights.bottom`) and measure
+distances over that surface, so neighbouring passes are a spacing apart along the surface,
+whatever its slope. Every pass is then sampled and refined with the drop-cutter exactly as a
+`parallel` pass is: no point it cuts at is below where the cutter rests, moves that go down are
+fed no faster down than the plunge feed, and passes are linked by feeding across when the link
+is short and clears the part, otherwise by lifting to the retract height. They can run inside
+`indexed` like the other 3-axis operations. With `climb` (the default) every offset pass and
+z-level keeps what is still to cut on the right of the tool's travel (the spindle turning
+clockwise seen from above), whichever way the passes run: inward, outward, or closing on a
+crease; `climb: false` keeps it on the left. A grid larger than 4 million nodes, more than
+10 000 levels, straight shallow passes of more than 4 million points or more drop-cutter
+samples than the operation's budget is refused with a message saying what to make larger.
+
+- **`scallop`** (constant stepover): passes offset from the boundary inward (`direction:
+  "outward"` runs the same passes from the middle out). With `scallop_height` the spacing is
+  `2·√(2·r·h − h²)` for the cutter's corner radius `r` (a flat end mill needs `stepover`),
+  closer where the surface is concave and further where it is convex, so the ridge left is the
+  same. Where fronts from different sides meet further apart than the spacing, a pass is added
+  between them. A last pass runs along every concave crease sharper than 30° (the foot of a
+  wall, a corner), which offsets land a grid step short of at best. Walls the cutter's side runs
+  down (cliffs in the height field) are not followed: use `steep_shallow` there.
+- **`steep_shallow`**: where the tip's height is steeper than `threshold_deg`, z-levels at most
+  `stepdown` apart, each crossing found to within the tolerance; elsewhere `scallop` passes
+  offset from the boundary and from the edge of the steep ground, or straight passes at
+  `angle_deg` (`shallow: "parallel"`), close enough to be a spacing apart on the steepest
+  shallow ground. Each kind runs `overlap` on into the other's ground; the crease passes of
+  `scallop` finish it.
+- **`pencil`**: along the concave creases where the cutter touches two faces at once. A crease
+  is where the tip's path turns up by at least `min_angle_deg` at one place across it, more than
+  it turns either side (so a fillet the cutter rolls along is no crease); each crease point is
+  moved across the crease to where the tip's height leaves the line of its flatter side, found by
+  halving, so the pass runs in the crease, not on the nearest grid node. `passes` adds offset
+  passes `stepover` apart along the surface on both sides, outermost first.
+- **`rest_finish`**: only where this tool reaches material `previous_tool` left. At each grid
+  node the tool's contact point and the surface's normal there come from its tip and the slope
+  of the tip's height; the previous tool is set touching the same point with the same normal and
+  dropped. Where it rests higher than that, what it left at the point is measured from the
+  envelope of every position it can take on the grid (the lowest its cutting surface reaches
+  over the point), square to the surface. Places with more than `threshold` left, grown by
+  `overlap`, are cut with passes offset from their edges inward, and their creases.
+
+Measured on test parts with a 6 mm ball and `scallop_height: 0.01` (the material left over what
+any path with the tool could reach, from the envelope of the ball along the path, computed
+independently of the strategies on a 0.1 mm grid; `crates/cam/src/finish3d_tests.rs`):
+
+| Part | Strategy | Largest | 95% of points under | Points within 0.0125 mm |
+| --- | --- | --- | --- | --- |
+| Dome (radius 12, 7 mm high) | `scallop` | 0.019 mm | 0.0096 mm | 99.7% |
+| Bowl (60° wall, concave fillet radius 4) | `scallop` | 0.021 mm | 0.0109 mm | 96.6% |
+| Bowl | `steep_shallow` (40°, scallop) | 0.023 mm | 0.0100 mm | 97.4% |
+| Bowl | `steep_shallow` (40°, parallel) | 0.027 mm | 0.0076 mm | 98.6% |
+| Three treads 4 mm apart | `scallop` | 0.018 mm | 0.0090 mm | 99.95% |
+| Three treads | `steep_shallow` (45°) | 0.016 mm | 0.0094 mm | 99.9% |
+
+The largest values are at single points where offset fronts meet. On the dome a plain
+`parallel` raster at the stepover the scallop height gives on flat ground does about as well
+(0.019 mm, 95% under 0.0087 mm, 98.5% within) with a shorter path (1860 mm against 2470 mm): the
+dome shows no advantage for `scallop`, and the other parts were not compared with a raster. On a
+sharp wall-and-floor corner a 10 mm ball leaves up to 5.6 mm; `rest_finish` with a 4 mm ball after it leaves at most
+0.016 mm, and cuts nothing on the floor further out or on the top. A pencil pass on a fillet
+joint tighter than the ball runs within 0.003 mm of where the ball touches both faces.

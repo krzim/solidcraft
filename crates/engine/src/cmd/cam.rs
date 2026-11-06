@@ -62,9 +62,10 @@ pub static COMMANDS: &[CommandSpec] = &[
              body), fixtures?: [names] (checked against, never cut), tolerance?: mm (default 0.01; bodies are tessellated at half of it), \
              stock?: {box: {min, max}} | {cylinder: {radius, x_min, x_max}} | {around_part: {margin: [x,y,z]}} (work coordinates; no \
              rapid may pass through it), tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | \
-             roughing | waterline | drill | chamfer {heights: {clearance, retract, top}, width, tip_offset?, side?} | indexed {a_deg, \
-             operation} | rotary_finish | rotary_roughing | wrap | bore | thread_mill | face {bottom, top?, retract?, clearance?, stepdown?, \
-             stepover?, angle_deg?, zigzag?, overhang?, rect?}, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
+             roughing | waterline | scallop | steep_shallow | pencil | rest_finish | drill | chamfer {heights: {clearance, retract, top}, \
+             width, tip_offset?, side?} | indexed {a_deg, operation} | rotary_finish | rotary_roughing | wrap | bore | thread_mill | face \
+             {bottom, top?, retract?, clearance?, stepdown?, stepover?, angle_deg?, zigzag?, overhang?, rect?}, tool: number, spindle_rpm?, \
+             feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
              and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
              operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, warnings}], \
@@ -760,6 +761,10 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
             let (path, r) = drill::plan(ctx, o, frame)?;
             Ok((path, r, "drill"))
         }
+        Op3Spec::Scallop(o) => finish3d::plan_scallop(ctx, o, surface),
+        Op3Spec::SteepShallow(o) => finish3d::plan_steep_shallow(ctx, o, surface),
+        Op3Spec::Pencil(o) => finish3d::plan_pencil(ctx, o, surface),
+        Op3Spec::RestFinish(o) => finish3d::plan_rest_finish(ctx, o, surface),
     }
 }
 
@@ -774,6 +779,10 @@ fn common3(op: &Op3Spec) -> Common<'_> {
         Op3Spec::Waterline(o) => o.common(),
         Op3Spec::Drill(o) => o.common(),
         Op3Spec::Chamfer(o) => o.common(),
+        Op3Spec::Scallop(o) => o.common(),
+        Op3Spec::SteepShallow(o) => o.common(),
+        Op3Spec::Pencil(o) => o.common(),
+        Op3Spec::RestFinish(o) => o.common(),
     }
 }
 
@@ -925,6 +934,10 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
         OperationSpec::Waterline(o) => indexed(&Op3Spec::Waterline(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Drill(o) => indexed(&Op3Spec::Drill(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Chamfer(o) => indexed(&Op3Spec::Chamfer(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::Scallop(o) => indexed(&Op3Spec::Scallop(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::SteepShallow(o) => indexed(&Op3Spec::SteepShallow(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::Pencil(o) => indexed(&Op3Spec::Pencil(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::RestFinish(o) => indexed(&Op3Spec::RestFinish(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Indexed(o) => {
             let name = common3(&o.operation).name;
             if rotaries != 1 {
@@ -1441,6 +1454,8 @@ mod adaptive;
 mod chamfer;
 #[path = "cam_leads.rs"]
 mod leads;
+#[path = "cam_finish3d.rs"]
+mod finish3d;
 
 #[cfg(test)]
 #[path = "cam_tests.rs"]

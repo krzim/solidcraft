@@ -552,6 +552,10 @@ operation! {
 #[path = "cam_drill.rs"]
 mod drill;
 pub use drill::{DrillCycleSpec, DrillOp};
+// The 3D finishing strategies, declared with the macro above.
+#[path = "cam_finish3d.rs"]
+mod finish3d;
+pub use finish3d::{DirectionSpec, PencilOp, RestFinishOp, ScallopOp, ShallowSpec, SteepShallowOp};
 
 /// A 3-axis operation, as an indexed operation runs it.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -566,6 +570,10 @@ pub enum Op3Spec {
     Waterline(WaterlineOp),
     Drill(DrillOp),
     Chamfer(ChamferOp),
+    Scallop(ScallopOp),
+    SteepShallow(SteepShallowOp),
+    Pencil(PencilOp),
+    RestFinish(RestFinishOp),
 }
 
 /// A 3-axis operation run with the A axis held at `a_deg` (3+1): its heights, boundary and
@@ -576,7 +584,8 @@ pub struct IndexedOp {
     /// The A angle, degrees.
     pub a_deg: f64,
     /// The 3-axis operation (`adaptive`, `adaptive_roughing`, `contour`, `pocket`, `parallel`,
-    /// `roughing`, `waterline`, `drill` or `chamfer`).
+    /// `roughing`, `waterline`, `scallop`, `steep_shallow`, `pencil`, `rest_finish`, `drill` or
+    /// `chamfer`).
     pub operation: Box<Op3Spec>,
 }
 
@@ -592,6 +601,10 @@ pub enum OperationSpec {
     Roughing(RoughingOp),
     Waterline(WaterlineOp),
     Drill(DrillOp),
+    Scallop(ScallopOp),
+    SteepShallow(SteepShallowOp),
+    Pencil(PencilOp),
+    RestFinish(RestFinishOp),
     Indexed(IndexedOp),
     RotaryFinish(RotaryFinishOp),
     RotaryRoughing(RotaryRoughingOp),

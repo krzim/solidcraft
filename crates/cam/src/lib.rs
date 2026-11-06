@@ -27,6 +27,7 @@ mod cutter;
 pub mod drill;
 mod dropcutter;
 pub mod engagement;
+pub mod finish3d;
 mod frame;
 mod gcode;
 pub mod gcode5;
@@ -54,6 +55,10 @@ pub use chamfer::{ChamferGeometry, ChamferParams, DEFAULT_TIP_OFFSET, chamfer, c
 pub use check::verify;
 pub use cutter::{Cone, Cutter};
 pub use dropcutter::{drop_along, drop_triangle, drop_z};
+pub use finish3d::{
+    OffsetDirection, PencilParams, RestParams, ScallopParams, ShallowPattern, Spacing, SteepShallowParams, pencil, rest_finish, scallop,
+    steep_shallow,
+};
 pub use frame::{Frame, angle_about, rotate, rotate_about};
 pub use gcode::{Operation, Program, emit, parse, work_offset_code};
 pub use leads::{
@@ -105,6 +110,8 @@ mod collision_tests;
 mod drill_tests;
 #[cfg(test)]
 mod engagement_tests;
+#[cfg(test)]
+mod finish3d_tests;
 #[cfg(test)]
 mod foundation_tests;
 #[cfg(test)]
