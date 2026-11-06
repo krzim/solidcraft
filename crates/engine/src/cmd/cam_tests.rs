@@ -227,6 +227,23 @@ fn a_job_file_reads_its_post_and_tools_beside_it() {
     assert_eq!(post["name"], "mach3_4axis");
     let mut post = post["post"].clone();
     post["base"]["header"] = json!(["(my mill)", "G90 G91.1 G94 G17 {units} G40 G49 G80"]);
+    // The program-layout switches are known keys too, not refused as misspellings.
+    for (k, v) in [
+        ("upper_case_comments", json!(true)),
+        ("comment_chars", json!(" .,=_-")),
+        ("tool_list", json!(true)),
+        ("operation_name_only", json!(true)),
+        ("blank_lines", json!(true)),
+        ("operation_start", json!(["G17 G90 G94", "{work_offset}"])),
+        ("safe_retract", json!({"lines": ["G28 G91 Z0.", "G90"], "at_start": true, "at_tool_change": true, "at_end": true})),
+        ("tool_length_on_first_z", json!(true)),
+        ("modal_motion", json!(true)),
+    ] {
+        post["base"][k] = v;
+    }
+    post["safe_rotate_first"] = json!(true);
+    post["inverse_time_decimals"] = json!(4);
+    post["rewind"] = json!({"distance": 25.0, "retract_feed": 500.0, "plunge_feed": 250.0});
     std::fs::write(dir.0.join("my.post.json"), post.to_string()).unwrap();
     std::fs::write(dir.0.join("tools.json"), json!([ball(3, 4.0)]).to_string()).unwrap();
     let mut job = barrel_job();

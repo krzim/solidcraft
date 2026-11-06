@@ -20,15 +20,15 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use solidcore_record::{Loop2, Region2, Seg2, Vec2, Vec3};
 use solidcraft_cam::collision::{gouges, holder_collisions};
-use solidcraft_cam::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, Tcp, emit_program, parse5};
+use solidcraft_cam::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, Rewind, Tcp, emit_program, parse5};
 use solidcraft_cam::indexed::{IndexedOperation, frame_for_index};
 use solidcraft_cam::kinematics::{AxisLetter, Carrier, Machine, RotaryAxis};
 use solidcraft_cam::readback5::readback_program;
 use solidcraft_cam::rotary::{RotaryParams, RotaryPattern, RotaryRoughingParams, rotary_finish, rotary_roughing, wrap_with_step};
 use solidcraft_cam::surface_ops::{Boundary, ParallelParams, RoughingParams, WaterlineParams, parallel, roughing, waterline};
 use solidcraft_cam::{
-    CamError, ContourParams, Cut, DEFAULT_MAX_ANGLE_STEP, Feeds, Frame, Heights, HolderSection, LineNumbers, Move, Operation5, PocketParams, Side,
-    Surface, Tool, ToolKind, Toolpath, Toolpath5, arc_sweep, contour, pocket,
+    CamError, ContourParams, Cut, DEFAULT_MAX_ANGLE_STEP, Feeds, Frame, Heights, HolderSection, LineNumbers, Move, Operation5, PocketParams,
+    SafeRetract, Side, Surface, Tool, ToolKind, Toolpath, Toolpath5, arc_sweep, contour, pocket,
 };
 use solidcraft_geom::Mesh;
 use solidcraft_geom::prelude::*;
@@ -240,6 +240,19 @@ fn post_sample() -> Value {
     post.clearance = Some(1.0);
     post.safe_rotate = vec![String::new()];
     post.base.line_numbers = Some(LineNumbers { start: 1, step: 1 });
+    post.base.upper_case_comments = true;
+    post.base.comment_chars = Some(String::new());
+    post.base.tool_list = true;
+    post.base.operation_name_only = true;
+    post.base.blank_lines = true;
+    post.base.operation_start = vec![String::new()];
+    post.base.operation_end = vec![String::new()];
+    post.base.safe_retract = Some(SafeRetract { lines: vec![String::new()], at_start: true, at_tool_change: true, at_end: true });
+    post.base.tool_length_on_first_z = true;
+    post.base.modal_motion = true;
+    post.safe_rotate_first = true;
+    post.inverse_time_decimals = Some(4);
+    post.rewind = Some(Rewind { distance: 1.0, retract_feed: 1.0, plunge_feed: 1.0 });
     serde_json::to_value(post).unwrap_or(Value::Null)
 }
 
