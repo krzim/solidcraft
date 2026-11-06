@@ -5,9 +5,12 @@ use std::f64::consts::{FRAC_PI_2, PI};
 
 use solidcore_record::Vec3;
 
-use crate::kinematics::{AxisLetter, Carrier, Machine, RotaryAxis};
-use crate::multiaxis::{Move5, Pose, Toolpath5};
+use crate::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, emit_program, parse5};
+use crate::indexed::IndexedOperation;
+use crate::kinematics::{AxisLetter, Carrier, Joints, Machine, RotaryAxis};
+use crate::multiaxis::{Move5, Operation5, Pose, Toolpath5};
 use crate::setup_sheet::*;
+use crate::{CommentStyle, Move, Tool, ToolKind, Toolpath};
 
 #[test]
 fn the_format_comes_from_the_extension() {
@@ -104,6 +107,30 @@ fn the_a_axis_convention_is_put_in_words() {
     let tilted = RotaryAxis::new(AxisLetter::B, Vec3::new(0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, 100.0), Carrier::Head, None);
     let all = rotary_note(&tilted).words.join(" ");
     assert!(all.contains("tilts the spindle head about [0, 0.7071, 0.7071] through (0, 0, 100)"), "{all}");
+}
+
+#[test]
+fn the_a_axis_words_agree_with_the_kinematics() {
+    let named = |n: &str| match n {
+        "+Y" => Vec3::new(0.0, 1.0, 0.0),
+        "-Y" => Vec3::new(0.0, -1.0, 0.0),
+        "+Z" => Vec3::new(0.0, 0.0, 1.0),
+        _ => Vec3::new(0.0, 0.0, -1.0),
+    };
+    for (dir, reversed) in [(Vec3::X, false), (Vec3::X, true), (Vec3::new(-1.0, 0.0, 0.0), false), (Vec3::new(-1.0, 0.0, 0.0), true)] {
+        let axis = RotaryAxis::new(AxisLetter::A, dir, Vec3::ZERO, Carrier::Table, None).reversed(reversed);
+        let m = Machine { name: "t".into(), rotaries: vec![axis], linear_limits: None, work_origin: Vec3::ZERO };
+        let words = rotary_note(&axis).words.join(" ");
+        // The side the words say A+90° brings up is the side a tool along it is at A+90° for.
+        let up = ["+Y", "-Y", "+Z", "-Z"].into_iter().find(|n| words.contains(&format!("brings the part's {n} side up"))).unwrap();
+        let v = named(up);
+        let j = crate::kinematics::inverse(&m, &Pose::new(v * 10.0, v), None).unwrap();
+        assert!((j.rotary[0] - FRAC_PI_2).abs() < 1e-9, "{dir:?} {reversed}: {words} but A is {j:?}");
+        // And the top of the part moves the way the words say as A rises.
+        let towards = ["+Y", "-Y"].into_iter().find(|n| words.contains(&format!("moves towards {n}"))).unwrap();
+        let top = crate::kinematics::table_point(&m, &[0.01], Vec3::new(0.0, 0.0, 10.0));
+        assert!(top.y * named(towards).y > 0.0, "{dir:?} {reversed}: {words} but the top goes to {top:?}");
+    }
 }
 
 #[test]
@@ -277,4 +304,121 @@ fn the_markdown_sheet_keeps_its_tables_whole() {
     assert!(m.contains("| 1 | rough a \\| b c | indexed pocket | T1 | 18000 | 800 | 200 | off | A90° | -2.5 | 1235 | 1.5 |"), "{m}");
     assert_eq!(m, sample("a | b\nc").render(SheetFormat::Markdown));
     assert_eq!(s.render(SheetFormat::Html), s.html());
+}
+
+fn side_op(name: &str, a: f64) -> MachineOperation {
+    let moves = vec![
+        Move::Rapid { to: Vec3::new(0.0, 0.0, 20.0) },
+        Move::Rapid { to: Vec3::new(5.0, 5.0, 12.0) },
+        Move::Feed { to: Vec3::new(5.0, 5.0, 10.0), feed: 200.0 },
+        Move::Feed { to: Vec3::new(15.0, 5.0, 10.0), feed: 600.0 },
+        Move::Rapid { to: Vec3::new(15.0, 5.0, 20.0) },
+    ];
+    MachineOperation::Indexed(IndexedOperation {
+        name: name.into(),
+        tool: Tool::new(1, ToolKind::FlatEndmill, 6.0, 20.0),
+        spindle_rpm: 10000.0,
+        coolant: false,
+        rotary: vec![a],
+        path: Toolpath { moves },
+    })
+}
+
+/// A cut round the X axis at radius 10 from A0 to A270, the tool pointing away from the axis.
+fn wrap_op() -> MachineOperation {
+    let at = |deg: f64, r: f64| {
+        let t = deg.to_radians();
+        (Vec3::new(2.0, r * t.sin(), r * t.cos()), Vec3::new(0.0, t.sin(), t.cos()))
+    };
+    let mut poses = vec![at(0.0, 30.0)];
+    poses.extend((0..=27).map(|k| at(f64::from(k) * 10.0, 10.0)));
+    poses.push(at(270.0, 30.0));
+    MachineOperation::Continuous(Operation5 {
+        name: "wrap".into(),
+        tool: Tool::new(2, ToolKind::BallEndmill, 4.0, 12.0),
+        spindle_rpm: 12000.0,
+        coolant: false,
+        path: path(&poses),
+    })
+}
+
+fn named(ops: &[MachineOperation]) -> Vec<(&str, &Tool)> {
+    ops.iter()
+        .map(|o| match o {
+            MachineOperation::Indexed(o) => (o.name.as_str(), &o.tool),
+            MachineOperation::Continuous(o) => (o.name.as_str(), &o.tool),
+        })
+        .collect()
+}
+
+#[test]
+fn an_indexed_operation_reaches_the_angle_it_asks_for() {
+    let a = Machine::four_axis_a();
+    let MachineOperation::Indexed(op) = side_op("s", -FRAC_PI_2) else { panic!("indexed") };
+    let poses = op.poses(&a, 0.01).unwrap();
+    let r = indexed_reach(&a, &op, &poses, false).unwrap().unwrap();
+    assert_eq!(r.rotary, vec![(-FRAC_PI_2, -FRAC_PI_2)]);
+    assert!((r.z_min - 10.0).abs() < 1e-12, "{r:?}");
+    assert_eq!(r.last.map(|j| j.rotary), Some(vec![-FRAC_PI_2]));
+    // From A90 the toolpath's nearest turn is A270, but the program writes A-90: so does this.
+    let from = reach(&a, &poses, false, Some(&Joints { linear: Vec3::ZERO, rotary: vec![FRAC_PI_2] })).unwrap().unwrap();
+    assert!((from.rotary[0].0 - 3.0 * FRAC_PI_2).abs() < 1e-9, "{from:?}");
+    // Hostile operations are errors, not panics.
+    let mut bad = op.clone();
+    bad.rotary = vec![f64::NAN];
+    assert!(indexed_reach(&a, &bad, &poses, false).is_err());
+    bad.rotary = vec![];
+    assert!(indexed_reach(&a, &bad, &poses, false).is_err());
+    let mut bad = op.clone();
+    bad.path.moves = vec![Move::Feed { to: Vec3::new(f64::INFINITY, 0.0, 0.0), feed: 100.0 }];
+    assert!(indexed_reach(&a, &bad, &poses, false).is_err());
+    bad.path.moves.clear();
+    assert!(indexed_reach(&a, &bad, &Toolpath5 { moves: vec![] }, false).unwrap().is_none());
+}
+
+#[test]
+fn each_operation_reaches_what_the_written_program_says() {
+    let a = Machine::four_axis_a();
+    let post = Post5::mach3_4axis();
+    // Two operations of the same name at A90 and A-90, then a cut round the bar.
+    let ops = vec![side_op("side", FRAC_PI_2), side_op("side", -FRAC_PI_2), wrap_op()];
+    let program = MachineProgram { name: "side".into(), operations: ops.clone(), work_offset: None };
+    let text = emit_program(&program, &post, &a).unwrap();
+    assert!(text.contains("A-90"), "{text}");
+    let r = program_reach(&text, &post, &a, &named(&ops)).unwrap().unwrap();
+    let [Some(r0), Some(r1), Some(r2)] = r.as_slice() else { panic!("{r:?}") };
+    assert!((r0.rotary[0].0 - FRAC_PI_2).abs() < 1e-9 && (r0.rotary[0].1 - FRAC_PI_2).abs() < 1e-9, "{r0:?}");
+    assert!((r1.rotary[0].0 + FRAC_PI_2).abs() < 1e-9 && (r1.rotary[0].1 + FRAC_PI_2).abs() < 1e-9, "{r1:?}");
+    assert!((r0.z_min - 10.0).abs() < 1e-9 && (r1.z_min - 10.0).abs() < 1e-9, "{r:?}");
+    // The cut round the bar: 270° of A, at the bar's radius.
+    let (lo, hi) = r2.rotary[0];
+    assert!(((hi - lo).to_degrees() - 270.0).abs() < 1e-3, "{r2:?}");
+    assert!((r2.z_min - 10.0).abs() < 1e-3, "{r2:?}");
+    // Every range is within what the whole program turns through at feed.
+    let angles: Vec<f64> = parse5(&text, &a.letters())
+        .unwrap()
+        .iter()
+        .filter_map(|b| match b {
+            JointWords::Feed { rotary, .. } => rotary.first().copied(),
+            _ => None,
+        })
+        .collect();
+    let (plo, phi) = angles.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| (l.min(*v), h.max(*v)));
+    assert!(r.iter().flatten().all(|x| x.rotary[0].0 >= plo - 1e-12 && x.rotary[0].1 <= phi + 1e-12), "{r:?}");
+
+    // A post without comments: the operations cannot be told apart.
+    let mut quiet = post.clone();
+    quiet.base.comments = CommentStyle::None;
+    let text_q = emit_program(&program, &quiet, &a).unwrap();
+    assert!(program_reach(&text_q, &quiet, &a, &named(&ops)).unwrap().is_none());
+    // Hostile text and mismatched operations are no panic.
+    assert!(program_reach("", &post, &a, &named(&ops)).unwrap().is_none());
+    let one = named(&ops[..1]);
+    let head = one.first().map(|(n, t)| format!("({})", post.base.comment_text(&crate::gcode::operation_comment(&post.base, n, t)))).unwrap();
+    for junk in ["G1 X1e400 Y0 Z0 A0 F100", "\u{0}\u{7f}((\nG0 X0 Y0 Z5 A0", "G0 X0 Y0 Z1e308 A1e308\nG1 Z-1e308 F1", "G0 X0 Y0 Z5 A0\nG4 P1"] {
+        let _ = program_reach(&format!("{head}\n{junk}\n"), &post, &a, &one);
+    }
+    let r = program_reach(&format!("{head}\nG0 X0 Y0 Z5 A0\nG4 P1\n"), &post, &a, &one).unwrap().unwrap();
+    assert!(matches!(r.as_slice(), [Some(x)] if x.z_min == 5.0 && x.rotary == vec![(0.0, 0.0)]), "{r:?}");
+    assert_eq!(program_reach(&text, &post, &a, &[]).unwrap(), Some(Vec::new()));
 }

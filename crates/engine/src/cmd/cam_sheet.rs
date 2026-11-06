@@ -4,13 +4,14 @@
 //! the CAM crate's [`SetupSheet`]; this fills it in. Nothing on it depends on the date or on
 //! where it is made, so the same job gives the same bytes.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use solidcore_record::Vec3;
 use solidcraft_cam::gcode5::{JointWords, MachineOperation, Post5, parse5};
 use solidcraft_cam::kinematics::{Carrier, Joints, Machine};
 use solidcraft_cam::setup_sheet::{
-    ProgramExtents, SetupSheet, SheetCheck, SheetFormat, SheetOperation, SheetTool, Totals, fmt_num, reach, rotary_note, rotary_words, work_zero,
+    ProgramExtents, SetupSheet, SheetCheck, SheetFormat, SheetOperation, SheetTool, Totals, fmt_num, indexed_reach, program_reach, reach,
+    rotary_note, rotary_words, work_zero,
 };
 use solidcraft_cam::{Surface, work_offset_code};
 use solidcraft_geom::prelude::*;
@@ -33,10 +34,26 @@ pub(super) fn format_of(cmd: &str, path: Option<&str>) -> Result<Option<SheetFor
     }
 }
 
+/// Whether two paths name the same file as far as their text tells: `.` parts dropped, and
+/// letter case ignored where file names ignore it (Windows).
+fn same_file(a: &str, b: &str) -> bool {
+    let parts = |p: &str| -> Vec<String> {
+        Path::new(p.trim())
+            .components()
+            .filter(|c| !matches!(c, Component::CurDir))
+            .map(|c| {
+                let s = c.as_os_str().to_string_lossy();
+                if cfg!(windows) { s.to_lowercase() } else { s.into_owned() }
+            })
+            .collect()
+    };
+    parts(a) == parts(b)
+}
+
 /// Refuses a setup sheet written over the G-code or the preview.
 pub(super) fn distinct(cmd: &str, output: Option<&str>, preview: Option<&str>, sheet: Option<&str>) -> Result<()> {
     let Some(sheet) = sheet else { return Ok(()) };
-    let same = |other: Option<&str>| other.is_some_and(|o| Path::new(o) == Path::new(sheet));
+    let same = |other: Option<&str>| other.is_some_and(|o| same_file(o, sheet));
     if same(output) || same(preview) {
         return Err(bad(cmd, "`setup_sheet` must be a file of its own, not the `output` or the `preview`"));
     }
@@ -127,18 +144,41 @@ pub(super) fn build(i: &Inputs<'_>) -> SetupSheet {
     let tcp = i.post.tcp.is_some();
     let mut warnings: Vec<String> = i.failures.iter().map(|f| format!("Failed check: {f}")).collect();
 
-    // The operations in order, each with how low its tip goes and where the rotaries are.
+    // The operations in order, each with how low its tip goes and where the rotaries are: as
+    // the written program has them, or where its operations cannot be told apart in it, as
+    // the toolpaths give them.
+    let named: Vec<(&str, &solidcraft_cam::Tool)> = i
+        .planned
+        .iter()
+        .map(|p| match &p.op {
+            MachineOperation::Indexed(o) => (o.name.as_str(), &o.tool),
+            MachineOperation::Continuous(o) => (o.name.as_str(), &o.tool),
+        })
+        .collect();
+    let written = program_reach(i.text, i.post, machine, &named).unwrap_or_else(|e| {
+        warnings.push(format!("the written program could not be read for how low each operation reaches ({e})"));
+        None
+    });
     let mut operations: Vec<SheetOperation> = Vec::with_capacity(i.planned.len());
     let mut previous: Option<Joints> = None;
-    for p in i.planned {
+    for (k, p) in i.planned.iter().enumerate() {
         let (rpm, coolant) = match &p.op {
             MachineOperation::Indexed(o) => (o.spindle_rpm, o.coolant),
             MachineOperation::Continuous(o) => (o.spindle_rpm, o.coolant),
         };
-        let (z_min, rotary) = match reach(machine, &p.poses, tcp, previous.as_ref()) {
+        let reached = match &written {
+            Some(w) => Ok(w.get(k).cloned().flatten()),
+            None => match &p.op {
+                MachineOperation::Indexed(o) => indexed_reach(machine, o, &p.poses, tcp),
+                MachineOperation::Continuous(_) => reach(machine, &p.poses, tcp, previous.as_ref()),
+            },
+        };
+        let (z_min, rotary) = match reached {
             Ok(Some(r)) => {
                 let words = rotary_words(&letters, &r.rotary);
-                previous = r.last;
+                if r.last.is_some() {
+                    previous = r.last;
+                }
                 (Some(r.z_min), words)
             }
             Ok(None) => (None, String::new()),

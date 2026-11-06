@@ -200,7 +200,12 @@ It holds, in order:
   operations that use it, and its description. HTML sheets have a box to tick per tool.
 - **Operations** in program order: name, kind, tool, spindle speed, cut and plunge feed,
   coolant, the A angle (`A90°`) or range (`A -180° to 180°`) as written, Z min, cut length and
-  minutes at feed.
+  minutes at feed. Z min and the A angles are read from the written program itself, each
+  operation's blocks being those after the comment the post writes at its start: an indexed
+  operation shows the angle it asked for (`A-90°`, as written, not the equal `A270°`), and a
+  cut on a table with limits shows the range the program turns through, rewinds included. With
+  a post that writes no comments they are worked out from the toolpaths instead (indexed angles
+  still as asked; a rewind's turn back is then not in the range).
 - **Totals:** operations, tools, tool changes, length and time at feed as planned and as the
   controller times the written program, the program's line count, and the X, Y, Z and A range
   the program moves over.

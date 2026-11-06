@@ -598,3 +598,105 @@ fn a_4th_axis_setup_sheet_gives_the_a_convention_and_program_z() {
     let z = sum["tools"][0]["z_min"].as_f64().unwrap();
     assert!((9.9..=10.1).contains(&z), "the ball's tip rides on the bar: {sum}");
 }
+
+/// The A angles (degrees) of the blocks after the program's comment naming operation `name`,
+/// up to the next blank line or comment, as written.
+fn written_a(text: &str, name: &str) -> Vec<f64> {
+    let mut out = Vec::new();
+    let named = |l: &&str| l.starts_with('(') && l.to_ascii_lowercase().contains(name);
+    for l in text.lines().skip_while(|l| !named(l)).skip(1) {
+        if l.starts_with('(') || l.trim().is_empty() {
+            break;
+        }
+        for w in l.split_whitespace() {
+            if let Some(v) = w.strip_prefix('A').and_then(|v| v.parse::<f64>().ok()) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_setup_sheet_gives_each_indexed_operation_the_angle_the_program_writes() {
+    // A90 then A-90: A-90 is written as asked, though A270 is the same turn nearer A90.
+    let mut s = pocketed_block();
+    let dir = Dir::new("sheet-angles");
+    let out = dir.file("two-sides.tap");
+    let mut job = side_pocket_job();
+    let mut other = job["operations"][0].clone();
+    other["a_deg"] = json!(-90);
+    other["operation"]["name"] = json!("other side");
+    other["operation"]["heights"] = json!({"clearance": 40, "retract": 20, "top": 18, "bottom": 16});
+    job["operations"].as_array_mut().unwrap().push(other);
+    let r = scoped(&dir, || run(&mut s, "cam.job", json!({"job": job, "output": out})));
+    assert_clean(&r);
+    let text = std::fs::read_to_string(&out).unwrap();
+    let a = written_a(&text, "other side");
+    assert!(!a.is_empty() && a.iter().all(|v| (v + 90.0).abs() < 1e-9), "the program turns to A-90: {a:?}\n{text}");
+    let ops = &r["summary"]["operations"];
+    assert_eq!(ops[0]["rotary"], "A90°", "{ops}");
+    assert_eq!(ops[1]["rotary"], "A-90°", "as written: {ops}");
+    let z = r["summary"]["tools"][0]["z_min"].as_f64().unwrap();
+    assert!((z - 10.0).abs() < 1e-6, "{r}");
+    // A post that writes no comments: the sheet works it out from the toolpaths, the same.
+    let mut post = run(&mut s, "cam.posts", json!({"name": "mach3"}))["post"].clone();
+    post["base"]["comments"] = json!("none");
+    std::fs::write(dir.0.join("quiet.post.json"), post.to_string()).unwrap();
+    let o = job.as_object_mut().unwrap();
+    o.remove("post");
+    o.insert("post_path".into(), json!(dir.file("quiet.post.json")));
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    let ops = &r["summary"]["operations"];
+    assert_eq!((ops[0]["rotary"].as_str(), ops[1]["rotary"].as_str()), (Some("A90°"), Some("A-90°")), "{ops}");
+}
+
+#[test]
+fn a_setup_sheet_gives_the_a_range_the_program_writes_with_rewinds() {
+    // A table that turns only so far, with a post that rewinds: the rotary finish's range on
+    // the sheet is the one the program turns through, rewinds and all.
+    let mut s = bar();
+    let dir = Dir::new("sheet-rewind");
+    let mut post = run(&mut s, "cam.posts", json!({"name": "mach3"}))["post"].clone();
+    post["rewind"] = json!({"distance": 25.0, "retract_feed": 500.0, "plunge_feed": 250.0});
+    std::fs::write(dir.0.join("rewind.post.json"), post.to_string()).unwrap();
+    for limits in [None, Some(json!([-180, 180])), Some(json!([-30, 330])), Some(json!([-360, 360]))] {
+        let mut job = barrel_job();
+        let o = job.as_object_mut().unwrap();
+        o.remove("post");
+        o.insert("post_path".into(), json!(dir.file("rewind.post.json")));
+        if let Some(l) = &limits {
+            o.insert("a_limits_deg".into(), l.clone());
+        }
+        let out = dir.file("bar.tap");
+        let r = scoped(&dir, || run(&mut s, "cam.job", json!({"job": job, "output": out})));
+        assert_clean(&r);
+        let c = run(&mut s, "cam.check", json!({"path": out}));
+        let a = &c["rotary_ranges"][0];
+        let deg = |k: &str| solidcraft_cam::setup_sheet::fmt_num(a[k].as_f64().unwrap(), 3);
+        let want = format!("A {}° to {}°", deg("min_deg"), deg("max_deg"));
+        assert_eq!(r["summary"]["operations"][0]["rotary"].as_str(), Some(want.as_str()), "{limits:?}: {}", r["summary"]);
+        let z = r["summary"]["tools"][0]["z_min"].as_f64().unwrap();
+        assert!((z - c["bounds"][0][2].as_f64().unwrap()).abs() < 2e-3, "{limits:?}: {r}");
+    }
+}
+
+#[test]
+fn a_setup_sheet_spelt_like_the_preview_is_still_the_preview() {
+    let mut s = dome();
+    let dir = Dir::new("sheet-same-file");
+    let out = dir.file("dome.tap");
+    let page = dir.file("dome.html");
+    let dotted = dir.0.join(".").join("dome.html").to_string_lossy().into_owned();
+    let mut same = vec![dotted];
+    if cfg!(windows) {
+        same.push(dir.file("DOME.HTML"));
+    }
+    for sheet in same {
+        let e =
+            scoped(&dir, || s.execute("cam.job", &json!({"job": two_tool_job(), "output": out, "preview": page, "setup_sheet": sheet}))).unwrap_err();
+        assert!(e.to_string().contains("file of its own"), "{sheet}: {e}");
+    }
+    assert!(!PathBuf::from(&page).exists() && !PathBuf::from(&out).exists(), "nothing written");
+}

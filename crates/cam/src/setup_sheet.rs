@@ -14,9 +14,12 @@ use solidcore_record::Vec3;
 use solidcraft_geom::prelude::*;
 
 use crate::frame::rotate;
+use crate::gcode::operation_comment;
+use crate::gcode5::{JointWords, Post5, parse5};
+use crate::indexed::IndexedOperation;
 use crate::kinematics::{Carrier, Joints, Machine, RotaryAxis, inverse};
 use crate::multiaxis::Toolpath5;
-use crate::{Result, invalid};
+use crate::{CommentStyle, Move, Post, Result, Tool, invalid};
 
 /// The format a sheet is written in, from its file's extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +222,108 @@ pub fn reach(machine: &Machine, path: &Toolpath5, tcp: bool, previous: Option<&J
         return Ok(None);
     }
     Ok(Some(Reach { z_min, rotary, last }))
+}
+
+/// [`reach`] for an indexed operation: its rotaries at the angles it asks for, which the
+/// program writes as they are (not as an equal turn nearer the previous operation's), and the
+/// tip as the program writes it: the moves of its frame, or with tool centre point control
+/// (`tcp`) its `poses` in work coordinates. `None` for an operation without a move.
+pub fn indexed_reach(machine: &Machine, op: &IndexedOperation, poses: &Toolpath5, tcp: bool) -> Result<Option<Reach>> {
+    if op.rotary.len() != machine.rotaries.len() {
+        return invalid(format!("the operation has {} rotary angles; the machine has {}", op.rotary.len(), machine.rotaries.len()));
+    }
+    if op.rotary.iter().any(|a| !a.is_finite()) {
+        return invalid("the operation's rotary angles must be finite");
+    }
+    let tips: Vec<Vec3> = if tcp { poses.poses().map(|p| p.tip).collect() } else { op.path.moves.iter().filter_map(Move::target).collect() };
+    let Some(last) = tips.last().copied() else { return Ok(None) };
+    if tips.iter().any(|t| !t.is_finite()) {
+        return invalid("a tool position is not finite");
+    }
+    let z_min = tips.iter().map(|t| t.z).fold(f64::INFINITY, f64::min);
+    let rotary = op.rotary.iter().map(|&a| (a, a)).collect();
+    Ok(Some(Reach { z_min, rotary, last: Some(Joints { linear: last, rotary: op.rotary.clone() }) }))
+}
+
+/// The comment line a post writes at the start of the operation `name` with `tool`, or `None`
+/// for a post that writes no comments.
+fn operation_line(post: &Post, name: &str, tool: &Tool) -> Option<String> {
+    let text = post.comment_text(&operation_comment(post, name, tool));
+    match post.comments {
+        CommentStyle::Parentheses => Some(format!("({text})")),
+        CommentStyle::Semicolon => Some(format!("; {text}")),
+        CommentStyle::None => None,
+    }
+}
+
+/// How low each operation of a written program reaches and how far it turns the rotaries, read
+/// from the program itself (`text`, as [`crate::gcode5::emit_program`] wrote it for `post` and
+/// `machine` from operations named `ops` with their tools, in order): each operation's blocks
+/// are those after the comment the post writes at its start. The lowest program Z of any
+/// block, and each rotary's range over its cuts (over every block when it has no cut, since
+/// the first blocks of an operation may still be at the last one's angles). `None` when the
+/// operations cannot be told apart in the text (a post that writes no comments); an operation
+/// without a move is `None`. Reading the program means rewinds, unwound turns and indexed
+/// angles are on the sheet as the controller will see them.
+pub fn program_reach(text: &str, post: &Post5, machine: &Machine, ops: &[(&str, &Tool)]) -> Result<Option<Vec<Option<Reach>>>> {
+    // The line (1-based, as the reader counts) of each operation's comment, found from the end
+    // so a header comment of the same text is never taken for one.
+    let lines: Vec<&str> = text.lines().collect();
+    let mut starts: Vec<usize> = Vec::with_capacity(ops.len());
+    let mut end = lines.len();
+    for (name, tool) in ops.iter().rev() {
+        let Some(want) = operation_line(&post.base, name, tool) else { return Ok(None) };
+        let Some(at) = lines.get(..end).and_then(|before| before.iter().rposition(|l| l.trim_end() == want)) else { return Ok(None) };
+        starts.push(at + 1);
+        end = at;
+    }
+    starts.reverse();
+
+    struct Acc {
+        z_min: f64,
+        cut: Vec<(f64, f64)>,
+        all: Vec<(f64, f64)>,
+        any: bool,
+    }
+    let n = machine.rotaries.len();
+    let empty = || vec![(f64::INFINITY, f64::NEG_INFINITY); n];
+    let mut acc: Vec<Acc> = ops.iter().map(|_| Acc { z_min: f64::INFINITY, cut: empty(), all: empty(), any: false }).collect();
+    let widen = |ranges: &mut [(f64, f64)], angles: &[f64]| {
+        for (r, a) in ranges.iter_mut().zip(angles) {
+            r.0 = r.0.min(*a);
+            r.1 = r.1.max(*a);
+        }
+    };
+    let mut k: Option<usize> = None;
+    for b in parse5(text, &machine.letters())? {
+        let (line, linear, rotary, cut) = match &b {
+            JointWords::Rapid { line, linear, rotary, .. } => (*line, *linear, rotary, false),
+            JointWords::Feed { line, linear, rotary, .. } | JointWords::Arc { line, linear, rotary, .. } => (*line, *linear, rotary, true),
+            JointWords::Dwell { .. } => continue,
+        };
+        // The blocks come in line order: the operation is the last one started before the line.
+        while starts.get(k.map_or(0, |k| k + 1)).is_some_and(|&s| s < line) {
+            k = Some(k.map_or(0, |k| k + 1));
+        }
+        let Some(a) = k.and_then(|k| acc.get_mut(k)) else { continue };
+        if !linear.is_finite() || rotary.iter().any(|v| !v.is_finite()) {
+            return invalid(format!("line {line}: a position is not finite"));
+        }
+        a.z_min = a.z_min.min(linear.z);
+        widen(&mut a.all, rotary);
+        if cut {
+            widen(&mut a.cut, rotary);
+        }
+        a.any = true;
+    }
+    let reaches = acc
+        .into_iter()
+        .map(|a| {
+            let has_cut = a.cut.iter().all(|r| r.0 <= r.1);
+            a.any.then(|| Reach { z_min: a.z_min, rotary: if has_cut { a.cut } else { a.all }, last: None })
+        })
+        .collect();
+    Ok(Some(reaches))
 }
 
 /// A number as the sheet shows it: at most `decimals` places, trailing zeros dropped, `-` for
