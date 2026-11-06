@@ -68,13 +68,15 @@ fn outside_rect(p: Vec2, x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
     (p.x.clamp(x0, x1) - p.x).hypot(p.y.clamp(y0, y1) - p.y)
 }
 
-/// The steepest descent of a cutting move below `top` (radians), and whether one goes straight down.
+/// The steepest descent of a cutting move below `top` (radians), and whether one goes straight
+/// down; a feed straight down from where a rapid stopped (through the air a level before cut,
+/// to that level) is not counted.
 fn steepest(path: &Toolpath, top: f64) -> (f64, bool) {
     let pts = path.points(0.002);
     let (mut angle, mut plunges) = (0.0f64, false);
     for w in pts.windows(2) {
         let (a, b) = (w[0].0, w[1].0);
-        if !w[1].1 || b.z >= a.z - 1e-9 || a.z > top + 1e-9 {
+        if !w[1].1 || b.z >= a.z - 1e-9 || a.z > top + 1e-9 || (!w[0].1 && (b.x - a.x).hypot(b.y - a.y) < 1e-9) {
             continue;
         }
         let run = (b.x - a.x).hypot(b.y - a.y);
@@ -425,9 +427,10 @@ fn finishing_passes_close_in_on_the_wall_and_the_spring_pass_repeats_the_last() 
         assert!(at_bottom.iter().any(|x| (x - d).abs() < 1e-6), "no pass {d} out");
     }
     assert!(at_bottom.iter().all(|x| *x >= 3.0 - 1e-6 && *x <= 3.5 + 1e-6));
-    // 8 mm plunged (retract 2 → −3 → −6), the laps, and the two short links between the passes.
+    // 7 mm plunged (from 1 mm above the top, where the rapid stops, → −3 → −6), the laps, and the
+    // two short links between the passes.
     let len = path.stats().cut_length;
-    let laps = 2.0 * lap(3.5) + lap(3.25) + 2.0 * lap(3.0) + 8.0;
+    let laps = 2.0 * lap(3.5) + lap(3.25) + 2.0 * lap(3.0) + 7.0;
     assert!(len >= laps - 1e-6 && len <= laps + 2.0, "{len} {laps}");
     // With leads every pass goes in and out by its lead, linked above the part.
     let lead = ContourOptions { lead: Some(Lead { radius: 2.0, sweep: PI / 2.0, line: 0.0 }), linking: Linking::StayDown, ..opts };
@@ -444,7 +447,7 @@ fn finishing_passes_close_in_on_the_wall_and_the_spring_pass_repeats_the_last() 
     // A spring pass alone repeats the bottom pass.
     let spring = ContourOptions { spring_pass: true, ..ContourOptions::default() };
     let path = contour_with(&regions, &tool(6.0), &outside(true), &spring, &c, &never).unwrap();
-    assert!((path.stats().cut_length - (3.0 * lap(3.0) + 8.0)).abs() < 1e-6);
+    assert!((path.stats().cut_length - (3.0 * lap(3.0) + 7.0)).abs() < 1e-6);
     // Refused: finishing passes on the profile itself, or further apart than half the tool's radius.
     let on = ContourParams { side: Side::On, ..outside(true) };
     assert!(contour_with(&regions, &tool(6.0), &on, &opts, &c, &never).is_err());

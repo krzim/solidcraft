@@ -40,12 +40,27 @@ The command never writes a program that fails one of these unless `allow_unsafe`
 - **Read-back.** The program as written is read back through the machine's kinematics and
   compared with the toolpaths, both ways round: the tip within the post's precision and
   tolerances (`readback.allowed_tip`), the tool axis within its angle precision.
-- **Gouges.** Every cutting move of every operation is sampled and the cutter (shrunk by the
-  job's tolerance) must not meet the part or a fixture. An operation that cuts what the model
-  does not show (an engraving) sets `gouge_check: false`; the reply lists it under
-  `gouge.skipped`, and it is still checked against the fixtures.
+- **Gouges.** Along every cutting move of every operation the cutter (a cylinder of its
+  radius, endless above its end) must be no deeper in the part or a fixture than
+  `gouge.allowed`: the job's tolerance less the tessellation's chord error
+  (`gouge.tessellation`), so no cut that passes is deeper than the tolerance into the exact
+  part. The depth is the true one: the deepest point of the part inside the cutter, measured to
+  the cutter's own surface (a cutter buried deeper than its radius is reported as far as it
+  would have to back out along its axis). A ball whose axis holds along a move is measured
+  exactly along all of it; other cutters are tested at samples at least half their radius
+  apart and half way and near the thirds between them, the deepest sample measured exactly
+  against the triangles and the deepest gouge followed to its deepest point. A failure names
+  the operation, the move of its toolpath, the G-code line that ends that move (when it is
+  found) and the work coordinates of the tool tip there, and says how deep that can be in the
+  exact part. An operation that cuts what the model does not show (an engraving) sets
+  `gouge_check: false`; the reply lists it under `gouge.skipped`, and it is still checked
+  against the fixtures. A drill is checked as its own shape, point and all.
 - **Holder.** For tools with holder data (`stickout` above the flutes, `shank_diameter`,
-  `holder`), the shank and holder must not touch the part or a fixture along a cutting move.
+  `holder`), the shank and holder must not touch the part or a fixture along a cutting move. A
+  shank or holder section no wider than the cutter is inside the cutter's endless cylinder, so
+  it reaches nothing the cutter does not reach first: it may come as close as the gouge check
+  allows (a wall the cutter has just cut is no collision). Counts are of moves of the
+  operation's toolpath.
 - **Rapids.** Every `G0` of the program as written, the stock and the turns of a 4th axis
   included (see "Stock, facing and rapid safety" below).
 - **Travel.** With a machine whose JSON has `linear_limits`, every position is within them.
@@ -69,10 +84,12 @@ message. With `dry_run`, the reply carries `passed: false` and `failures`.
 ### The reply
 
 `operations` (each with `name`, `kind`, `tool`, `moves`, `cut_length`, `cut_minutes`, `rewinds`,
-`max_tilt_deg`, `a_deg` when indexed, `gouge`, `holder_collisions`, `warnings`), `program_lines`,
+`max_tilt_deg`, `a_deg` when indexed, `gouge`, `gouge_at` when it gouges, `holder_collisions`,
+`warnings`), `program_lines`,
 `program_head` (the first lines), `readback`, `cut_minutes` (as the machine runs it with
 `machine_rates`, else as written), `rapid_minutes` and `machine_time` (with `machine_rates`, else
-`null`), `gouge`, `holder_collisions` (`null` when no tool has holder data), `rapids` (`checked`, `hits`, `worst`, `pass`, `from_unknown`, `first`),
+`null`), `gouge` (`worst`, `tolerance`, `tessellation`, `allowed`, `hits`, `at: {operation,
+move_index, line?, xyz}` for the deepest, `skipped`, `pass`), `holder_collisions` (`null` when no tool has holder data), `rapids` (`checked`, `hits`, `worst`, `pass`, `from_unknown`, `first`),
 `travel` (`checked`, `violation`, `pass`; `null` without `linear_limits`), `stock` (as checked
 against; `null` without one), `passed`, `failures`, `dry_run`, `outputs` (`gcode`, `preview`,
 `setup_sheet`), `notes` (how the bodies were tessellated, a post that writes no work offset, an
@@ -141,12 +158,17 @@ tool.
 
 ### Tessellation
 
-Each body is tessellated from its exact B-rep surfaces with a chord tolerance of half the job's
-tolerance (`solidcraft_kernel::MeshTolerance::chord`, the tolerance-driven path the mesh exports
-are built on; the export presets `standard`/`fine`/`finest` are a share of the body's size and
-so are not used). The facets then lie within half the tolerance of the true surfaces, which
-leaves the other half for the toolpath. A mesh body (an imported STL, 3MF or OBJ) is used as it
-is; the reply's notes say so.
+Each body is tessellated from its exact B-rep surfaces with a chord tolerance of a quarter of
+the job's tolerance (`solidcraft_kernel::MeshTolerance::chord`, the tolerance-driven path the
+mesh exports are built on; the export presets `standard`/`fine`/`finest` are a share of the
+body's size and so are not used). The facets then lie within a quarter of the tolerance of the
+true surfaces: inside a convex surface, outside a hollow one. The 3D operations (`parallel`,
+`roughing`, `waterline`, `scallop`, `steep_shallow`, `pencil`, `rest_finish`) are planned on the facets within the rest of their tolerance (the
+operation's `tolerance`, the job's by default, less the chord error; at least half of it):
+four fifths of that for the operation itself and one fifth for merging its moves (below). The
+gouge check allows the same, so a toolpath right on the true surface of a hole, which seems to
+cut the chord error into the facets, still passes. A mesh body (an imported STL, 3MF or OBJ) is
+used as it is; the reply's notes say so.
 
 ### Tools
 
@@ -187,7 +209,7 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | --- | --- |
 | `contour` | `sketch` (id or name) + `profiles?` (indices; default every drawn profile) or `polygon: [[x, y], …]`; `heights`; `stepdown` (tool's, else half its diameter); `side`: `outside` \| `inside` \| `on` (outside); `climb` (true); `stock_to_leave` (0); `ramp_angle_deg` (0: plunge); `tolerance` (the job's); `lead`, `entry`, `linking`, `tabs`, `finish_passes`, `finish_stepover`, `spring_pass` (see [Leads, entries, linking and tabs](#leads-entries-linking-and-tabs)) |
 | `pocket` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown`; `stepover` (tool's, else 40% of its diameter); `climb`; `stock_to_leave`; `ramp_angle_deg`; `tolerance`; `entry` (a helix); `linking` (see [Leads, entries, linking and tabs](#leads-entries-linking-and-tabs)) |
-| `parallel` | `heights` (`bottom` is the floor); `stepover` (tool's, else 10% of its diameter); `angle_deg` (0); `boundary?: {rect?: [[x, y], [x, y]], polygon?}` (the part's extent); `stock_to_leave` (0); `step` (a quarter of the diameter); `tolerance`; `zigzag` (true) |
+| `parallel` | `heights` (`bottom` is the floor); `stepover` (tool's, else 10% of its diameter); `angle_deg` (0); `boundary?: {rect?: [[x, y], [x, y]], polygon?}` (the part's extent); `stock_to_leave` (0); `step` (a quarter of the diameter); `tolerance`; `zigzag` (true); `descent_limit_deg` (70: see Feeds) |
 | `roughing` | `heights` (`top` is the stock's top); `stepdown`; `stepover`; `angle_deg`; `boundary`; `stock_to_leave` (0.25); `step`; `tolerance`; `zigzag` |
 | `waterline` | `heights` (levels from `top` to `bottom`); `stepdown` (tool's, else a quarter of its diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` (true) |
 | `scallop` | `heights` (`bottom` is the floor); `scallop_height` or `stepover` (tool's, else 10% of its diameter; along the surface); `direction`: `inward` \| `outward` (inward); `boundary`; `stock_to_leave` (0); `step` (a tenth of the diameter: the grid and the samples); `tolerance`; `climb` (true). See "3D finishing strategies". |
@@ -216,7 +238,42 @@ Z is work +Y. A sketch used as a boundary must lie on a plane square to the oper
 and facing it (for a plain 3-axis operation, a plane facing +Z), in the design's root component.
 Indexed and 3-axis operations are written with arcs kept (`G2`/`G3`); rotary and wrapped
 operations as short cuts, each turning A by at most `max_angle_step_deg`, in inverse time where
-the post says so.
+the post says so. The moves of a 3D operation are merged before they are written: a run of
+straight cuts at one feed whose points all lie within the merging tolerance of one line becomes
+that line, and, where the post writes arcs (`arcs`, and `helical_arcs` for one that changes Z),
+a run that lies within it of an arc in the XY plane (`G17`) becomes that arc. The merging
+tolerance is a fifth of the operation's part of the tolerance, and never more than the post's
+`arc_tolerance`; the read-back holds the program against the merged moves. Between two of the
+points it replaces an arc bows out from the straight move joining them (by its sagitta there);
+it is taken only where that is no more than the tolerance the operation was planned within,
+the most its straight moves were allowed to cut across a curve, so an arc through points
+sampled that closely from a curve is taken as the curve, and one through the corners of a
+polygon (which lie on a circle too) is not.
+
+### Feeds
+
+Every move runs at the operation's cut feed except these, which go down no faster than the
+plunge feed:
+
+- **Entries.** Each cut is entered from above, the last of the way at the plunge feed. A
+  `roughing` level comes down at rapid through the air the levels before it cleared, to 1 mm
+  above the material left there (the level before, or the stock's `top`), and plunges from
+  there. A `pocket` level comes down the same way to 1 mm above the level before it, and the
+  first one, like a `contour`, to 1 mm above `top` (where that is below the retract height).
+  A `parallel`, `waterline`, `scallop`, `steep_shallow`, `pencil` or `rest_finish` cut is
+  entered from the retract height, and the links between its passes follow the part as
+  `parallel`'s do.
+- **Plunges.** A `parallel` move that goes down at least `descent_limit_deg` from horizontal
+  (default 70°; `scallop`, `steep_shallow`, `pencil` and `rest_finish` always 70°) is slowed so the tool goes down no faster than the plunge feed; a move down the
+  surface less steeply than that runs at the cut feed. 0 slows every move that goes down. In
+  `roughing` every move that goes down is slowed so: it goes into material no level has cut.
+- **Ramps.** A `contour` or `pocket` with `ramp_angle_deg` goes down along the profile at
+  exactly that angle (the last lap only part of the way round, then on round at the depth),
+  each ramping move slowed so the tool goes down no faster than the plunge feed.
+
+These feeds are worked out again from the coordinates as the post writes them, and rounded
+down to its feed digits, so the program as written never goes down faster than the plunge feed
+either.
 
 ## `cam.posts`
 

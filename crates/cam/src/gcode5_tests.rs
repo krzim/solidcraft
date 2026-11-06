@@ -890,7 +890,7 @@ G54
 M8
 G0 X0. Y-3.
 G43 Z15. H1
-Z5.
+Z1.
 G1 Z0. F50.
 Z-1.
 G2 X-3. Y0. I0. J3. F1600.
@@ -913,7 +913,7 @@ G54
 M8
 G0 X13.5 Y8.5
 G43 Z15. H2
-Z5.
+Z1.
 G1 Z0. F50.
 ";
     assert!(text.contains(change), "{text}");
@@ -999,8 +999,8 @@ fn a_dialect_post_retracts_before_every_turn_of_a() {
     assert!(text.starts_with("(WRAP)\n(T3 D=6. CR=0. - FLAT END MILL)\n"), "{text}");
     // The first index turns A after the start's retract; the next one retracts before its
     // comment, then A turns alone and the tool comes back across and down with its offset.
-    assert!(text.contains("\n(SIDE 0)\nT3 M6\nS9000 M3\nG17 G90 G94\nG54\nG0 A0.\nG0 X0. Y-3.\nG43 Z10. H3\nZ2.\n"), "{text}");
-    assert!(text.contains("\nG0 Z10.\nG28 G91 Z0.\nG90\n\n(SIDE 90)\nG17 G90 G94\nG54\nG0 A90.\nG0 X0. Y-3.\nG43 Z10. H3\nZ2.\n"), "{text}");
+    assert!(text.contains("\n(SIDE 0)\nT3 M6\nS9000 M3\nG17 G90 G94\nG54\nG0 A0.\nG0 X0. Y-3.\nG43 Z10. H3\nZ1.\n"), "{text}");
+    assert!(text.contains("\nG0 Z10.\nG28 G91 Z0.\nG90\n\n(SIDE 90)\nG17 G90 G94\nG54\nG0 A90.\nG0 X0. Y-3.\nG43 Z10. H3\nZ1.\n"), "{text}");
     assert_modal_with_points(&text);
     // Inverse time: F with at most four decimals on every block that turns A, G94 before the
     // next cut that does not.

@@ -137,7 +137,8 @@ fn feed_moves(path: &Toolpath) -> Vec<(Vec3, Vec3)> {
 }
 
 /// No move at feed goes into the surface by more than the tolerance between its ends, and
-/// every move down is no faster down than the plunge feed.
+/// every move down at least as steeply as the default descent limit (70°) is no faster down
+/// than the plunge feed (shallower ones run down the surface at the cut feed).
 fn assert_safe(s: &Surface, tool: &Tool, path: &Toolpath, tol: f64, f: Feeds) {
     let c = tool.cutter().unwrap();
     let mut pos: Option<Vec3> = None;
@@ -150,7 +151,7 @@ fn assert_safe(s: &Surface, tool: &Tool, path: &Toolpath, tol: f64, f: Feeds) {
                 }
             }
             let (len, down) = (a.dist(b), a.z - b.z);
-            if down > 1e-9 && len > 1e-9 {
+            if down > 1e-9 && len > 1e-9 && down >= DEFAULT_DESCENT_LIMIT.sin() * len - 1e-12 {
                 assert!(feed * down / len <= f.plunge + 1e-6, "{a:?} → {b:?} goes down at {}", feed * down / len);
             }
         }
@@ -320,6 +321,7 @@ fn scallop_height_holds_across_a_dome() {
         step: 0.25,
         tolerance: 0.005,
         zigzag: true,
+        descent_limit: DEFAULT_DESCENT_LIMIT,
     };
     let raster = parallel(&s, &tool, &par).unwrap();
     let base = left(&s, &tool, &[&raster], &ev, &on_dome, target * 1.25);
@@ -544,6 +546,7 @@ fn rest_finishing_cuts_only_the_corner() {
             step: 0.25,
             tolerance: 0.005,
             zigzag: true,
+            descent_limit: DEFAULT_DESCENT_LIMIT,
         },
     )
     .unwrap();
@@ -803,4 +806,35 @@ fn shallow_rasters_too_dense_to_cut_are_refused_before_they_are_built() {
         Err(CamError::TooLarge(why)) => assert!(why.contains("shallow passes"), "{why}"),
         other => panic!("{:?}", other.map(|p| p.moves.len())),
     }
+}
+
+/// Scallop rings 2 mm apart over a dome: a straight link from one ring to the next cuts across
+/// the dome's curve (a 2 mm chord on a 12 mm sphere sags 0.04 mm, far past the tolerance), so
+/// the links follow the dome (raised where the cutter resting on it is higher), as a parallel
+/// finish's do, instead of lifting to the retract height and plunging again between rings.
+#[test]
+fn scallop_links_follow_the_surface_between_rings() {
+    let s = dome();
+    let tool = ball(6.0);
+    let h = heights(8.0);
+    let p = scallop_params(h, rect(-14.0, -14.0, 14.0, 14.0), Spacing::Stepover(2.0));
+    let path = scallop(&s, &tool, &p).unwrap();
+    verify(&path, &h).unwrap();
+    assert_safe(&s, &tool, &path, p.tolerance, p.feeds);
+    // Lifts: rapids up to the retract height or above.
+    let mut pos: Option<Vec3> = None;
+    let mut lifts = 0;
+    for m in &path.moves {
+        if let (Some(a), Move::Rapid { to }) = (pos, *m)
+            && to.z > a.z + 1e-9
+        {
+            lifts += 1;
+        }
+        pos = m.target().or(pos);
+    }
+    // Links that rise over the dome: a feed move up and on to the next ring.
+    let rising = feed_moves(&path).iter().filter(|(a, b)| b.z > a.z + 0.01 && (b.x - a.x).hypot(b.y - a.y) > 1e-6).count();
+    assert!(rising > 0, "no link follows the dome");
+    // Straight links, taken only where they stay out of the dome, lift 16 times here.
+    assert!(lifts <= 10, "{lifts} lifts between rings");
 }

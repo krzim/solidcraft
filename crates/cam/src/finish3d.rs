@@ -36,8 +36,8 @@ use crate::ops::{Feeds, Heights};
 use crate::path::{MAX_MOVES, Toolpath};
 use crate::surface::Surface;
 use crate::surface_ops::{
-    Boundary, Fence, Field, MAX_GRID_NODES, Out3, Pass, Profile, Rect, Tip, check_angle, check_leave, check_step, check_stepdown, check_tolerance,
-    depth_for, levels, link_clear, spans, tool_cutter,
+    Boundary, DEFAULT_DESCENT_LIMIT, Fence, Field, MAX_GRID_NODES, Out3, Pass, Profile, Rect, Tip, check_angle, check_leave, check_step,
+    check_stepdown, check_tolerance, depth_for, levels, link_path, spans, tool_cutter,
 };
 use crate::tool::Tool;
 use crate::{CamError, Result, invalid};
@@ -913,13 +913,13 @@ impl Plan<'_> {
     /// Cuts the groups in turn, each group's passes nearest first, linked as a raster's.
     fn cut(&self, groups: Vec<Vec<Run>>) -> Result<Toolpath> {
         let spacing = self.step.min(self.cutter().radius * 0.5);
-        let link = |a: Vec3, b: Vec3| link_clear(&self.field, a, b, self.link_len, spacing, self.tol);
-        let mut out = Out3::new(self.heights, self.feeds);
+        let link = |a: Vec3, b: Vec3| link_path(&self.field, a, b, self.link_len, spacing, self.tol);
+        let mut out = Out3::new(self.heights, self.feeds, DEFAULT_DESCENT_LIMIT);
         let mut at: Option<Vec2> = None;
         for group in groups {
             for run in nearest_first(group, at) {
                 for piece in self.drape(&run)? {
-                    out.span(&piece, &link)?;
+                    out.span(&piece, &link, None)?;
                     if let Some(p) = piece.last() {
                         at = Some(Vec2::new(p.x, p.y));
                     }
@@ -1415,7 +1415,7 @@ pub fn rest_finish(surface: &Surface, tool: &Tool, p: &RestParams) -> Result<Too
         }
     }
     if !rest.iter().any(|r| *r) {
-        return Out3::new(p.heights, p.feeds).finish();
+        return Out3::new(p.heights, p.feeds, DEFAULT_DESCENT_LIMIT).finish();
     }
     let is_rest = |k: usize| rest.get(k).copied().unwrap_or(false);
     // Grown over the tip's surface, not the plane, so the overlap runs on over the ground round

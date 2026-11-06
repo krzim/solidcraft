@@ -87,7 +87,7 @@ fn planned(ctx: &Ctx<'_>, c: Common<'_>, r: Resolved, kind: &str, path: Toolpath
     let stats = path.stats();
     let rotary = vec![0.0; ctx.machine.rotaries.len()];
     let io = IndexedOperation { name: c.name.into(), tool: r.tool.clone(), spindle_rpm: r.rpm, coolant: c.coolant, rotary, path };
-    let poses = io.poses(ctx.machine, arc_tol).map_err(|e| ctx.bad(c.name, e))?;
+    let (poses, sources) = io.poses_mapped(ctx.machine, arc_tol).map_err(|e| ctx.bad(c.name, e))?;
     let report = OperationReport {
         name: c.name.into(),
         kind: kind.into(),
@@ -99,7 +99,16 @@ fn planned(ctx: &Ctx<'_>, c: Common<'_>, r: Resolved, kind: &str, path: Toolpath
         warnings,
         ..OperationReport::default()
     };
-    Ok(Planned { op: MachineOperation::Indexed(io), poses, feeds: r.feeds, tool: r.tool, gouge_check: c.gouge_check, report, axes: "3-axis".into() })
+    Ok(Planned {
+        op: MachineOperation::Indexed(io),
+        poses,
+        sources,
+        feeds: r.feeds,
+        tool: r.tool,
+        gouge_check: c.gouge_check,
+        report,
+        axes: "3-axis".into(),
+    })
 }
 
 /// A `bore` operation.

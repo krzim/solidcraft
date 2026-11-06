@@ -226,16 +226,20 @@ fn the_gouge_check_holds_a_drills_point_against_the_part_not_a_flat_bottom() {
     let d = drill_tool(6.0);
     // The drill's tip in the funnel's apex: its point fits the cone.
     assert!(tool_gouges(&surface, &d, &plunge(0.0), 0.01, 0.5).unwrap().is_empty());
-    // A flat end mill there is its tip length into the cone.
+    // A flat end mill there is deep in the cone: the deepest point of the cone inside it is
+    // 1.125 mm from its surface (where the cone, rising 0.6 mm a millimetre out, is as far
+    // above its end as in from its side), though it would have to back out the 1.8 mm of the
+    // cone's height at its rim along its axis.
     let mill = Tool::new(1, ToolKind::FlatEndmill, 6.0, 40.0);
     let hits = tool_gouges(&surface, &mill, &plunge(0.0), 0.01, 0.5).unwrap();
-    assert!(hits.first().is_some_and(|h| h.distance > 1.5), "{hits:?}");
-    // The drill 0.3 mm too deep gouges by that much, found on the move and at the tip's pose.
+    assert!(hits.first().is_some_and(|h| h.distance > 1.1 && h.distance < 1.15), "{hits:?}");
+    // The drill 0.3 mm too deep gouges, found on the move and at the tip's pose: square to the
+    // cone's wall, less deep than the 0.3 mm along its axis.
     let hits = tool_gouges(&surface, &d, &plunge(-0.3), 0.01, 0.5).unwrap();
     assert_eq!(hits.len(), 1, "{hits:?}");
     let h = hits.first().unwrap();
     assert_eq!(h.index, 2);
-    assert!((0.2..=0.35).contains(&h.distance), "{h:?}");
+    assert!((0.15..=0.3).contains(&h.distance), "{h:?}");
     assert!(h.pose.tip.z < -0.2, "the tip, not a raised step: {h:?}");
     // A blunter drill (140°) does not fit a 118° cone: its shoulder meets the wall.
     let blunt = Tool { point_angle_deg: Some(140.0), ..d.clone() };

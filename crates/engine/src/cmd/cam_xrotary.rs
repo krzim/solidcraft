@@ -26,8 +26,8 @@ const WRAP_RETRACT: f64 = 1.0;
 
 /// Plans the job entry `spec` onto `planned` (an indexed pattern as one operation per angle) and
 /// holds each against the setup check.
-pub(super) fn plan_into(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5, planned: &mut Vec<Planned>) -> Result<()> {
-    let arc_tol = post.base.arc_tolerance;
+/// `arc_tol`: how closely arcs are followed into the poses the checks run along.
+pub(super) fn plan_into(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5, arc_tol: f64, planned: &mut Vec<Planned>) -> Result<()> {
     let start = planned.len();
     let room = |have: usize, more: usize| {
         if have.saturating_add(more) > MAX_OPERATIONS {
@@ -146,9 +146,11 @@ fn continuous(c: Common<'_>, r: Resolved, kind: &str, path: Toolpath5) -> Planne
         path: path.clone(),
         plunge_feed: Some(r.feeds.plunge),
     };
+    let sources = (0..path.moves.len()).collect();
     Planned {
         op: MachineOperation::Continuous(op),
         poses: path,
+        sources,
         feeds: r.feeds,
         tool: r.tool,
         gouge_check: c.gouge_check,

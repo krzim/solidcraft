@@ -31,7 +31,18 @@ fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Boundary {
 }
 
 fn par(heights: Heights, boundary: Boundary) -> ParallelParams {
-    ParallelParams { heights, feeds: feeds(), stepover: 1.5, angle: 0.0, boundary, stock_to_leave: 0.0, step: 1.0, tolerance: 0.01, zigzag: true }
+    ParallelParams {
+        heights,
+        feeds: feeds(),
+        stepover: 1.5,
+        angle: 0.0,
+        boundary,
+        stock_to_leave: 0.0,
+        step: 1.0,
+        tolerance: 0.01,
+        zigzag: true,
+        descent_limit: DEFAULT_DESCENT_LIMIT,
+    }
 }
 
 /// The targets of every move at feed.
@@ -677,9 +688,9 @@ fn levels_times_samples_are_bounded() {
     assert!(roughing(&high, &flat(6.0), &r).unwrap().moves.is_empty());
 }
 
-/// No cutting move goes down faster than the plunge feed: a move that descends is slowed in
-/// proportion, so a ramp just under 45° is not taken at the full cut feed (and the feed does
-/// not jump between the two on near-45° slivers).
+/// With no descent limit no cutting move goes down faster than the plunge feed: a move that
+/// descends is slowed in proportion, so a ramp just under 45° is not taken at the full cut feed
+/// (and the feed does not jump between the two on near-45° slivers). Roughing always works so.
 #[test]
 fn descents_never_go_down_faster_than_the_plunge_feed() {
     let s = sphere(Vec3::new(0.0, 0.0, 0.0), 10.0, 32);
@@ -705,6 +716,253 @@ fn descents_never_go_down_faster_than_the_plunge_feed() {
     };
     for tool in [flat(6.0), ball(6.0)] {
         check(&roughing(&s, &tool, &rough(h, rect(-15.0, -15.0, 15.0, 15.0))).unwrap());
-        check(&parallel(&s, &tool, &par(h, rect(-15.0, -15.0, 15.0, 15.0))).unwrap());
+        let mut p = par(h, rect(-15.0, -15.0, 15.0, 15.0));
+        p.descent_limit = 0.0;
+        check(&parallel(&s, &tool, &p).unwrap());
     }
+}
+
+/// Finishing runs down the surface at the cut feed: only moves at least as steep as the
+/// descent limit (70° by default) and entries from above are slowed to the plunge feed's rate
+/// of descent. On a sphere a 45° flank used to run at about a fifth of the cut feed.
+#[test]
+fn finishing_runs_down_the_surface_at_the_cut_feed() {
+    let s = sphere(Vec3::new(0.0, 0.0, 0.0), 10.0, 64);
+    let h = Heights { clearance: 25.0, retract: 15.0, top: 11.0, bottom: -1.0 };
+    let f = feeds();
+    for limit in [DEFAULT_DESCENT_LIMIT, 45f64.to_radians()] {
+        let mut p = par(h, rect(-12.0, -12.0, 12.0, 12.0));
+        p.descent_limit = limit;
+        let path = parallel(&s, &ball(4.0), &p).unwrap();
+        verify(&path, &h).unwrap();
+        let (mut shallow, mut steep) = (0, 0);
+        let mut pos: Option<Vec3> = None;
+        for m in &path.moves {
+            if let (Move::Feed { to, feed }, Some(q)) = (*m, pos) {
+                let (len, drop) = (q.dist(to), q.z - to.z);
+                if drop > 1e-9 && drop < limit.sin() * len * (1.0 - 1e-9) {
+                    shallow += 1;
+                    assert_eq!(feed, f.cut, "{q:?} → {to:?} down the surface at {feed}");
+                } else if drop > 1e-9 {
+                    steep += 1;
+                    assert!(feed * drop / len <= f.plunge * (1.0 + 1e-9), "{q:?} → {to:?} goes down at {}", feed * drop / len);
+                }
+            }
+            pos = m.target().or(pos);
+        }
+        assert!(shallow > 100 && steep > 0, "{shallow} down the surface, {steep} steep");
+    }
+    // A descent limit beyond a right angle, or not a number, is refused.
+    for bad in [-0.1, 1.6, f64::NAN] {
+        let mut p = par(h, rect(-12.0, -12.0, 12.0, 12.0));
+        p.descent_limit = bad;
+        assert!(parallel(&s, &ball(4.0), &p).is_err());
+    }
+    // Left out of the JSON, the default.
+    let mut v = serde_json::to_value(par(h, rect(0.0, 0.0, 1.0, 1.0))).unwrap();
+    v.as_object_mut().unwrap().remove("descent_limit");
+    assert_eq!(serde_json::from_value::<ParallelParams>(v).unwrap().descent_limit, DEFAULT_DESCENT_LIMIT);
+}
+
+/// A link between passes is never further into the part than half the tolerance: it follows the
+/// surface where the straight line would cut into it. Over a dome and the rounded edge of the
+/// block it stands on (where a link once cut 0.016 mm in at a tolerance of 0.01), sampled every
+/// 0.01 mm.
+#[test]
+fn links_between_passes_follow_the_surface() {
+    let mut tris = sphere(Vec3::new(0.0, 0.0, -6.0), 12.0, 96).triangles().to_vec();
+    tris.extend_from_slice(cylinder_x(2.0, -30.0, 30.0, 96).triangles());
+    let s = Surface::new(tris).unwrap();
+    let h = Heights { clearance: 30.0, retract: 15.0, top: 7.0, bottom: -4.0 };
+    let mut p = par(h, rect(-14.0, -6.0, 14.0, 6.0));
+    p.stepover = 0.4;
+    p.step = 1.0;
+    let tool = ball(4.0);
+    let path = parallel(&s, &tool, &p).unwrap();
+    verify(&path, &h).unwrap();
+    let c = tool.cutter().unwrap();
+    let mut links = 0;
+    let mut worst: f64 = 0.0;
+    for (a, b) in feed_moves(&path) {
+        if (a.y - b.y).abs() < 1e-9 {
+            continue;
+        }
+        links += 1;
+        let n = ((a.dist(b) / 0.01).ceil() as usize).clamp(1, 5000);
+        for k in 0..=n {
+            let q = a.lerp(b, k as f64 / n as f64);
+            if let Some(z) = rest(&s, &c, 0.0, q) {
+                worst = worst.max(z - q.z);
+            }
+        }
+    }
+    assert!(links > 20, "{links} links");
+    assert!(worst <= 0.5 * p.tolerance + 1e-9, "a link is {worst} mm into the part");
+}
+
+/// Each roughing level comes down at rapid through the air the levels before it cleared, to
+/// [`ENTRY_GAP`] above the material left (the level before, or the stock's top), and feeds in
+/// from there; it used to feed all the way from the retract height.
+#[test]
+fn roughing_levels_come_down_through_the_air_they_cleared() {
+    let s = block(Vec3::new(-10.0, -10.0, 0.0), Vec3::new(10.0, 10.0, 5.0));
+    let h = Heights { clearance: 30.0, retract: 20.0, top: 8.0, bottom: 0.0 };
+    let p = rough(h, rect(-20.0, -20.0, 20.0, 20.0));
+    let path = roughing(&s, &flat(6.0), &p).unwrap();
+    verify(&path, &h).unwrap();
+    let levels: Vec<f64> = (0..=6).map(|k| 8.0 - 8.0 * k as f64 / 6.0).collect();
+    let mut pos: Option<Vec3> = None;
+    let mut entries = 0;
+    let mut last_rapid = false;
+    for m in &path.moves {
+        if let (Move::Feed { to, feed }, Some(q)) = (*m, pos)
+            && last_rapid
+        {
+            entries += 1;
+            assert_eq!(feed, p.feeds.plunge);
+            // Straight down, from just above the level before this one's.
+            assert!((q.x - to.x).hypot(q.y - to.y) < 1e-12, "{q:?} → {to:?}");
+            let before = levels.iter().copied().filter(|l| *l > to.z + 1e-9).fold(f64::INFINITY, f64::min);
+            assert!(q.z <= before + ENTRY_GAP + 1e-9, "{q:?} → {to:?}: fed from {} above the level before", q.z - before);
+        }
+        last_rapid = matches!(m, Move::Rapid { .. });
+        pos = m.target().or(pos);
+    }
+    assert!(entries >= 6, "{entries} entries");
+}
+
+/// The points of `path` at feed, each reached from the one before.
+fn feed_points(path: &Toolpath) -> Vec<Vec3> {
+    feed_moves(path).into_iter().flat_map(|(a, b)| [a, b]).collect()
+}
+
+/// The distance from `q` to the nearest move of `path` at feed, arcs followed closely.
+fn off_path(path: &Toolpath, q: Vec3) -> f64 {
+    let pts = path.points(1e-5);
+    pts.windows(2).filter(|w| w[1].1).map(|w| q.dist_to_segment(w[0].0, w[1].0)).fold(f64::INFINITY, f64::min)
+}
+
+/// Merging: a roughing level's straight passes become one move each, a waterline's loop round
+/// a pin becomes arcs, and every point merged away is within the tolerance of what replaces it.
+#[test]
+fn compacting_merges_lines_and_fits_arcs_within_the_tolerance() {
+    let s = block(Vec3::new(-10.0, -10.0, 0.0), Vec3::new(10.0, 10.0, 5.0));
+    let h = Heights { clearance: 20.0, retract: 10.0, top: 8.0, bottom: 0.0 };
+    let rough_path = roughing(&s, &flat(6.0), &rough(h, rect(-20.0, -20.0, 20.0, 20.0))).unwrap();
+    let how = Compaction { tolerance: 0.001, arcs: true, helical: true, bow: 0.001 };
+    let merged = compact(&rough_path, &how).unwrap();
+    verify(&merged, &h).unwrap();
+    assert!(merged.moves.len() * 4 < rough_path.moves.len(), "{} of {} moves", merged.moves.len(), rough_path.moves.len());
+    for q in feed_points(&rough_path) {
+        assert!(off_path(&merged, q) <= how.tolerance + 1e-9, "{q:?} is {} off", off_path(&merged, q));
+    }
+    close(merged.stats().cut_length, rough_path.stats().cut_length, 1e-2);
+    // Straight passes give no arcs.
+    assert!(!merged.moves.iter().any(|m| matches!(m, Move::Arc { .. })));
+
+    let pin = pin(1.0, 10.0, 512);
+    let hw = Heights { clearance: 30.0, retract: 15.0, top: 8.0, bottom: 2.0 };
+    let mut p = wl(hw, rect(-6.0, -6.0, 6.0, 6.0));
+    p.step = 0.5;
+    p.stepdown = 3.0;
+    p.tolerance = 0.0005;
+    let loops = waterline(&pin, &flat(4.0), &p).unwrap();
+    let how = Compaction { tolerance: 0.002, arcs: true, helical: false, bow: p.tolerance };
+    let merged = compact(&loops, &how).unwrap();
+    verify(&merged, &hw).unwrap();
+    let arcs = merged.moves.iter().filter(|m| matches!(m, Move::Arc { .. })).count();
+    assert!(arcs >= 6 && merged.moves.len() * 5 < loops.moves.len(), "{arcs} arcs, {} of {} moves", merged.moves.len(), loops.moves.len());
+    for q in feed_points(&loops) {
+        assert!(off_path(&merged, q) <= how.tolerance + 1e-9, "{q:?} is {} off", off_path(&merged, q));
+    }
+    // Without arcs only lines are merged; a level loop is no helix.
+    let lines_only = compact(&loops, &Compaction { arcs: false, ..how }).unwrap();
+    assert!(!lines_only.moves.iter().any(|m| matches!(m, Move::Arc { .. })));
+    // A hostile tolerance is refused.
+    for bad in [-1.0, f64::NAN, 1e9] {
+        assert!(compact(&loops, &Compaction { tolerance: bad, ..how }).is_err());
+        assert!(compact(&loops, &Compaction { bow: bad, ..how }).is_err());
+    }
+}
+
+/// A merged move stays near the path it replaces all along it, not only at the points it
+/// replaces: a line within the tolerance, an arc within the tolerance and the bow asked for.
+/// The corners of an octagon lie on a circle, but an arc through them bows out of the
+/// octagon's sides by 7.6% of its radius between them (it was fitted, and a wall the octagon
+/// runs along would have been cut 0.76 mm deep).
+#[test]
+fn compacting_never_moves_the_path_far_between_its_points() {
+    let corner = |k: usize| {
+        let a = k as f64 * PI / 4.0;
+        Vec3::new(10.0 * a.cos(), 10.0 * a.sin(), 0.0)
+    };
+    let mut moves = vec![Move::Rapid { to: corner(0) }];
+    moves.extend((1..=8).map(|k| Move::Feed { to: corner(k), feed: 500.0 }));
+    let octagon = Toolpath { moves };
+    // The same with each side cut into steps: merging gives the sides back as lines.
+    let mut moves = vec![Move::Rapid { to: corner(0) }];
+    for k in 0..8 {
+        moves.extend((1..=10).map(|s| Move::Feed { to: corner(k).lerp(corner(k + 1), s as f64 / 10.0), feed: 500.0 }));
+    }
+    let stepped = Toolpath { moves };
+    let pin = pin(1.0, 10.0, 512);
+    let hw = Heights { clearance: 30.0, retract: 15.0, top: 8.0, bottom: 2.0 };
+    let mut p = wl(hw, rect(-6.0, -6.0, 6.0, 6.0));
+    p.step = 0.5;
+    p.stepdown = 3.0;
+    p.tolerance = 0.0005;
+    let loops = waterline(&pin, &flat(4.0), &p).unwrap();
+    for (path, tol, bow) in [(&octagon, 0.01, 0.01), (&stepped, 0.01, 0.01), (&loops, 0.002, p.tolerance)] {
+        let how = Compaction { tolerance: tol, arcs: true, helical: true, bow };
+        let merged = compact(path, &how).unwrap();
+        let pts = merged.points(1e-5);
+        for w in pts.windows(2).filter(|w| w[1].1) {
+            for k in 0..=8 {
+                let q = w[0].0.lerp(w[1].0, k as f64 / 8.0);
+                assert!(off_path(path, q) <= tol + bow + 1e-9, "{q:?} is {} off the path it replaces", off_path(path, q));
+            }
+        }
+        for q in feed_points(path) {
+            assert!(off_path(&merged, q) <= tol + 1e-9, "{q:?} is {} off", off_path(&merged, q));
+        }
+    }
+    // The waterline's loops round the pin are still written as arcs.
+    let merged = compact(&loops, &Compaction { tolerance: 0.002, arcs: true, helical: false, bow: p.tolerance }).unwrap();
+    assert!(merged.moves.iter().filter(|m| matches!(m, Move::Arc { .. })).count() >= 6);
+    // The octagon stays an octagon.
+    let merged = compact(&octagon, &Compaction { tolerance: 0.01, arcs: true, helical: true, bow: 0.01 }).unwrap();
+    assert!(!merged.moves.iter().any(|m| matches!(m, Move::Arc { .. })), "{merged:?}");
+}
+
+/// A link between two points where nothing is under the cutter (the ends of two passes that
+/// ran off the part's reach) still looks between them: here the straight line passes 0.2 mm
+/// under where the ball rests on the corner of a block, and used to be taken as it was (a link
+/// over the corner of the dome's block cut 0.0097 mm into it at a tolerance of 0.01).
+#[test]
+fn a_link_between_two_clear_points_rises_over_a_corner_between_them() {
+    let s = block(Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 10.0, 5.0));
+    let c = Cutter::ball(2.0).unwrap();
+    let tol = 0.01;
+    let field = crate::surface_ops::Field::new(&s, &c, 0.0, None, tol).unwrap();
+    // Both ends 2.05 from the corner's edge, the chord between them 1 long: its middle is 1.988
+    // from the edge, where the ball rests on the corner at 3.22.
+    let at = |deg: f64| Vec3::new(2.05 * deg.to_radians().cos(), 2.05 * deg.to_radians().sin(), 3.0);
+    let half = (0.5f64 / 2.05).asin().to_degrees();
+    let (a, b) = (at(225.0 - half), at(225.0 + half));
+    assert!(rest(&s, &c, 0.0, a).is_none() && rest(&s, &c, 0.0, b).is_none());
+    assert!(rest(&s, &c, 0.0, a.lerp(b, 0.5)).is_some_and(|z| z > 3.2), "the corner is under the middle");
+    let way = crate::surface_ops::link_path(&field, a, b, 10.0, 1.0, tol).unwrap().unwrap();
+    assert!(way.len() > 2, "{way:?}");
+    let mut from = a;
+    let mut worst = f64::NEG_INFINITY;
+    for p in way {
+        for k in 0..=200 {
+            let q = from.lerp(p, k as f64 / 200.0);
+            if let Some(z) = rest(&s, &c, 0.0, q) {
+                worst = worst.max(z - q.z);
+            }
+        }
+        from = p;
+    }
+    assert!(worst <= 0.5 * tol + 1e-9, "the link is {worst} mm into the corner");
 }

@@ -411,6 +411,7 @@ fn a_fifty_millimetre_part_at_a_twentieth_of_a_millimetre() {
             step: 1.0,
             tolerance: 0.01,
             zigzag: true,
+            descent_limit: DEFAULT_DESCENT_LIMIT,
         },
     )
     .unwrap();

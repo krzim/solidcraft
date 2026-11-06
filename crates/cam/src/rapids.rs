@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use solidcore_record::{Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
+use crate::check::Swept;
 use crate::collision::{Moves, gouges_in, holder_collisions_in};
 use crate::cutter::Cutter;
 use crate::gcode::words;
@@ -352,6 +353,11 @@ pub fn check_rapids_staged(
     // The operation and the start of its last retract straight up the tool's axis, which a
     // rapid may go back down along as far as it started (a peck drill's way back into its hole).
     let mut withdrawn: Option<(usize, Pose)> = None;
+    // Each operation's straight cutting moves so far with the tool upright, in work
+    // coordinates: a rapid straight down to above where one of them went through that point
+    // comes down through what that operation has already cut (a level of a pocket or a
+    // roughing coming down through the air the levels before cleared).
+    let mut cut: Vec<Swept> = program.operations.iter().map(|_| Swept::default()).collect();
     for (i, b) in blocks.iter().enumerate() {
         let (line, linear, rotary, tcp, rapid) = match b {
             JointWords::Rapid { line, linear, rotary, tcp } => (*line, *linear, rotary, *tcp, true),
@@ -383,7 +389,8 @@ pub fn check_rapids_staged(
                 };
                 let deliberate = owner.is_some() && unchecked.get(k).copied().unwrap_or(false);
                 let back_in = owner.is_some() && withdrawn.as_ref().is_some_and(|(w, bottom)| *w == k && back_down(&poses, bottom));
-                let left = if back_in { None } else { left };
+                let through_cut = owner.is_some() && cut.get(k).is_some_and(|c| down_into(&poses, c));
+                let left = if back_in || through_cut { None } else { left };
                 check_block(&mut out, &poses, (line, owner.as_ref().map(|_| k)), tool, cutter, obstacles, left, deliberate, tol, step)?;
                 if owner.is_some() && retract(&poses) {
                     withdrawn = poses.first().map(|p| (k, *p));
@@ -402,9 +409,40 @@ pub fn check_rapids_staged(
                 }
             }
         }
+        if !rapid
+            && let (Some(&k), Some(from)) = (owner.as_ref().and_then(|o| o.get(i)), state.as_ref())
+            && let Some(c) = cut.get_mut(k)
+        {
+            // An arc is filed by its ends: its chord is not where it cut.
+            let arc = matches!(b, JointWords::Arc { .. });
+            let (a, end) = (pose_at(machine, from.linear, &from.rotary, from.tcp), pose_at(machine, to.linear, &to.rotary, to.tcp));
+            if upright(&a) && upright(&end) {
+                if arc {
+                    c.add(a.tip, a.tip);
+                    c.add(end.tip, end.tip);
+                } else {
+                    c.add(a.tip, end.tip);
+                }
+            }
+        }
         state = Some(to);
     }
     Ok(out)
+}
+
+/// Whether the tool's axis is work +Z.
+fn upright(p: &Pose) -> bool {
+    p.axis.z >= 1.0 - 1e-9
+}
+
+/// Whether `poses` (a rapid's samples) run straight down with the tool upright, ending above
+/// where a cutting move of `cut` went through that point.
+fn down_into(poses: &[Pose], cut: &Swept) -> bool {
+    let (Some(a), Some(b)) = (poses.first(), poses.last()) else { return false };
+    poses.len() > 1
+        && b.tip.z < a.tip.z
+        && poses.iter().all(|p| upright(p) && (p.tip.x - a.tip.x).hypot(p.tip.y - a.tip.y) <= 1e-6)
+        && cut.below(Vec2::new(b.tip.x, b.tip.y), b.tip.z)
 }
 
 /// The poses along a rapid from `from` (the block's start; `None` where it is not known: only
@@ -466,7 +504,7 @@ fn check_block(
         }
     }
     if !tool.envelopes().is_empty() {
-        let hits = holder_collisions_in(obstacles, tool, &path, 0.0, step, Moves::All)?;
+        let hits = holder_collisions_in(obstacles, tool, &path, 0.0, 0.0, step, Moves::All)?;
         if let Some(h) = hits.iter().min_by(|a, b| a.distance.total_cmp(&b.distance)) {
             out.hit(RapidHit { line, operation: op, kind: RapidHitKind::Holder, depth: (-h.distance).max(0.0), at: h.pose.tip });
         }

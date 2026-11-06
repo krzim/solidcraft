@@ -417,3 +417,41 @@ fn a_peck_rapid_back_into_its_own_hole_is_not_in_the_stock() {
     let elsewhere = pecks(-2.5, 6.0);
     assert!(elsewhere.hits.iter().any(|h| h.kind == RapidHitKind::Stock), "{elsewhere:?}");
 }
+
+/// A level of a pocket or a roughing comes down at rapid through what the levels before it cut,
+/// to just above the material left: that rapid is below the stock's top but in air the same
+/// operation has cleared, so the stock does not count against it. The same rapid where nothing
+/// was cut is in the stock.
+#[test]
+fn a_rapid_down_through_what_its_operation_cut_is_not_in_the_stock() {
+    let post = Post5::mach3_4axis();
+    let stock = Stock::Box { min: Vec3::new(-15.0, -15.0, -12.0), max: Vec3::new(15.0, 15.0, 4.0) };
+    let levels = |x: f64| {
+        let v = Vec3::new;
+        let moves = vec![
+            Move::Rapid { to: v(-5.0, 0.0, 10.0) },
+            Move::Rapid { to: v(-5.0, 0.0, 5.0) },
+            Move::Feed { to: v(-5.0, 0.0, 2.0), feed: 100.0 },
+            Move::Feed { to: v(5.0, 0.0, 2.0), feed: 300.0 },
+            Move::Rapid { to: v(5.0, 0.0, 10.0) },
+            Move::Rapid { to: v(x, 0.0, 10.0) },
+            // Down at rapid to 1 mm above the level just cut.
+            Move::Rapid { to: v(x, 0.0, 3.0) },
+            Move::Feed { to: v(x, 0.0, 1.0), feed: 100.0 },
+            Move::Feed { to: v(5.0, 0.0, 1.0), feed: 300.0 },
+            Move::Rapid { to: v(5.0, 0.0, 10.0) },
+        ];
+        program(vec![MachineOperation::Indexed(IndexedOperation {
+            name: "levels".into(),
+            tool: flat(1, 6.0),
+            spindle_rpm: 12000.0,
+            coolant: false,
+            rotary: Vec::new(),
+            path: Toolpath { moves },
+        })])
+    };
+    let r = check3(&levels(-5.0), &post, Some(&stock));
+    assert!(r.pass(), "{r:?}");
+    let r = check3(&levels(8.0), &post, Some(&stock));
+    assert!(r.hits.iter().any(|h| h.kind == RapidHitKind::Stock && (h.at.x - 8.0).abs() < 1e-6), "{r:?}");
+}

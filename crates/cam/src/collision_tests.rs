@@ -351,3 +351,131 @@ fn a_tool_touching_a_wall_does_not_gouge_it() {
     let out = tilt_away(&s, &tool, &along_the_wall(-7.0), &options(deg(40.0))).unwrap();
     assert!(holder_collisions(&s, &tool, &out, 0.5, 0.5).unwrap().is_empty());
 }
+
+/// The depth of a gouge is how deep the cutter is in the surface, square to it: on a 60° slope a
+/// ball 0.05 mm too close to it is 0.05 mm in, though it would have to back out 0.1 mm along its
+/// axis (what the check used to report). The ball along a move is measured exactly, and so is a
+/// flat end, at its deepest sample.
+#[test]
+fn the_gouge_depth_is_measured_square_to_the_surface() {
+    let th = deg(60.0);
+    let s = slope(50.0, th);
+    let (r, d) = (2.0, 0.05);
+    let ball = Cutter::ball(r).unwrap();
+    // The plane's unit normal; the ball's centre r − d from the plane, at y from -5 to 5.
+    let n = Vec3::new(-th.sin(), 0.0, th.cos());
+    let centre = |y: f64| Vec3::new(0.0, y, 0.0) + n * (r - d);
+    let tip = |y: f64| centre(y) - Vec3::new(0.0, 0.0, r);
+    let path = path3(&[(tip(-5.0) + Vec3::new(0.0, 0.0, 30.0), false), (tip(-5.0), true), (tip(5.0), true)]);
+    let hits = gouges(&s, &ball, &path, 0.01, 0.5).unwrap();
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    for h in &hits {
+        close(h.distance, d, 1e-9);
+    }
+    close(depth_at(&s, &ball, &Pose::vertical(tip(0.0))).unwrap(), d, 1e-7);
+    // A flat end 0.03 below a level floor is 0.03 in.
+    let floor = plane(50.0, 0.0);
+    let flat = Cutter::flat(3.0).unwrap();
+    let low = path3(&[(Vec3::new(-5.0, 0.0, 10.0), false), (Vec3::new(-5.0, 0.0, -0.03), true), (Vec3::new(5.0, 0.0, -0.03), true)]);
+    let hits = gouges(&floor, &flat, &low, 0.01, 0.5).unwrap();
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    for h in &hits {
+        close(h.distance, 0.03, 1e-7);
+    }
+    // Clear of the surface, or touching it, is no depth at all.
+    assert_eq!(depth_at(&floor, &flat, &Pose::vertical(Vec3::new(0.0, 0.0, 0.5))).unwrap(), 0.0);
+    assert!(depth_at(&floor, &flat, &Pose::vertical(Vec3::ZERO)).unwrap() < 1e-9);
+    // Buried deeper than the radius: as far as it would have to back out.
+    close(depth_at(&floor, &flat, &Pose::vertical(Vec3::new(0.0, 0.0, -5.0))).unwrap(), 5.0, 1e-9);
+}
+
+/// A gouge between two samples is found: a ball moving straight over the edge of a block,
+/// clear at both ends of the move, is 0.03 mm into the edge half way, measured exactly; a flat
+/// end over a rib narrower than its samples are apart is found by the samples between them.
+#[test]
+fn a_gouge_between_samples_is_found_and_measured() {
+    let b = block(Vec3::new(-10.0, -10.0, 0.0), Vec3::new(10.0, 10.0, 5.0));
+    let ball = Cutter::ball(3.0).unwrap();
+    // The ball's centre runs along y = 10 + 1, 2.8 above the top: 2.973 from the edge at
+    // (·, 10, 5) at its nearest, so 0.027 in, but only along the block (|x| ≤ 10).
+    let z = 5.0 + 2.8 - 3.0;
+    let over = path3(&[(Vec3::new(-30.0, 11.0, 20.0), false), (Vec3::new(-30.0, 11.0, z), true), (Vec3::new(30.0, 11.0, z), true)]);
+    let hits = gouges(&b, &ball, &over, 0.01, 2.0).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let expect = 3.0 - 1.0f64.hypot(2.8);
+    close(hits[0].distance, expect, 1e-9);
+    assert!(hits[0].pose.tip.x.abs() <= 10.0 + 1e-9, "{:?}", hits[0].pose);
+    // A rib 0.2 wide and 1 high on a floor, under a flat end 0.02 too low over it, crossed by a
+    // move 10 long sampled every 4: it is found between the samples, as deep as it is.
+    let mut tris = plane(50.0, 0.0).triangles().to_vec();
+    tris.extend_from_slice(block(Vec3::new(4.9, -20.0, 0.0), Vec3::new(5.1, 20.0, 1.0)).triangles());
+    let ribbed = Surface::new(tris).unwrap();
+    let flat = Cutter::flat(1.0).unwrap();
+    let across = path3(&[(Vec3::new(0.0, 0.0, 10.0), false), (Vec3::new(0.0, 0.0, 0.98), true), (Vec3::new(10.0, 0.0, 0.98), true)]);
+    let hits = gouges(&ribbed, &flat, &across, 0.005, 4.0).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    close(hits[0].distance, 0.02, 1e-6);
+}
+
+/// The inside of a round hole of radius `r` about the Z axis from `z0` to `z1`, `n` facets round.
+fn hole(r: f64, z0: f64, z1: f64, n: usize) -> Surface {
+    let at = |j: usize, z: f64| {
+        let th = TAU * (j % n) as f64 / n as f64;
+        Vec3::new(r * th.cos(), r * th.sin(), z)
+    };
+    let mut tris = Vec::new();
+    for j in 0..n {
+        let (a, b, c, d) = (at(j, z0), at(j + 1, z0), at(j + 1, z1), at(j, z1));
+        tris.push([a, c, b]);
+        tris.push([a, d, c]);
+    }
+    Surface::new(tris).unwrap()
+}
+
+/// A shank no wider than the cutter, above the flutes, cannot hit a wall the cutter has just
+/// cut: round a hole the cutter runs on the true wall, which is a hair outside the facets, and
+/// the shank of its own diameter is that hair into them too. Within the gouge check's tolerance
+/// that is no collision; a wider shank still is one.
+#[test]
+fn a_shank_as_wide_as_the_cutter_does_not_hit_the_hole_it_cuts() {
+    let s = hole(3.0, -15.0, 0.0, 128);
+    let mut tool = Tool::new(4, ToolKind::FlatEndmill, 4.0, 12.0);
+    tool.shank_diameter = Some(4.0);
+    tool.stickout = Some(20.0);
+    tool.holder = vec![HolderSection { diameter: 34.0, length: 22.0 }];
+    // Round the hole at radius 1, the tip 13 down: the shank is in the hole from 1 down up.
+    let round: Vec<(Vec3, bool)> = std::iter::once((Vec3::new(1.0, 0.0, 10.0), false))
+        .chain(
+            (0..=64).map(|k| (Vec3::new(1.0, 0.0, -13.0) + Vec3::new((TAU * k as f64 / 64.0).cos() - 1.0, (TAU * k as f64 / 64.0).sin(), 0.0), true)),
+        )
+        .collect();
+    let path = path3(&round);
+    let sag = 3.0 * (1.0 - (PI / 128.0).cos());
+    assert!(!holder_collisions(&s, &tool, &path, 0.0, 0.5).unwrap().is_empty(), "the facets are {sag} inside the true wall");
+    let within = holder_collisions_within(&s, &tool, &path, 0.0, 0.005, 0.5).unwrap();
+    assert!(within.is_empty(), "{within:?}");
+    assert!(gouges(&s, &tool.cutter().unwrap(), &path, 0.005, 0.5).unwrap().is_empty());
+    // A 5 mm shank above a 4 mm cutter is into the wall by half a millimetre: a collision, once
+    // per move whatever the samples.
+    tool.shank_diameter = Some(5.0);
+    let hits = holder_collisions_within(&s, &tool, &path, 0.0, 0.005, 0.1).unwrap();
+    assert!(!hits.is_empty() && hits.iter().all(|h| h.envelope == Some(0)) && hits.len() <= path.moves.len(), "{} hits", hits.len());
+    assert!(holder_collisions_within(&s, &tool, &path, 0.0, f64::NAN, 0.5).is_err());
+}
+
+/// The deepest sample by the quick test is not always the deepest gouge: beside a tall wall
+/// the cutter would have to back out the wall's height along its axis, though it is only a
+/// hair into it. A flat end 0.03 mm into a plate at the start of a move and 0.012 mm into a
+/// wall at its end is 0.03 mm deep there (it used to be reported as 0.012, the wall's depth).
+#[test]
+fn the_deepest_gouge_of_a_move_is_measured_whatever_the_quick_test_says() {
+    let mut tris = block(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 0.03)).triangles().to_vec();
+    tris.extend_from_slice(block(Vec3::new(12.0 - 0.012, -5.0, -5.0), Vec3::new(20.0, 5.0, 5.0)).triangles());
+    let s = Surface::new(tris).unwrap();
+    // A flat end of radius 2, its tip at Z 0 from X 0 to 10.
+    let flat = Cutter::flat(2.0).unwrap();
+    let path = path3(&[(Vec3::new(0.0, 0.0, 10.0), false), (Vec3::new(0.0, 0.0, 0.0), true), (Vec3::new(10.0, 0.0, 0.0), true)]);
+    let hits = gouges(&s, &flat, &path, 0.01, 0.5).unwrap();
+    let along = hits.iter().find(|h| h.index == 2).map(|h| h.distance);
+    assert!(along.is_some_and(|d| (d - 0.03).abs() < 1e-6), "{hits:?}");
+}

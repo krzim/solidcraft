@@ -7,9 +7,9 @@ use solidcraft_cam::finish3d::{
     OffsetDirection, PencilParams, RestParams, ScallopParams, ShallowPattern, Spacing, SteepShallowParams, pencil, rest_finish, scallop,
     steep_shallow,
 };
-use solidcraft_cam::{Surface, Tool, Toolpath};
+use solidcraft_cam::{Surface, Tool};
 
-use super::{Ctx, Resolved, heights, or_tool};
+use super::{Ctx, Planned3, heights, or_tool, split_budget};
 use crate::Result;
 use crate::schema::cam::{DirectionSpec, PencilOp, RestFinishOp, ScallopOp, ShallowSpec, SteepShallowOp};
 
@@ -28,9 +28,10 @@ fn step(v: Option<f64>, tool: &Tool) -> f64 {
     v.unwrap_or(tool.diameter * 0.1)
 }
 
-pub(super) fn plan_scallop(ctx: &Ctx<'_>, o: &ScallopOp, surface: &Surface) -> Result<(Toolpath, Resolved, &'static str)> {
+pub(super) fn plan_scallop(ctx: &Ctx<'_>, o: &ScallopOp, surface: &Surface) -> Result<Planned3> {
     let c = o.common();
     let r = ctx.resolve(&c)?;
+    let (tolerance, merge) = split_budget(ctx.surface_budget(c.name, o.tolerance)?);
     let params = ScallopParams {
         heights: heights(&o.heights),
         feeds: r.feeds,
@@ -42,16 +43,17 @@ pub(super) fn plan_scallop(ctx: &Ctx<'_>, o: &ScallopOp, surface: &Surface) -> R
         boundary: ctx.boundary(c.name, o.boundary.as_ref())?,
         stock_to_leave: o.stock_to_leave.unwrap_or(0.0),
         step: step(o.step, &r.tool),
-        tolerance: ctx.tolerance(c.name, o.tolerance)?,
+        tolerance,
         climb: o.climb.unwrap_or(true),
     };
     let path = scallop(surface, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
-    Ok((path, r, "scallop"))
+    Ok((path, r, "scallop", merge))
 }
 
-pub(super) fn plan_steep_shallow(ctx: &Ctx<'_>, o: &SteepShallowOp, surface: &Surface) -> Result<(Toolpath, Resolved, &'static str)> {
+pub(super) fn plan_steep_shallow(ctx: &Ctx<'_>, o: &SteepShallowOp, surface: &Surface) -> Result<Planned3> {
     let c = o.common();
     let r = ctx.resolve(&c)?;
+    let (tolerance, merge) = split_budget(ctx.surface_budget(c.name, o.tolerance)?);
     let shallow = match o.shallow.unwrap_or(ShallowSpec::Scallop) {
         ShallowSpec::Scallop => {
             if o.angle_deg.is_some() {
@@ -72,16 +74,17 @@ pub(super) fn plan_steep_shallow(ctx: &Ctx<'_>, o: &SteepShallowOp, surface: &Su
         boundary: ctx.boundary(c.name, o.boundary.as_ref())?,
         stock_to_leave: o.stock_to_leave.unwrap_or(0.0),
         step: step(o.step, &r.tool),
-        tolerance: ctx.tolerance(c.name, o.tolerance)?,
+        tolerance,
         climb: o.climb.unwrap_or(true),
     };
     let path = steep_shallow(surface, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
-    Ok((path, r, "steep_shallow"))
+    Ok((path, r, "steep_shallow", merge))
 }
 
-pub(super) fn plan_pencil(ctx: &Ctx<'_>, o: &PencilOp, surface: &Surface) -> Result<(Toolpath, Resolved, &'static str)> {
+pub(super) fn plan_pencil(ctx: &Ctx<'_>, o: &PencilOp, surface: &Surface) -> Result<Planned3> {
     let c = o.common();
     let r = ctx.resolve(&c)?;
+    let (tolerance, merge) = split_budget(ctx.surface_budget(c.name, o.tolerance)?);
     let params = PencilParams {
         heights: heights(&o.heights),
         feeds: r.feeds,
@@ -92,25 +95,25 @@ pub(super) fn plan_pencil(ctx: &Ctx<'_>, o: &PencilOp, surface: &Surface) -> Res
         boundary: ctx.boundary(c.name, o.boundary.as_ref())?,
         stock_to_leave: o.stock_to_leave.unwrap_or(0.0),
         step: step(o.step, &r.tool),
-        tolerance: ctx.tolerance(c.name, o.tolerance)?,
+        tolerance,
         climb: o.climb.unwrap_or(true),
     };
     let path = pencil(surface, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
-    Ok((path, r, "pencil"))
+    Ok((path, r, "pencil", merge))
 }
 
-pub(super) fn plan_rest_finish(ctx: &Ctx<'_>, o: &RestFinishOp, surface: &Surface) -> Result<(Toolpath, Resolved, &'static str)> {
+pub(super) fn plan_rest_finish(ctx: &Ctx<'_>, o: &RestFinishOp, surface: &Surface) -> Result<Planned3> {
     let c = o.common();
     let r = ctx.resolve(&c)?;
+    let (tolerance, merge) = split_budget(ctx.surface_budget(c.name, o.tolerance)?);
     let Some(previous) = ctx.tools.iter().find(|t| t.number == o.previous_tool) else {
         return Err(ctx.bad(c.name, format!("no tool number {} (`previous_tool`)", o.previous_tool)));
     };
-    let tolerance = ctx.tolerance(c.name, o.tolerance)?;
     let params = RestParams {
         heights: heights(&o.heights),
         feeds: r.feeds,
         previous: previous.clone(),
-        threshold: o.threshold.unwrap_or(2.0 * tolerance),
+        threshold: o.threshold.unwrap_or(2.0 * ctx.tolerance(c.name, o.tolerance)?),
         spacing: spacing(ctx, c.name, o.scallop_height, o.stepover, &r.tool)?,
         overlap: o.overlap.unwrap_or(r.tool.diameter * 0.25),
         boundary: ctx.boundary(c.name, o.boundary.as_ref())?,
@@ -120,5 +123,5 @@ pub(super) fn plan_rest_finish(ctx: &Ctx<'_>, o: &RestFinishOp, surface: &Surfac
         climb: o.climb.unwrap_or(true),
     };
     let path = rest_finish(surface, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
-    Ok((path, r, "rest_finish"))
+    Ok((path, r, "rest_finish", merge))
 }

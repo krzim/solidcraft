@@ -29,7 +29,7 @@ use solidcore_record::{Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
 use crate::check::verify;
-use crate::collision::{Hit, gouges};
+use crate::collision::{GougeTest, Hit, Moves as Sampled, depth_at, for_each_sample, gouges};
 use crate::cutter::Cutter;
 use crate::dropcutter::drop_z;
 use crate::multiaxis::{Move5, Pose, Toolpath5};
@@ -332,8 +332,12 @@ fn raised(path: &Toolpath5, h: f64) -> Toolpath5 {
 /// The gouges of `tool` along the cutting moves of `path`, as [`gouges`] finds them for a
 /// milling cutter. A drill is held against the surface as its real shape: the full diameter
 /// from [`tip_length`] up, and its point as stepped cylinders inscribed in the cone, each
-/// within the larger of `tol` and 1/64 of the tip length of the cone along the axis. One hit
-/// per move, at its deepest; the pose is the tip's.
+/// within the larger of `tol` and 1/64 of the tip length of the cone along the axis. Every step
+/// is tested quickly at the samples of each move (how far it would have to back out along its
+/// axis); the deepest step of each move is then measured as [`gouges`] measures a cutter (the
+/// deepest point of the surface inside it, to its own surface, see [`depth_at`]), so a part
+/// with many gouging pecks costs one exact measure per move, not one per step. One hit per
+/// move, at its deepest; the pose is the tip's.
 pub fn tool_gouges(surface: &Surface, tool: &Tool, path: &Toolpath5, tol: f64, sample_step: f64) -> Result<Vec<Hit>> {
     if tool.kind != ToolKind::Drill {
         return gouges(surface, &tool.cutter()?, path, tol, sample_step);
@@ -344,27 +348,39 @@ pub fn tool_gouges(surface: &Surface, tool: &Tool, path: &Toolpath5, tol: f64, s
         return gouges(surface, &Cutter::flat(r)?, path, tol, sample_step);
     }
     let steps = ((length / tol.max(1e-6)).ceil().max(1.0) as usize).min(MAX_POINT_STEPS);
-    // The deepest hit of every step on each move, keyed by the move: one lookup per hit, not a
-    // search through every hit found so far (which made a part with many gouging pecks
-    // quadratic in them).
-    let mut hits: BTreeMap<usize, Hit> = BTreeMap::new();
+    // The deepest quick value of every step on each move, keyed by the move: one lookup per
+    // hit, not a search through every hit found so far (which made a part with many gouging
+    // pecks quadratic in them). With it, the step and the pose of its cylinder.
+    let mut deepest: BTreeMap<usize, (f64, usize, Pose)> = BTreeMap::new();
     for k in 1..=steps {
         let t = k as f64 / steps as f64;
-        let h = length * t;
-        for mut hit in gouges(surface, &Cutter::flat(r * t)?, &raised(path, h), tol, sample_step)? {
-            hit.pose = Pose::new(hit.pose.up(-h), hit.pose.axis);
-            match hits.entry(hit.index) {
-                Entry::Occupied(mut x) if hit.distance > x.get().distance => {
-                    x.insert(hit);
-                }
-                Entry::Occupied(_) => {}
-                Entry::Vacant(x) => {
-                    x.insert(hit);
+        let cutter = Cutter::flat(r * t)?;
+        let test = GougeTest::new(&cutter, tol)?;
+        let lifted = raised(path, length * t);
+        for_each_sample(&lifted, cutter.radius, sample_step, Sampled::Cutting, |index, pose| {
+            if let Some(d) = test.depth(surface, &pose)? {
+                match deepest.entry(index) {
+                    Entry::Occupied(mut x) if d > x.get().0 => {
+                        x.insert((d, k, pose));
+                    }
+                    Entry::Occupied(_) => {}
+                    Entry::Vacant(x) => {
+                        x.insert((d, k, pose));
+                    }
                 }
             }
+            Ok(())
+        })?;
+    }
+    let mut hits = Vec::with_capacity(deepest.len());
+    for (index, (_, k, pose)) in deepest {
+        let t = k as f64 / steps as f64;
+        let depth = depth_at(surface, &Cutter::flat(r * t)?, &pose)?;
+        if depth > tol {
+            hits.push(Hit { index, pose: Pose::new(pose.up(-length * t), pose.axis), envelope: None, distance: depth });
         }
     }
-    Ok(hits.into_values().collect())
+    Ok(hits)
 }
 
 /// How far past a hole's edge, as a share of the tool's radius, [`check_approach`] looks for

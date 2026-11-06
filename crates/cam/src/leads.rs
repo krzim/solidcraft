@@ -856,14 +856,15 @@ pub fn contour_with(
         };
         let tab_points: Vec<Vec2> = tabs.iter().map(|s| at_length(&lp, *s).0).collect();
         let rough = make_pass(lp, tabs, opts.lead, &geo, away_left)?;
-        // Down to the top, then into the material by the entry, as often as there are levels.
+        // Down to the top (at rapid to just above it), then into the material by the entry, as
+        // often as there are levels.
         hop(&mut b, rough.entry(), opts.linking, above)?;
-        b.plunge_to(top)?;
+        b.descend_to(top, top)?;
         let mut prev = top;
         for (k, &z) in levels.iter().enumerate() {
             if k > 0 && !rough.lead_in.is_empty() {
                 hop(&mut b, rough.entry(), opts.linking, above)?;
-                b.plunge_to(prev)?;
+                b.descend_to(prev, prev)?;
             }
             down.enter(&mut b, &rough, z)?;
             cut_pass(&mut b, &rough, z, plan.as_ref())?;
@@ -880,11 +881,11 @@ pub fn contour_with(
                     hop(b, to, opts.linking, above)?;
                     // Down where the depth passes cut, or into the material by the entry.
                     if cut_so_far.iter().any(|piece| piece.dist(to) <= 0.9 * r) {
-                        b.plunge_to(bottom)?;
+                        b.descend_to(bottom, top)?;
                     } else if entry == Entry::Plunge {
                         return invalid("a finishing pass would plunge where the depth passes did not cut: give it a smaller lead, or an entry");
                     } else {
-                        b.plunge_to(top)?;
+                        b.descend_to(top, top)?;
                         down.enter(b, &pass, bottom)?;
                     }
                 }
@@ -1094,7 +1095,8 @@ pub fn pocket_with(
                     b.cut_to(start, cleared)?;
                 } else {
                     hop(&mut b, start, opts.linking, above)?;
-                    b.plunge_to(cleared)?;
+                    // Through the air the levels before cut, then down into this one.
+                    b.descend_to(cleared, cleared)?;
                 }
                 match (entry, spot) {
                     (Entry::Helix { angle, .. }, Some((_, c, ccw))) if helix(&mut b, c, ccw, z, angle)? => {}

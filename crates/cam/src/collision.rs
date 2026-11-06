@@ -11,7 +11,9 @@
 //!
 //! A gouge is the cutter deeper in the surface than the tolerance: the cutter shrunk by the
 //! tolerance must not meet it. A tool that only touches a wall beside it, or is within the
-//! tolerance of it sideways, does not gouge it.
+//! tolerance of it sideways, does not gouge it. How deep a gouge is, is the deepest point of
+//! the surface inside the cutter measured to the cutter's own surface ([`depth_at`]), not how
+//! far the cutter would have to back out along its axis, which on a steep wall is far more.
 
 use std::cell::Cell;
 
@@ -23,7 +25,7 @@ use crate::cutter::Cutter;
 use crate::dropcutter::drop_along;
 use crate::multiaxis::{Move5, Pose, Toolpath5, slerp, verify5};
 use crate::path::MAX_MOVES;
-use crate::surface::{Surface, capsule_meets_box, nearest_segments, segment_triangle_distance};
+use crate::surface::{Surface, capsule_meets_box, nearest_on_triangle, nearest_segments, ray_triangle, segment_triangle_distance};
 use crate::tool::{Envelope, Tool};
 use crate::{CamError, Result, invalid};
 
@@ -41,8 +43,7 @@ pub struct Hit {
     pub pose: Pose,
     /// Which of [`Tool::envelopes`] touches; `None` for the cutter itself (a gouge).
     pub envelope: Option<usize>,
-    /// For a gouge, how much farther out along the axis the tool would have to be (mm): for the
-    /// cutter shrunk by the tolerance to clear the surface, plus the tolerance. For an
+    /// For a gouge, how deep the cutter is in the surface there (mm, see [`depth_at`]). For an
     /// envelope, the gap between its cylinder and the nearest triangle (mm), below the clearance
     /// asked for; 0 or less where they touch or cross.
     pub distance: f64,
@@ -91,7 +92,7 @@ pub(crate) enum Moves {
 /// Calls `f` with the move index and pose of every sample along the moves `moves` selects,
 /// each from the pose before it. The start of a run of such moves is sampled too, as the first
 /// move's.
-fn for_each_sample(path: &Toolpath5, reach: f64, step: f64, moves: Moves, mut f: impl FnMut(usize, Pose) -> Result<()>) -> Result<()> {
+pub(crate) fn for_each_sample(path: &Toolpath5, reach: f64, step: f64, moves: Moves, mut f: impl FnMut(usize, Pose) -> Result<()>) -> Result<()> {
     let mut prev: Option<Pose> = None;
     // Whether the move to `prev` was sampled, and whether it was a rapid.
     let (mut sampled, mut after_rapid) = (false, false);
@@ -152,17 +153,284 @@ impl GougeTest {
     }
 
     /// How far the cutter at `pose` is in the surface, where deeper than the tolerance: how much
-    /// farther out along the axis it would have to be (see [`Hit::distance`]).
+    /// farther out along the axis it would have to be for the shrunk cutter to clear it, plus
+    /// the tolerance (a quick test, not the depth: see [`depth_at`]).
     pub(crate) fn depth(&self, surface: &Surface, pose: &Pose) -> Result<Option<f64>> {
         Ok(drop_along(surface, &self.inner, pose.up(self.lift), pose.axis)?.filter(|d| *d > 0.0).map(|d| d + self.tol))
     }
 }
 
+/// Halvings that find a depth: to a billionth of the cutter's radius.
+const DEPTH_HALVINGS: usize = 30;
+/// Golden-section steps that find the deepest point along a move near its deepest sample.
+const DEEPEST_STEPS: usize = 24;
+/// Most samples of one move measured once the deepest is buried deeper than the radius.
+const MAX_BURIED_MEASURES: usize = 64;
+/// Where along each stretch between two samples of a move the cutter is tested besides its
+/// ends: half way and near the thirds (see [`crate::surface_ops`]), so a bulge of the surface
+/// between two samples is met near its top.
+const BETWEEN: [f64; 3] = [0.381_966_011_250_105_1, 0.5, 0.618_033_988_749_894_9];
+
+/// How deep the cutter (endless above its end) at `pose` is in the surface (mm; 0 where it is
+/// clear of it or only touches): the deepest point of the surface inside the cutter, measured
+/// to the cutter's own surface, which is the most the cutter shrunk all round (its tip as far
+/// up the axis) still meets the surface. Found by halving, each step tested exactly against the
+/// triangles, to a billionth of the radius. No point is deeper than the radius: a cutter that
+/// deep in (buried in the part, plunged into a face) is reported as far as it would have to
+/// back out along its axis to clear the surface, if that is farther.
+pub fn depth_at(surface: &Surface, cutter: &Cutter, pose: &Pose) -> Result<f64> {
+    cutter.validate()?;
+    let meets = |d: f64| -> Result<bool> {
+        // A tapered cutter keeps its angle, its side moved in (by at most half its radius).
+        let (inner, lift) = match cutter.cone {
+            None => (Cutter::bull(cutter.radius - d, (cutter.corner - d).max(0.0))?, d),
+            Some(_) => cutter.shrunk(d)?,
+        };
+        Ok(drop_along(surface, &inner, pose.up(lift), pose.axis)?.is_some_and(|t| t > 0.0))
+    };
+    let top = cutter.radius * (1.0 - 1e-9);
+    if !meets(0.0)? {
+        return Ok(0.0);
+    }
+    if meets(top)? {
+        let out = drop_along(surface, cutter, pose.tip, pose.axis)?.unwrap_or(0.0);
+        return Ok(cutter.radius.max(out));
+    }
+    let (mut lo, mut hi) = (0.0, top);
+    for _ in 0..DEPTH_HALVINGS {
+        let m = 0.5 * (lo + hi);
+        if meets(m)? {
+            lo = m;
+        } else {
+            hi = m;
+        }
+    }
+    Ok(lo)
+}
+
+/// The nearest points of the segment `a–b` and the triangle `t`: the distance, the point on
+/// the segment and the point on the triangle.
+fn segment_triangle(a: Vec3, b: Vec3, t: &[Vec3; 3]) -> (f64, Vec3, Vec3) {
+    if let Some(at) = ray_triangle(a, b - a, t)
+        && at <= 1.0
+    {
+        let p = a.lerp(b, at);
+        return (0.0, p, p);
+    }
+    let mut best = {
+        let q = nearest_on_triangle(a, t);
+        (q.dist(a), a, q)
+    };
+    let q = nearest_on_triangle(b, t);
+    if q.dist(b) < best.0 {
+        best = (q.dist(b), b, q);
+    }
+    for (p, q) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+        let (x, y) = nearest_segments(a, b, p, q);
+        if x.dist(y) < best.0 {
+            best = (x.dist(y), x, y);
+        }
+    }
+    best
+}
+
+/// The distance between the triangles `t` and `q`, and the point of `q` nearest `t`: two
+/// triangles apart are nearest along an edge of one of them, and two that meet have an edge of
+/// one through the other.
+fn triangle_triangle(t: &[Vec3; 3], q: &[Vec3; 3]) -> (f64, Vec3) {
+    let mut best = (f64::INFINITY, q[0]);
+    for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+        let (d, _, on_q) = segment_triangle(a, b, q);
+        if d < best.0 {
+            best = (d, on_q);
+        }
+    }
+    for (a, b) in [(q[0], q[1]), (q[1], q[2]), (q[2], q[0])] {
+        let (d, on_q, _) = segment_triangle(a, b, t);
+        if d < best.0 {
+            best = (d, on_q);
+        }
+    }
+    best
+}
+
+/// For a ball moving straight from `from` to `to` with its axis held: the deepest the ball,
+/// endless above its centre, is in the surface anywhere along the move, and the share of the
+/// move where it is; `None` where it is clear all along. Exact: such a ball is everything within
+/// its radius of the half-line up the axis from its centre, so along the move it sweeps
+/// everything within the radius of the strip those half-lines sweep, and the deepest point is
+/// the radius less the distance from the surface to the strip.
+fn ball_move(surface: &Surface, r: f64, from: &Pose, to: &Pose) -> Option<(f64, f64)> {
+    let a = from.axis;
+    let (c0, c1) = (from.up(r), to.up(r));
+    let bounds = surface.bounds();
+    if bounds.is_empty() {
+        return None;
+    }
+    // Up the axis to beyond the surface's highest point along it.
+    let reach = [
+        bounds.min,
+        bounds.max,
+        Vec3::new(bounds.max.x, bounds.min.y, bounds.min.z),
+        Vec3::new(bounds.min.x, bounds.max.y, bounds.min.z),
+        Vec3::new(bounds.min.x, bounds.min.y, bounds.max.z),
+        Vec3::new(bounds.max.x, bounds.max.y, bounds.min.z),
+        Vec3::new(bounds.max.x, bounds.min.y, bounds.max.z),
+        Vec3::new(bounds.min.x, bounds.max.y, bounds.max.z),
+    ]
+    .iter()
+    .map(|p| a.dot(*p))
+    .fold(f64::NEG_INFINITY, f64::max)
+        + r
+        + 1.0;
+    let (u0, u1) = ((reach - a.dot(c0)).max(0.0), (reach - a.dot(c1)).max(0.0));
+    let along = c1 - c0;
+    let across = along - a * a.dot(along);
+    let strip: Vec<[Vec3; 3]> = if across.len() <= 1e-9 {
+        // Along the axis: the strip is the half-line up from the lower centre.
+        let (low, up) = if a.dot(c0) <= a.dot(c1) { (c0, u0) } else { (c1, u1) };
+        vec![[low, low + a * up, low + a * up]]
+    } else {
+        let (q0, q1, q2, q3) = (c0, c1, c1 + a * u1, c0 + a * u0);
+        vec![[q0, q1, q2], [q0, q2, q3]]
+    };
+    let mut lo = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut hi = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for p in strip.iter().flatten() {
+        lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+        hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+    }
+    let (lo, hi) = (lo - Vec3::new(r, r, r), hi + Vec3::new(r, r, r));
+    let best: Cell<Option<(f64, Vec3)>> = Cell::new(None);
+    surface.visit(
+        |b| b.max.x >= lo.x && b.min.x <= hi.x && b.max.y >= lo.y && b.min.y <= hi.y && b.max.z >= lo.z && b.min.z <= hi.z,
+        |_, t| {
+            for q in &strip {
+                let (d, at) = if across.len() <= 1e-9 {
+                    let (d, on, _) = segment_triangle(q[0], q[1], t);
+                    (d, on)
+                } else {
+                    triangle_triangle(t, q)
+                };
+                if d < r && best.get().is_none_or(|(b, _)| d < b) {
+                    best.set(Some((d, at)));
+                }
+            }
+        },
+    );
+    let (d, at) = best.get()?;
+    let share = if across.len() <= 1e-9 { 0.0 } else { ((at - c0).dot(across) / across.len2()).clamp(0.0, 1.0) };
+    Some((r - d, share))
+}
+
+/// The pose a share `t` of the way from `from` to `to`.
+fn between(from: &Pose, to: &Pose, t: f64) -> Pose {
+    Pose::new(from.tip.lerp(to.tip, t), slerp(from.axis, to.axis, t))
+}
+
+/// Finds gouges along moves, sampling where it cannot be exact.
+struct Gouger<'a> {
+    surface: &'a Surface,
+    cutter: Cutter,
+    test: GougeTest,
+    tol: f64,
+    step: f64,
+}
+
+impl Gouger<'_> {
+    /// The deepest point of the move from `from` to `to` (with its share of the way) where the
+    /// cutter is deeper than the tolerance, and how deep; the start is sampled only when
+    /// `start` (it ends the move before otherwise).
+    fn along(&self, from: &Pose, to: &Pose, start: bool) -> Result<Option<(f64, Pose, f64)>> {
+        if self.cutter.is_ball() && from.axis_angle(to) <= 1e-12 {
+            let Some((depth, t)) = ball_move(self.surface, self.cutter.radius, from, to).filter(|(depth, _)| *depth > self.tol) else {
+                return Ok(None);
+            };
+            let pose = between(from, to, t);
+            // As deep as the radius: the depth there says how far it is buried.
+            let depth = if depth >= self.cutter.radius - 1e-12 { depth_at(self.surface, &self.cutter, &pose)? } else { depth };
+            return Ok(Some((t, pose, depth)));
+        }
+        // Sampled at least every step, and between samples half way and near the thirds; the
+        // samples the quick test finds in the surface are then measured, deepest by the quick
+        // test first, and the deepest point near the deepest of them found.
+        // Points of the end are up to its radius out and its rim height up: a tall cone's top
+        // moves farther than its radius as the axis turns.
+        let n = samples_along(from, to, self.cutter.radius.max(self.cutter.rim_height()), self.step)?;
+        let mut found: Vec<(f64, f64)> = Vec::new();
+        for k in 0..=n {
+            let shares = std::iter::once(0.0).chain(if k < n { BETWEEN.to_vec() } else { Vec::new() });
+            for s in shares {
+                let t = (k as f64 + s) / n as f64;
+                if t <= 0.0 && !start {
+                    continue;
+                }
+                if let Some(d) = self.test.depth(self.surface, &between(from, to, t))? {
+                    found.push((t, d));
+                }
+            }
+        }
+        found.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // The quick test is at least the depth where that is less than the radius (the cutter
+        // shrunk by the depth is inside the one the quick test uses, moved up the axis by the
+        // depth less the tolerance), so a sample it puts no deeper than the deepest measured is
+        // no deeper; past the radius it says nothing, so a few more are measured.
+        let mut worst: Option<(f64, f64)> = None;
+        for (measured, (t, quick)) in found.into_iter().enumerate() {
+            if let Some((_, w)) = worst
+                && quick <= w
+                && (w < self.cutter.radius * (1.0 - 1e-9) || measured >= MAX_BURIED_MEASURES)
+            {
+                break;
+            }
+            let depth = depth_at(self.surface, &self.cutter, &between(from, to, t))?;
+            if worst.is_none_or(|(_, w)| depth > w) {
+                worst = Some((t, depth));
+            }
+        }
+        Ok(worst.filter(|(_, depth)| *depth > self.tol).map(|(t, depth)| (t, between(from, to, t), depth)))
+    }
+
+    /// The deepest point along the move near the share `t` (within a sample's spacing `w`
+    /// either side), by golden-section search on the depth.
+    fn deepest_near(&self, from: &Pose, to: &Pose, t: f64, w: f64, depth: f64) -> Result<(f64, Pose, f64)> {
+        let g = 0.5 * (5f64.sqrt() - 1.0);
+        let f = |s: f64| depth_at(self.surface, &self.cutter, &between(from, to, s));
+        let (mut a, mut b) = ((t - w).max(0.0), (t + w).min(1.0));
+        let (mut x1, mut x2) = (b - g * (b - a), a + g * (b - a));
+        let (mut f1, mut f2) = (f(x1)?, f(x2)?);
+        let mut best = (t, depth);
+        for _ in 0..DEEPEST_STEPS {
+            if f1 > best.1 {
+                best = (x1, f1);
+            }
+            if f2 > best.1 {
+                best = (x2, f2);
+            }
+            if f1 < f2 {
+                a = x1;
+                (x1, f1) = (x2, f2);
+                x2 = a + g * (b - a);
+                f2 = f(x2)?;
+            } else {
+                b = x2;
+                (x2, f2) = (x1, f1);
+                x1 = b - g * (b - a);
+                f1 = f(x1)?;
+            }
+        }
+        Ok((best.0, between(from, to, best.0), best.1))
+    }
+}
+
 /// The poses along the cutting moves of `path` where `cutter` (as a cylinder of its radius,
-/// endless above its end) cuts into the surface by more than `tol`: where the cutter shrunk by
-/// `tol` all round (sideways by at most half its radius) and raised by `tol` along its axis
-/// still meets the surface. A cutter touching a wall beside it, or within `tol` of it sideways,
-/// does not gouge it. One hit per move, at its deepest sample.
+/// endless above its end) cuts into the surface deeper than `tol`. One hit per move, at its
+/// deepest point, its [`Hit::distance`] the depth there ([`depth_at`]): a cutter touching a
+/// wall beside it, or within `tol` of it, does not gouge it. A ball whose axis holds along a
+/// move is measured exactly along all of it; another cutter, or a turning axis, is tested at
+/// samples at least every `sample_step` and between them (half way and near the thirds), the
+/// deepest sample measured exactly, and the deepest hit of the path followed to the deepest
+/// point near it.
 pub fn gouges(surface: &Surface, cutter: &Cutter, path: &Toolpath5, tol: f64, sample_step: f64) -> Result<Vec<Hit>> {
     gouges_in(surface, cutter, path, tol, sample_step, Moves::Cutting)
 }
@@ -172,26 +440,63 @@ pub(crate) fn gouges_in(surface: &Surface, cutter: &Cutter, path: &Toolpath5, to
     let test = GougeTest::new(cutter, tol)?;
     check_step(sample_step)?;
     check_path(path)?;
+    let g = Gouger { surface, cutter: *cutter, test, tol, step: sample_step };
     let mut hits: Vec<Hit> = Vec::new();
-    // Points of the end are up to its radius out and its rim height up: a tall cone's top moves
-    // farther than its radius as the axis turns.
-    for_each_sample(path, cutter.radius.max(cutter.rim_height()), sample_step, moves, |index, pose| {
-        if let Some(depth) = test.depth(surface, &pose)? {
-            let hit = Hit { index, pose, envelope: None, distance: depth };
-            match hits.last_mut() {
-                Some(h) if h.index == index => {
-                    if depth > h.distance {
-                        *h = hit;
+    // The deepest sampled hit: its index in `hits`, its move's ends, its share and spacing.
+    let mut sampled: Option<(usize, Pose, Pose, f64, f64)> = None;
+    let mut prev: Option<Pose> = None;
+    let (mut was_checked, mut after_rapid) = (false, false);
+    let mut total = 0usize;
+    for (i, m) in path.moves.iter().enumerate() {
+        let (to, rapid) = match *m {
+            Move5::Feed { to, .. } => (to, false),
+            Move5::Rapid { to } => (to, true),
+            Move5::Dwell { .. } => continue,
+        };
+        let checked = match moves {
+            Moves::Cutting => !rapid,
+            Moves::Links => rapid || after_rapid,
+            Moves::All => true,
+        };
+        if checked {
+            let found = match prev {
+                Some(from) => {
+                    let n = samples_along(&from, &to, cutter.radius.max(cutter.rim_height()), sample_step)?;
+                    total = total.saturating_add(4 * n + 1);
+                    if total > MAX_SAMPLES {
+                        return Err(CamError::TooLarge(format!("more than {MAX_SAMPLES} samples along the toolpath")));
                     }
+                    let exact = cutter.is_ball() && from.axis_angle(&to) <= 1e-12;
+                    g.along(&from, &to, !was_checked)?.map(|(t, pose, depth)| {
+                        if !exact && sampled.is_none_or(|(k, ..)| hits.get(k).is_none_or(|h| depth > h.distance)) {
+                            sampled = Some((hits.len(), from, to, t, 1.0 / n as f64));
+                        }
+                        (pose, depth)
+                    })
                 }
-                _ => hits.push(hit),
+                None => {
+                    let depth = depth_at(surface, cutter, &to)?;
+                    (depth > tol).then_some((to, depth))
+                }
+            };
+            if let Some((pose, depth)) = found {
+                hits.push(Hit { index: i, pose, envelope: None, distance: depth });
             }
         }
-        Ok(())
-    })?;
+        (was_checked, after_rapid, prev) = (checked, rapid, Some(to));
+    }
+    // The deepest sampled hit, if it is the deepest of all, is followed to its deepest point.
+    let deepest = hits.iter().map(|h| h.distance).fold(0.0, f64::max);
+    if let Some((k, from, to, t, w)) = sampled
+        && let Some(h) = hits.get_mut(k)
+        && h.distance >= deepest
+    {
+        let (_, pose, depth) = g.deepest_near(&from, &to, t, w, h.distance)?;
+        h.pose = pose;
+        h.distance = depth;
+    }
     Ok(hits)
 }
-
 /// A convex polygon of at most eight corners, without allocating.
 struct Poly {
     p: [Vec3; 8],
@@ -279,15 +584,35 @@ fn envelope_gap(surface: &Surface, pose: &Pose, e: &Envelope, limit: f64) -> Opt
 /// closer to the surface than `clearance`, measured square to the axis. One hit per move and
 /// envelope, at its closest sample.
 pub fn holder_collisions(surface: &Surface, tool: &Tool, path: &Toolpath5, clearance: f64, sample_step: f64) -> Result<Vec<Hit>> {
-    holder_collisions_in(surface, tool, path, clearance, sample_step, Moves::Cutting)
+    holder_collisions_in(surface, tool, path, clearance, 0.0, sample_step, Moves::Cutting)
 }
 
-/// [`holder_collisions`] along the moves `moves` selects.
+/// [`holder_collisions`], allowing what the gouge check allows: an envelope no wider than the
+/// cutter is inside the cutter's endless cylinder, so it reaches nothing the cutter does not
+/// reach first, and a wall the cutter runs along within `tolerance` (one it has just cut) is no
+/// collision for it either. Such an envelope counts only where it comes closer than `clearance`
+/// less `tolerance`; a wider one as in [`holder_collisions`].
+pub fn holder_collisions_within(
+    surface: &Surface,
+    tool: &Tool,
+    path: &Toolpath5,
+    clearance: f64,
+    tolerance: f64,
+    sample_step: f64,
+) -> Result<Vec<Hit>> {
+    if !(tolerance >= 0.0) || !(tolerance <= 1.0e3) {
+        return invalid("the gouge tolerance must be from 0 to 1000 mm");
+    }
+    holder_collisions_in(surface, tool, path, clearance, tolerance, sample_step, Moves::Cutting)
+}
+
+/// [`holder_collisions_within`] along the moves `moves` selects.
 pub(crate) fn holder_collisions_in(
     surface: &Surface,
     tool: &Tool,
     path: &Toolpath5,
     clearance: f64,
+    tolerance: f64,
     sample_step: f64,
     moves: Moves,
 ) -> Result<Vec<Hit>> {
@@ -303,9 +628,11 @@ pub(crate) fn holder_collisions_in(
     if envelopes.is_empty() {
         return Ok(hits);
     }
+    // What each envelope must keep from the surface.
+    let limits: Vec<f64> = envelopes.iter().map(|e| if e.radius <= tool.radius() + 1e-9 { clearance - tolerance } else { clearance }).collect();
     for_each_sample(path, reach, sample_step, moves, |index, pose| {
-        for (k, e) in envelopes.iter().enumerate() {
-            let Some(gap) = envelope_gap(surface, &pose, e, clearance) else { continue };
+        for (k, (e, limit)) in envelopes.iter().zip(&limits).enumerate() {
+            let Some(gap) = envelope_gap(surface, &pose, e, *limit) else { continue };
             let hit = Hit { index, pose, envelope: Some(k), distance: gap };
             match hits.iter_mut().rev().take_while(|h| h.index == index).find(|h| h.envelope == Some(k)) {
                 Some(h) => {
@@ -696,7 +1023,7 @@ pub fn tilt_away(surface: &Surface, tool: &Tool, path: &Toolpath5, opts: &TiltOp
     if let Some(h) = gouges_in(surface, &t.cutter, &out, opts.tolerance, opts.sample_step, Moves::All)?.first() {
         return Err(CamError::Unsafe(format!("move {}: the tilted tool cuts {:.4} mm into the surface", named(h.index), h.distance)));
     }
-    if let Some(h) = holder_collisions_in(surface, tool, &out, opts.clearance, opts.sample_step, Moves::All)?.first() {
+    if let Some(h) = holder_collisions_in(surface, tool, &out, opts.clearance, 0.0, opts.sample_step, Moves::All)?.first() {
         return Err(CamError::Unsafe(format!("move {}: the tilted holder still comes within {:.4} mm of the surface", named(h.index), h.distance)));
     }
     Ok(out)

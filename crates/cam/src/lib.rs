@@ -23,6 +23,7 @@ pub mod adaptive;
 mod chamfer;
 mod check;
 pub mod collision;
+mod compact;
 mod cutter;
 pub mod drill;
 mod dropcutter;
@@ -57,6 +58,7 @@ pub mod wrapped;
 
 pub use chamfer::{ChamferGeometry, ChamferParams, DEFAULT_TIP_OFFSET, chamfer, chamfer_geometry};
 pub use check::verify;
+pub use compact::{Compaction, compact, limit_descents};
 pub use cutter::{Cone, Cutter};
 pub use dropcutter::{drop_along, drop_triangle, drop_z};
 pub use finish3d::{
@@ -79,7 +81,10 @@ pub use rotary::{
     wrap_with_step,
 };
 pub use surface::{Surface, barycentric, capsule_meets_box, nearest_on_triangle, nearest_segments, ray_triangle, segment_triangle_distance};
-pub use surface_ops::{Boundary, MAX_GRID_NODES, MAX_SAMPLES, ParallelParams, RoughingParams, WaterlineParams, parallel, roughing, waterline};
+pub use surface_ops::{
+    Boundary, DEFAULT_DESCENT_LIMIT, ENTRY_GAP, MAX_GRID_NODES, MAX_SAMPLES, ParallelParams, RoughingParams, WaterlineParams, parallel, roughing,
+    waterline,
+};
 pub use tool::{Envelope, HolderSection, Tool, ToolKind};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
