@@ -524,3 +524,28 @@ fn a_program_that_never_writes_the_rotary_is_not_taken_as_checked() {
     assert_eq!(r.moves, 4);
     assert!(r.gouge_worst > 4.0, "{}", r.gouge_worst);
 }
+
+/// Every kind of tool has a shape in the simulation: a chamfer mill is its flat tip then its
+/// cone, a face mill a flat or bull nose by its inserts' corners, a thread mill its whole
+/// radius (as the gouge check takes it) and a drill its own point angle.
+#[test]
+fn the_simulation_shapes_every_kind_of_tool() {
+    let mut chamfer = Tool::new(7, ToolKind::Chamfer, 10.0, 10.0);
+    chamfer.angle_deg = Some(90.0);
+    chamfer.tip_diameter = Some(1.0);
+    let p = Profile::of(&chamfer).unwrap();
+    assert!((p.radius - 5.0).abs() < 1e-12);
+    assert!(p.height(0.3).abs() < 1e-12, "the flat tip");
+    assert!((p.height(3.0) - 2.5).abs() < 1e-9, "45 degrees beyond the tip: {}", p.height(3.0));
+    assert!((p.height(5.0) - 4.5).abs() < 1e-9);
+    let mut face = Tool::new(1, ToolKind::FaceMill, 20.0, 6.0);
+    assert!(Profile::of(&face).unwrap().height(9.9).abs() < 1e-12, "square inserts cut flat");
+    face.corner_radius = Some(1.0);
+    let p = Profile::of(&face).unwrap();
+    assert!(p.height(8.9).abs() < 1e-12 && (p.height(10.0) - 1.0).abs() < 1e-9, "rounded inserts");
+    let thread = Profile::of(&Tool::new(5, ToolKind::ThreadMill, 6.0, 12.0)).unwrap();
+    assert!(thread.height(2.9).abs() < 1e-12 && (thread.radius - 3.0).abs() < 1e-12);
+    let mut drill = Tool::new(3, ToolKind::Drill, 6.0, 30.0);
+    drill.point_angle_deg = Some(90.0);
+    assert!((Profile::of(&drill).unwrap().height(2.0) - 2.0).abs() < 1e-9, "a 90 degree point");
+}

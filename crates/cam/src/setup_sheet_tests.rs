@@ -422,3 +422,16 @@ fn each_operation_reaches_what_the_written_program_says() {
     assert!(matches!(r.as_slice(), [Some(x)] if x.z_min == 5.0 && x.rotary == vec![(0.0, 0.0)]), "{r:?}");
     assert_eq!(program_reach(&text, &post, &a, &[]).unwrap(), Some(Vec::new()));
 }
+
+/// The stock is put in words for the operator: a block by its size and corners, a bar by its
+/// diameter and ends.
+#[test]
+fn the_stock_is_described_by_its_size_and_place() {
+    let block = crate::stock::Stock::Box { min: Vec3::new(-25.0, -20.0, -11.0), max: Vec3::new(25.0, 20.0, 0.5) };
+    let w = stock_words(&block);
+    assert!(w.starts_with("A block 50 x 40 x 11.5 mm"), "{w}");
+    assert!(w.contains("from X-25 Y-20 Z-11 to X25 Y20 Z0.5") && w.contains("top is at Z0.5"), "{w}");
+    let bar = crate::stock::Stock::Cylinder { radius: 12.5, x_min: -40.0, x_max: 35.0 };
+    let w = stock_words(&bar);
+    assert_eq!(w, "A bar 25 mm in diameter about the X axis (Y0 Z0), from X-40 to X35 (75 mm long).");
+}

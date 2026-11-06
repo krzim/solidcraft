@@ -507,3 +507,16 @@ fn a_thread_mill_is_checked_whole_outside_thread_milling() {
     let shanked = Tool { shank_diameter: Some(4.0), stickout: Some(20.0), ..t.clone() };
     assert_eq!(thread_check_tool(&shanked, &p).unwrap().envelopes(), shanked.envelopes());
 }
+
+/// A bore always goes down along a helix, so a face mill may bore; a chamfer mill's tapered
+/// side would leave the wall uncut and is refused.
+#[test]
+fn a_face_mill_bores_and_a_chamfer_mill_is_refused() {
+    let mut face = Tool::new(1, ToolKind::FaceMill, 10.0, 6.0);
+    face.corner_radius = Some(0.8);
+    assert!(bore(&[hole(0.0, 0.0, 20.0)], &face, &bore_params(1.0)).is_ok());
+    let mut chamfer = Tool::new(7, ToolKind::Chamfer, 10.0, 10.0);
+    chamfer.angle_deg = Some(90.0);
+    let e = bore(&[hole(0.0, 0.0, 20.0)], &chamfer, &bore_params(1.0)).unwrap_err();
+    assert!(e.to_string().contains("a chamfer mill's side is tapered"), "{e}");
+}

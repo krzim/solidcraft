@@ -390,6 +390,36 @@ fn axis_words(letter: char, lo: f64, hi: f64, sides: [&str; 2], beyond: [&str; 2
     }
 }
 
+/// The job's stock in words, for the operator who saws and clamps it: a box by its corners and
+/// size, a bar by its diameter and its ends along X, in work coordinates.
+pub fn stock_words(stock: &crate::stock::Stock) -> String {
+    match *stock {
+        crate::stock::Stock::Box { min, max } => {
+            let size = max - min;
+            format!(
+                "A block {} x {} x {} mm (X x Y x Z), from X{} Y{} Z{} to X{} Y{} Z{}; its top is at Z{}.",
+                mm(size.x),
+                mm(size.y),
+                mm(size.z),
+                mm(min.x),
+                mm(min.y),
+                mm(min.z),
+                mm(max.x),
+                mm(max.y),
+                mm(max.z),
+                mm(max.z)
+            )
+        }
+        crate::stock::Stock::Cylinder { radius, x_min, x_max } => format!(
+            "A bar {} mm in diameter about the X axis (Y0 Z0), from X{} to X{} ({} mm long).",
+            mm(2.0 * radius),
+            mm(x_min),
+            mm(x_max),
+            mm(x_max - x_min)
+        ),
+    }
+}
+
 /// Where work zero is on the part in words: the design point, the part's extent from it, and
 /// each axis. `lo`/`hi` are the part's extent in work coordinates; `rotary_x` is the letter of a
 /// rotary table about work X through work zero (a 4th axis), whose centreline Y0 Z0 is on.

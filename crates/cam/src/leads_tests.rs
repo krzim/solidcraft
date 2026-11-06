@@ -631,3 +631,41 @@ fn finishing_passes_never_reach_where_the_depth_passes_did_not_fit() {
         assert!(contour_with(&triangle, &tool(6.0), &params, &opts, &c, &never).is_ok());
     }
 }
+
+/// The milling-tool rule of the face and chamfer mills holds for the entry a pocket or contour
+/// actually takes: a face mill goes in along a ramp but never plunges, and a chamfer mill, a
+/// drill and a thread mill do not pocket at all.
+#[test]
+fn the_entry_decides_whether_a_face_mill_may_pocket_or_contour() {
+    let mut face = Tool::new(1, ToolKind::FaceMill, 10.0, 6.0);
+    face.corner_radius = Some(0.8);
+    let region = [rect(0.0, 0.0, 40.0, 30.0)];
+    let c = cut(0.0, -1.0, 1.0);
+    let ramp = Some(Entry::Ramp { angle: 3f64.to_radians() });
+    let plunge = PocketOptions { entry: Some(Entry::Plunge), ..PocketOptions::default() };
+    let e = pocket_with(&region, &face, &lanes(4.0), &plunge, &c, &never).unwrap_err();
+    assert!(e.to_string().contains("a face mill cannot plunge"), "{e}");
+    let e = pocket_with(&region, &face, &lanes(4.0), &PocketOptions::default(), &c, &never).unwrap_err();
+    assert!(e.to_string().contains("a face mill cannot plunge"), "no entry and no ramp angle is a plunge: {e}");
+    let ramped = PocketOptions { entry: ramp, ..PocketOptions::default() };
+    assert!(pocket_with(&region, &face, &lanes(4.0), &ramped, &c, &never).is_ok());
+    let e = contour_with(&region, &face, &outside(true), &ContourOptions::default(), &c, &never).unwrap_err();
+    assert!(e.to_string().contains("a face mill cannot plunge"), "{e}");
+    let ramped = ContourOptions { entry: ramp, ..ContourOptions::default() };
+    assert!(contour_with(&region, &face, &outside(true), &ramped, &c, &never).is_ok());
+    let mut chamfer = Tool::new(7, ToolKind::Chamfer, 10.0, 10.0);
+    chamfer.angle_deg = Some(90.0);
+    let others = [
+        (chamfer, "a chamfer mill's side is tapered"),
+        (Tool::new(3, ToolKind::Drill, 6.0, 30.0), "a drill cannot mill"),
+        (Tool::new(5, ToolKind::ThreadMill, 6.0, 12.0), "a thread mill cuts threads only"),
+    ];
+    for (t, why) in others {
+        let ramped = PocketOptions { entry: ramp, ..PocketOptions::default() };
+        let e = pocket_with(&region, &t, &lanes(4.0), &ramped, &c, &never).unwrap_err();
+        assert!(e.to_string().contains(why), "{:?}: {e}", t.kind);
+        let ramped = ContourOptions { entry: ramp, ..ContourOptions::default() };
+        let e = contour_with(&region, &t, &outside(true), &ramped, &c, &never).unwrap_err();
+        assert!(e.to_string().contains(why), "{:?}: {e}", t.kind);
+    }
+}

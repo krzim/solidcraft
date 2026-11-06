@@ -461,3 +461,23 @@ fn adaptive_roughing_refuses_hostile_input() {
     let empty = Surface::new(vec![]).unwrap();
     assert!(adaptive_roughing(&empty, &tool, &roughing_params()).is_err());
 }
+
+/// Adaptive clearing takes the shared milling-tool rule: it enters along a helix, so a face mill
+/// may clear, but a chamfer mill, a drill and a thread mill are refused.
+#[test]
+fn adaptive_clearing_refuses_tools_that_cannot_clear() {
+    let mut face = Tool::new(1, ToolKind::FaceMill, 6.0, 20.0);
+    face.corner_radius = Some(0.5);
+    assert!(adaptive(&[square(24.0)], &face, &params(), &cut(0.0, -1.0)).is_ok());
+    let mut chamfer = Tool::new(7, ToolKind::Chamfer, 6.0, 10.0);
+    chamfer.angle_deg = Some(90.0);
+    let refused = [
+        (chamfer, "a chamfer mill's side is tapered"),
+        (Tool::new(3, ToolKind::Drill, 6.0, 30.0), "a drill cannot mill"),
+        (Tool::new(5, ToolKind::ThreadMill, 6.0, 12.0), "a thread mill cuts threads only"),
+    ];
+    for (t, why) in refused {
+        let e = adaptive(&[square(24.0)], &t, &params(), &cut(0.0, -1.0)).unwrap_err();
+        assert!(e.to_string().contains(why), "{:?}: {e}", t.kind);
+    }
+}

@@ -3,14 +3,17 @@
 //! held against the part. The program is parsed as the controller would read it; the job gives
 //! the machine, the tools, the part's bodies (tessellated as `cam.job` does) and the tolerance.
 //!
-//! A job without a stock starts from one taken from the part: its box on a 3-axis machine, the
-//! cylinder about work X through its farthest point from the axis on a 4th axis.
+//! The simulation starts from the job's `stock` when its shape suits the machine (a box on a
+//! 3-axis machine, a bar about X on a 4th axis). Otherwise, and for a job without a stock, it
+//! starts from one taken from the part: its box on a 3-axis machine, the cylinder about work X
+//! through its farthest point from the axis on a 4th axis.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use solidcraft_cam::kinematics::Machine;
 use solidcraft_cam::sim::{SimParams, SimReport, StockShape, simulate as run_sim, stock_around};
+use solidcraft_cam::stock::Stock;
 use solidcraft_cam::{Surface, Tool};
 
 use super::{MAX_GCODE_BYTES, TOLERANCE_RANGE, cam_err, finite_point, machine_of, num, parse, read_json, surfaces_of, tools_of, v3};
@@ -52,8 +55,18 @@ fn unchecked(v: &Value) -> bool {
     }
 }
 
-/// The stock the program starts from, and whether it was taken from the part.
-fn stock_of(cmd: &str, part: &Surface, machine: &Machine) -> Result<(StockShape, bool)> {
+/// The stock the program starts from, and whether it was taken from the part: the job's
+/// `stock` when the simulation can model it on this machine, else one round the part (with a
+/// note saying why).
+fn stock_of(cmd: &str, job_stock: Option<&Stock>, part: &Surface, machine: &Machine, notes: &mut Vec<String>) -> Result<(StockShape, bool)> {
+    let rotary = !machine.rotaries.is_empty();
+    match job_stock {
+        Some(&Stock::Box { min, max }) if !rotary => return Ok((StockShape::Box { min, max }, false)),
+        Some(&Stock::Cylinder { radius, x_min, x_max }) if rotary => return Ok((StockShape::Cylinder { x_min, x_max, radius }, false)),
+        Some(Stock::Box { .. }) => notes.push("the simulation models a bar about X on a 4th axis, not the job's box stock".into()),
+        Some(Stock::Cylinder { .. }) => notes.push("the simulation models a box on a 3-axis machine, not the job's bar stock".into()),
+        None => {}
+    }
     let stock = stock_around(part, machine).map_err(|e| cam_err(cmd, "the stock", e))?;
     Ok((stock, true))
 }
@@ -82,6 +95,7 @@ pub(super) fn check_program(
     machine: &Machine,
     tools: &[Tool],
     part: &Surface,
+    job_stock: Option<&Stock>,
     tol: f64,
     resolution: Option<f64>,
     deliberate_gouges: bool,
@@ -89,7 +103,8 @@ pub(super) fn check_program(
     if resolution.is_some_and(|r| !(1e-4..=1e4).contains(&r)) {
         return Err(bad(cmd, "`resolution` must be from 0.0001 to 10000 mm"));
     }
-    let (stock, derived) = stock_of(cmd, part, machine)?;
+    let mut stock_notes = Vec::new();
+    let (stock, derived) = stock_of(cmd, job_stock, part, machine, &mut stock_notes)?;
     let report = run_sim(text, machine, tools, &stock, part, &SimParams { tolerance: tol, resolution }).map_err(|e| cam_err(cmd, "simulation", e))?;
     let mut failures = Vec::new();
     let mut warnings = report.warnings.clone();
@@ -131,6 +146,7 @@ pub(super) fn check_program(
     } else {
         "the simulation starts from the job's stock".to_string()
     }];
+    notes.extend(stock_notes);
     notes.push(format!("simulated on {} cells of {} mm", report.cells, num(report.cell)));
     if report.rapids_in_material.len() > LISTED {
         notes.push(format!("the first {LISTED} of {} rapids in material are listed", report.rapids_in_material.len()));
@@ -186,9 +202,12 @@ pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let bytes = solidcraft_io::vfs::read(&params.path, MAX_GCODE_BYTES).map_err(|e| EngineError::Other(format!("{}: {e}", params.path)))?;
     let text = String::from_utf8_lossy(&bytes);
     let surfaces = surfaces_of(cmd, s, &job, v3(origin), tol)?;
-    let (mut reply, report) = check_program(cmd, &text, &machine, &tools, &surfaces.part, tol, params.resolution, deliberate)?;
+    let mut stock_notes = Vec::new();
+    let job_stock = super::cam_stock::stock_of(cmd, &job, &surfaces, tol, &mut stock_notes)?;
+    let (mut reply, report) = check_program(cmd, &text, &machine, &tools, &surfaces.part, job_stock.as_ref(), tol, params.resolution, deliberate)?;
     reply.path = params.path.clone();
     reply.notes.extend(surfaces.notes);
+    reply.notes.extend(stock_notes);
     if let Some(out) = &params.stock_stl {
         let mesh = report.stock.mesh(STL_SIDE);
         solidcraft_io::vfs::write(out, &solidcraft_io::stl_binary(&[mesh], "stock")).map_err(|e| EngineError::Other(format!("{out}: {e}")))?;

@@ -132,7 +132,7 @@ pub(super) fn plan_face(ctx: &Ctx<'_>, o: &FaceOp, arc_tol: f64) -> Result<Plann
         warnings,
         ..OperationReport::default()
     };
-    Ok(Planned { op: MachineOperation::Indexed(io), poses, tool: r.tool, gouge_check: c.gouge_check, report, axes: "3-axis".into() })
+    Ok(Planned { op: MachineOperation::Indexed(io), poses, feeds: r.feeds, tool: r.tool, gouge_check: c.gouge_check, report, axes: "3-axis".into() })
 }
 
 /// What is left of the job's stock as each of its operations starts: a `face` over the whole

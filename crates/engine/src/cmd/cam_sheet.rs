@@ -82,6 +82,8 @@ pub(super) struct Inputs<'a> {
     pub notes: &'a [String],
     /// The G-code file, when one is written.
     pub program_file: Option<&'a str>,
+    /// The job's stock, when it gives one.
+    pub stock: Option<&'a solidcraft_cam::stock::Stock>,
 }
 
 /// The letter of the machine's one rotary when it is a table about work X through work zero
@@ -218,7 +220,7 @@ pub(super) fn build(i: &Inputs<'_>) -> SetupSheet {
                     kind: t.kind.label().into(),
                     description: t.description.clone(),
                     diameter: t.diameter,
-                    corner_radius: t.corner_radius.filter(|_| t.kind == solidcraft_cam::ToolKind::BullNose),
+                    corner_radius: t.corner_radius.filter(|_| matches!(t.kind, solidcraft_cam::ToolKind::BullNose | solidcraft_cam::ToolKind::FaceMill)),
                     flutes: t.flutes,
                     flute_length: t.flute_length,
                     shank_diameter: t.shank_diameter,
@@ -327,7 +329,7 @@ pub(super) fn build(i: &Inputs<'_>) -> SetupSheet {
         work_offset: work_offset_words(i.post, i.work_offset),
         work_zero: zero,
         rotaries: machine.rotaries.iter().map(rotary_note).collect(),
-        stock: None,
+        stock: i.stock.map(solidcraft_cam::setup_sheet::stock_words),
         tools,
         operations,
         totals,
@@ -354,6 +356,7 @@ pub(super) fn summary(s: &SetupSheet) -> SetupSummary {
     SetupSummary {
         work_zero: z.words.clone(),
         part_extent: [z.part_min.map(|v| round(v, 3)), z.part_max.map(|v| round(v, 3))],
+        stock: s.stock.clone(),
         work_offset: s.work_offset.clone(),
         rotary: s.rotaries.iter().flat_map(|r| r.words.iter().cloned()).collect(),
         tools: s

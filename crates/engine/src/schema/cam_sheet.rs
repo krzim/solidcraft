@@ -12,6 +12,9 @@ pub struct SetupSummary {
     pub work_zero: Vec<String>,
     /// The part's lowest and highest [x, y, z] from work zero, mm.
     pub part_extent: [[f64; 3]; 2],
+    /// The job's stock in words (its size and where it is from work zero); `null` when the job
+    /// gives none.
+    pub stock: Option<String>,
     /// The work offset the program runs in (`G54` ...), or what the post does instead.
     pub work_offset: String,
     /// Each rotary axis's convention (what it turns, which way positive goes, its travel), a

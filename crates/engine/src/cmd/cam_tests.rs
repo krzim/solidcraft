@@ -2227,7 +2227,7 @@ fn rotary_rings_step_over_exactly_in_the_written_program() {
 }
 
 /// A bar 40 long with a 30 mm square section about X: a flat face 15 mm out at each quarter turn.
-fn square_bar() -> Session {
+fn square_block() -> Session {
     let mut s = Session::default();
     run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 30, "corner": [-20, -15, -15], "body_name": "Block"}));
     s
@@ -2247,7 +2247,7 @@ fn faces_job(operations: Value) -> Value {
 
 #[test]
 fn an_indexed_pattern_is_the_indexed_operations_it_stands_for() {
-    let mut s = square_bar();
+    let mut s = square_block();
     let dir = Dir::new("pattern");
     let write = |s: &mut Session, job: Value, file: &str| {
         let out = dir.file(file);
@@ -2283,7 +2283,7 @@ fn an_indexed_pattern_is_the_indexed_operations_it_stands_for() {
 fn a_clearance_inside_the_part_is_refused() {
     // The square bar reaches 21.21 mm from the axis at its corners: A turning at a clearance
     // of 18 would swing them into the tool.
-    let mut s = square_bar();
+    let mut s = square_block();
     let job = faces_job(json!([{"type": "indexed_pattern", "count": 4, "operation": face_op("face", 18.0)}]));
     let e = s.execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
     let msg = e.to_string();
@@ -2403,7 +2403,7 @@ fn hostile_rotary_operations_are_refused_without_panics() {
     assert!(s.execute("cam.job", &json!({"job": on3, "dry_run": true})).is_err());
     let mut pat = faces_job(json!([{"type": "indexed_pattern", "count": 4, "operation": face_op("face", 40.0)}]));
     pat["machine"] = json!("3axis");
-    assert!(square_bar().execute("cam.job", &json!({"job": pat, "dry_run": true})).is_err());
+    assert!(square_block().execute("cam.job", &json!({"job": pat, "dry_run": true})).is_err());
     for stepover in [json!(0), json!(-1), json!(1e308), json!("x")] {
         let mut job = barrel_job();
         job["operations"][0]["pattern"] = json!({"type": "rings", "stepover": stepover});
@@ -3020,4 +3020,56 @@ fn a_setup_sheet_spelt_like_the_preview_is_still_the_preview() {
         assert!(e.to_string().contains("file of its own"), "{sheet}: {e}");
     }
     assert!(!PathBuf::from(&page).exists() && !PathBuf::from(&out).exists(), "nothing written");
+}
+
+// The features wired together: the job's stock in the simulation and on the setup sheet.
+
+/// A job's stock is what the simulation starts from (in cam.job and in cam.simulate) and what
+/// the setup sheet and the summary tell the operator to clamp; facing its top 1 mm removes a
+/// 50 × 50 × 1 slab of it.
+#[test]
+fn the_simulation_and_the_setup_sheet_start_from_the_jobs_stock() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 50, "width": 50, "height": 10, "corner": [-25, -25, -11], "body_name": "Block"}));
+    let mill = json!({"number": 5, "kind": "flat_endmill", "diameter": 32, "flute_length": 6, "spindle_rpm": 9000, "feed": 1500, "plunge_feed": 400});
+    let job = json!({
+        "machine": "3axis", "post": "mach3_4axis", "tools": [mill], "stock": {"box": {"min": [-25, -25, -11], "max": [25, 25, 0]}},
+        "operations": [{"name": "face", "type": "face", "tool": 5, "bottom": -1, "stepdown": 0.5}]
+    });
+    let dir = Dir::new("stock-wired");
+    let (out, md) = (dir.file("face.tap"), dir.file("face-setup.md"));
+    let r = scoped(&dir, || run(&mut s, "cam.job", json!({"job": job, "output": out, "setup_sheet": md, "simulate": true})));
+    assert_clean(&r);
+    let sim = &r["simulation"];
+    assert_eq!(sim["passed"], true, "{sim}");
+    assert_eq!(sim["stock"]["derived"], false, "the job's stock: {sim}");
+    assert_eq!(sim["stock"]["max"], json!([25.0, 25.0, 0.0]), "{sim}");
+    assert_eq!(sim["stock"]["min"], json!([-25.0, -25.0, -11.0]), "{sim}");
+    let removed = sim["removed_volume"].as_f64().unwrap();
+    assert!((removed - 2500.0).abs() < 100.0, "a 50 x 50 x 1 slab: {removed}");
+    assert!(sim["notes"].as_array().unwrap().iter().any(|n| n.as_str().is_some_and(|n| n.contains("the job's stock"))), "{sim}");
+    // The summary and the sheet say what to clamp.
+    let stock = r["summary"]["stock"].as_str().unwrap_or_default();
+    assert!(stock.starts_with("A block 50 x 50 x 11 mm"), "{}", r["summary"]);
+    let sheet = std::fs::read_to_string(&md).unwrap();
+    assert!(sheet.contains("## Stock") && sheet.contains("A block 50 x 50 x 11 mm"), "{sheet}");
+    // cam.simulate of the file on its own reads the same stock from the job.
+    let c = run(&mut s, "cam.simulate", json!({"path": out, "job": job}));
+    assert_eq!(c["stock"]["derived"], false, "{c}");
+    assert_eq!(c["removed_volume"], sim["removed_volume"], "{c}");
+    // A bar stock cannot be modelled on a 3-axis machine: the part's box, said so.
+    let mut bar_job = job.clone();
+    bar_job["stock"] = json!({"cylinder": {"radius": 40, "x_min": -25, "x_max": 25}});
+    let c = run(&mut s, "cam.simulate", json!({"path": out, "job": bar_job}));
+    assert_eq!(c["stock"]["derived"], true, "{c}");
+    assert!(c["notes"].as_array().unwrap().iter().any(|n| n.as_str().is_some_and(|n| n.contains("not the job's bar stock"))), "{c}");
+    // Without a stock the summary has none and the sheet no stock section.
+    let mut bare = job.clone();
+    bare["stock"] = Value::Null;
+    if let Some(o) = bare.as_object_mut() {
+        o.remove("stock");
+    }
+    bare["operations"][0]["top"] = json!(0);
+    let r = run(&mut s, "cam.job", json!({"job": bare, "dry_run": true}));
+    assert!(r["summary"]["stock"].is_null(), "{}", r["summary"]);
 }

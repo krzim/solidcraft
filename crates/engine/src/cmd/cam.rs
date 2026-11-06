@@ -1171,7 +1171,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let (rapids, travel) = cam_stock::check_motion(cmd, &job, &text, &program, &post, &machine, &surfaces, stock.as_ref(), tol, &mut failures)?;
     let simulation = if params.simulate.unwrap_or(false) {
         let deliberate = planned.iter().any(|p| !p.gouge_check);
-        match sim::check_program(cmd, &text, &machine, &tools, &surfaces.part, tol, None, deliberate) {
+        match sim::check_program(cmd, &text, &machine, &tools, &surfaces.part, stock.as_ref(), tol, None, deliberate) {
             Ok((reply, _)) => {
                 failures.extend(reply.failures.iter().cloned());
                 Some(reply)
@@ -1231,6 +1231,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         failures: &failures,
         notes: &notes,
         program_file: if dry_run { None } else { output.as_deref() },
+        stock: stock.as_ref(),
     });
     let summary = sheet::summary(&setup);
 

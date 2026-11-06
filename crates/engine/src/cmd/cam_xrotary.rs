@@ -91,21 +91,37 @@ fn pattern_angles(ctx: &Ctx<'_>, name: &str, o: &IndexedPatternOp) -> Result<Vec
 
 fn rename(op: &mut Op3Spec, name: String) {
     match op {
+        Op3Spec::Adaptive(o) => o.name = name,
+        Op3Spec::AdaptiveRoughing(o) => o.name = name,
         Op3Spec::Contour(o) => o.name = name,
         Op3Spec::Pocket(o) => o.name = name,
         Op3Spec::Parallel(o) => o.name = name,
         Op3Spec::Roughing(o) => o.name = name,
         Op3Spec::Waterline(o) => o.name = name,
+        Op3Spec::Drill(o) => o.name = name,
+        Op3Spec::Chamfer(o) => o.name = name,
+        Op3Spec::Scallop(o) => o.name = name,
+        Op3Spec::SteepShallow(o) => o.name = name,
+        Op3Spec::Pencil(o) => o.name = name,
+        Op3Spec::RestFinish(o) => o.name = name,
     }
 }
 
 fn op3_clearance(op: &Op3Spec) -> f64 {
     match op {
+        Op3Spec::Adaptive(o) => o.heights.clearance,
+        Op3Spec::AdaptiveRoughing(o) => o.heights.clearance,
         Op3Spec::Contour(o) => o.heights.clearance,
         Op3Spec::Pocket(o) => o.heights.clearance,
         Op3Spec::Parallel(o) => o.heights.clearance,
         Op3Spec::Roughing(o) => o.heights.clearance,
         Op3Spec::Waterline(o) => o.heights.clearance,
+        Op3Spec::Drill(o) => o.heights.clearance,
+        Op3Spec::Chamfer(o) => o.heights.clearance,
+        Op3Spec::Scallop(o) => o.heights.clearance,
+        Op3Spec::SteepShallow(o) => o.heights.clearance,
+        Op3Spec::Pencil(o) => o.heights.clearance,
+        Op3Spec::RestFinish(o) => o.heights.clearance,
     }
 }
 
@@ -123,7 +139,7 @@ fn continuous(c: Common<'_>, r: Resolved, kind: &str, path: Toolpath5) -> Planne
         ..OperationReport::default()
     };
     let op = Operation5 { name: c.name.into(), tool: r.tool.clone(), spindle_rpm: r.rpm, coolant: c.coolant, path: path.clone() };
-    Planned { op: MachineOperation::Continuous(op), poses: path, tool: r.tool, gouge_check: c.gouge_check, report, axes: "4-axis".into() }
+    Planned { op: MachineOperation::Continuous(op), poses: path, feeds: r.feeds, tool: r.tool, gouge_check: c.gouge_check, report, axes: "4-axis".into() }
 }
 
 /// The depths and motion of a wrapped operation.

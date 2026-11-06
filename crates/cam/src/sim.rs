@@ -219,6 +219,9 @@ enum Shape {
     Bull,
     /// A point: height `slope·d` at distance `d` from the axis.
     Cone(f64),
+    /// A flat tip of radius `tip`, then a cone: height `slope·(d - tip)` beyond it (a chamfer
+    /// mill).
+    Taper { slope: f64, tip: f64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -233,9 +236,10 @@ impl Profile {
         tool.validate()?;
         let r = tool.radius();
         Ok(match tool.kind {
-            ToolKind::FlatEndmill => Profile { radius: r, corner: 0.0, shape: Shape::Flat },
+            // A thread mill is checked as its whole radius, as the gouge check does.
+            ToolKind::FlatEndmill | ToolKind::ThreadMill => Profile { radius: r, corner: 0.0, shape: Shape::Flat },
             ToolKind::BallEndmill => Profile { radius: r, corner: r, shape: Shape::Ball },
-            ToolKind::BullNose => {
+            ToolKind::BullNose | ToolKind::FaceMill => {
                 let c = tool.corner_radius.unwrap_or(0.0).clamp(0.0, r);
                 if c <= 0.0 {
                     Profile { radius: r, corner: 0.0, shape: Shape::Flat }
@@ -245,7 +249,12 @@ impl Profile {
                     Profile { radius: r, corner: c, shape: Shape::Bull }
                 }
             }
-            ToolKind::Drill => Profile { radius: r, corner: 0.0, shape: Shape::Cone(1.0 / (DRILL_POINT_ANGLE * 0.5).tan()) },
+            ToolKind::Drill => Profile { radius: r, corner: 0.0, shape: Shape::Cone(1.0 / (crate::drill::point_angle(tool) * 0.5).tan()) },
+            ToolKind::Chamfer => {
+                let half = tool.angle_deg.unwrap_or(90.0).to_radians() * 0.5;
+                let tip = (tool.tip_diameter.unwrap_or(0.0) * 0.5).clamp(0.0, r);
+                Profile { radius: r, corner: 0.0, shape: Shape::Taper { slope: 1.0 / half.tan(), tip } }
+            }
         })
     }
 
@@ -256,6 +265,7 @@ impl Profile {
         match self.shape {
             Shape::Flat => 0.0,
             Shape::Cone(k) => k * d,
+            Shape::Taper { slope, tip } => slope * (d - tip).max(0.0),
             Shape::Ball | Shape::Bull => {
                 let a = self.radius - self.corner;
                 if d <= a {
@@ -272,6 +282,13 @@ impl Profile {
         match self.shape {
             Shape::Flat => 0.0,
             Shape::Cone(k) => k,
+            Shape::Taper { slope, tip } => {
+                if d <= tip {
+                    0.0
+                } else {
+                    slope
+                }
+            }
             Shape::Ball | Shape::Bull => {
                 let e = d - (self.radius - self.corner);
                 if e <= 0.0 {
@@ -289,7 +306,7 @@ impl Profile {
         let s = match self.shape {
             Shape::Flat => (4.0 * self.radius * tol).sqrt(),
             Shape::Ball | Shape::Bull => (4.0 * self.corner * tol).sqrt(),
-            Shape::Cone(k) => tol / k.max(1e-9),
+            Shape::Cone(k) | Shape::Taper { slope: k, .. } => tol / k.max(1e-9),
         };
         s.clamp(1e-3, self.radius.max(1e-3))
     }
@@ -333,7 +350,7 @@ impl Profile {
                         (u + c * v / (1.0 - c * c).sqrt()).clamp(lo, hi)
                     }
                 }
-                Shape::Bull => {
+                Shape::Bull | Shape::Taper { .. } => {
                     let slope = |s: f64| {
                         let t = s - u;
                         let d = hyp(t, v);
@@ -413,7 +430,7 @@ impl Profile {
                     (a, b) => a.or(b),
                 }
             }
-            Shape::Bull | Shape::Cone(_) => {
+            Shape::Bull | Shape::Cone(_) | Shape::Taper { .. } => {
                 // Inside where g ≥ 0, g concave along the ray.
                 let g = |p: f64| p * c - z - self.height(hyp(dx, p * s - y));
                 let dg = |p: f64| {
