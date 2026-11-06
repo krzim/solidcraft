@@ -43,6 +43,9 @@ The command never writes a program that fails one of these unless `allow_unsafe`
   `gouge.skipped`.
 - **Holder.** For tools with holder data (`stickout` above the flutes, `shank_diameter`,
   `holder`), the shank and holder must not touch the part or a fixture along a cutting move.
+- **Rapids.** Every `G0` of the program as written, the stock and the turns of a 4th axis
+  included (see "Stock, facing and rapid safety" below).
+- **Travel.** With a machine whose JSON has `linear_limits`, every position is within them.
 
 Without `dry_run` or `allow_unsafe`, a failure refuses the call with every failed check in the
 message. With `dry_run`, the reply carries `passed: false` and `failures`.
@@ -52,7 +55,9 @@ message. With `dry_run`, the reply carries `passed: false` and `failures`.
 `operations` (each with `name`, `kind`, `tool`, `moves`, `cut_length`, `cut_minutes`,
 `max_tilt_deg`, `a_deg` when indexed, `gouge`, `holder_collisions`, `warnings`), `program_lines`,
 `program_head` (the first lines), `readback`, `gouge`, `holder_collisions` (`null` when no tool
-has holder data), `passed`, `failures`, `dry_run`, `outputs` (`gcode`, `preview`) and `notes`
+has holder data), `rapids` (`checked`, `hits`, `worst`, `pass`, `from_unknown`, `first`),
+`travel` (`checked`, `violation`, `pass`; `null` without `linear_limits`), `stock` (as checked
+against; `null` without one), `passed`, `failures`, `dry_run`, `outputs` (`gcode`, `preview`) and `notes`
 (how the bodies were tessellated, a post that writes no work offset, an output extension other
 than the post's).
 
@@ -97,6 +102,7 @@ silently left at its default. That holds for the tools, the machine and the post
 | `bodies` | The part's bodies by name. Default: every visible body not in `fixtures`. |
 | `fixtures` | Bodies the tool must stay clear of (vises, clamps): in the gouge and holder checks only, never machined. |
 | `tolerance` | 0.0001 to 1 mm (default 0.01): how far a toolpath may be from the part, and how deep a cut into it counts as a gouge. |
+| `stock` | The raw material in work coordinates: `{"box": {"min": [x, y, z], "max": [x, y, z]}}`, `{"cylinder": {"radius", "x_min", "x_max"}}` (a bar about work X, the A axis) or `{"around_part": {"margin": [x, y, z]}}` (the part's box grown by the margin each side). No rapid may pass through it; `face` faces it. Default: none. |
 | `tools` | The tools, as the CAM crate's `Tool` JSON (below). Give this or `tool_library_path`. |
 | `tool_library_path` | A JSON file holding an array of tools. |
 | `operations` | 1 to 200 operations, run and written in order (below). |
@@ -142,6 +148,7 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `indexed` | `a_deg` and `operation`: any of the five above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
 | `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}` or `{type: "helix", pitch}`; `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
 | `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
+| `face` | `bottom`; `top` (the stock's top; required without a stock); `retract` (2 above the top, or the stock's top if higher); `clearance` (10 above the retract); `stepdown` (tool's, else 1); `stepover` (tool's, else 70% of the flat of its end); `angle_deg` (0); `zigzag` (true); `overhang` (half the tool's diameter and 0.5); `rect: [[x, y], [x, y]]` (the stock seen from above, else the part's extent). A flat end mill or a bull nose. |
 | `wrap` | `radius` (of the cylinder the path is drawn on); `points: [[x, y, z], …]` (x along the axis, y the arc length round it, z the depth: 0 on the cylinder, negative into it) or `sketch` + `curve` (a curve id; its sketch x and y are taken as x and arc length) with `depth` (0); `clearance` (5) and `retract` (1) above the cylinder; `max_angle_step_deg` (2) |
 
 The 3-axis operations (`contour` to `waterline`) run with every rotary at zero; on `3axis` and
@@ -168,3 +175,64 @@ rotary letter's lowest and highest angle), `bounds` and `errors` (the first line
 cannot read). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
 elsewhere are read on a best-effort basis and stop at the first block it cannot follow
 (incremental coordinates, for one).
+
+## Stock, facing and rapid safety
+
+A job may say what it starts from with `stock`, in work coordinates. A box gives its corners;
+`around_part` is the box round the part's bodies grown by a margin on each side (the reply's
+`stock` shows the box it came to); a cylinder is a round bar about work X, the A axis of a 4th
+axis set up the usual way. The notes say when the part reaches outside the stock.
+
+### Facing
+
+`face` cuts the stock's top (or `top`) flat down to `bottom` in levels of at most `stepdown`,
+in straight passes along `angle_deg` at most `stepover` apart, over `rect` (by default the
+stock seen from above). Every pass starts and ends with the whole cutter 1 mm clear of the
+area, so the tool goes down beside the stock at the plunge feed and enters it at depth: it
+never plunges into material. The outermost passes reach `overhang` past the edges (by default
+half the diameter and 0.5 mm, which puts their centres just outside), so the edges come out
+clean. With `zigzag` every other pass runs back and the passes link at depth along a line
+beside the stock, each level starting where the last ended; without it the tool rises to the
+retract height between passes and every pass runs the same way. The stepover is held to the
+flat of the tool's end (its diameter less the corners, for a bull nose), so the floor has no
+ridges. A top below the stock's top is warned of: its first level takes more than a stepdown.
+
+### The rapid check
+
+Every `G0` block of the program as written is read back and followed as the controller moves
+through it, every axis evenly from the block's start to its end, sampled every 0.5 mm of the
+tip's travel and of a point at the tool's reach. That covers the move to the first point, the
+links between passes and operations, rotary turns, rewinds, the moves after a tool change and
+the final retract. At every sample, in work coordinates:
+
+- the cutter, as a cylinder of its radius without end above its tip (the shank and spindle are
+  there too), must not be in the part or a fixture by more than the job's tolerance, and a
+  tool's shank and holder (with holder data) must not touch them;
+- with a stock, the cutter must not be in the stock. Nothing tracks what earlier operations
+  removed, so the stock as given is the bound: a rapid below the stock's top over the stock
+  fails, even where an earlier operation has cut it away. A retract straight up the tool's axis
+  out of the cut is the exception: it only passes through room the tool already fills. Keep
+  every retract and clearance height above the stock's top (on a 4th axis, outside its radius);
+- a block that turns the A axis (a table about X) must keep the cutter outside the radius the
+  stock sweeps (a box's farthest corner; without a stock, the part's largest radius and the
+  tolerance) all through the turn, wherever the stock or part is level with the tool along X.
+  A post with `clearance_retract` rises to the operation's highest rapid before it turns; a
+  low clearance height can still leave the tool inside the swept radius, and this check finds it.
+
+A block after a return to the machine's home (`G28`, `G30`), a move in machine coordinates
+(`G53`) or a tool change starts where the program does not say: only its end is checked, which
+with the cutter endless above covers the way down from the machine's top. Turns made there (a
+post's `safe_rotate` lines) are taken to happen at the machine's top, and a tool change to be
+made where the new tool clears everything: give the post a `safe_retract` at tool changes where
+the controller changes tools wherever the spindle is. `rapids.from_unknown` counts these blocks.
+Each block is checked with the tool of its own operation.
+
+A failure names the line, the operation, what the rapid runs into, how deep and where; the
+reply's `rapids.first` lists the first 20. Like the other checks, a failure refuses the call
+unless `dry_run` or `allow_unsafe` is given.
+
+### Travel
+
+A machine given as JSON with `linear_limits: [[x, y, z], [x, y, z]]` (the lowest and highest
+position of the linear axes, as written in the program) has every block's end, and points along
+every arc, held against them. The first position beyond them fails the job, by line and axis.

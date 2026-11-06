@@ -56,14 +56,17 @@ pub static COMMANDS: &[CommandSpec] = &[
              a_limits_deg?: [min, max], post: built-in name (cam.posts) | post_path: Post5 JSON file, work_offset?: 1-6, origin?: [x,y,z] \
              (the design point that is work zero; on a 4th axis the A axis is work X through it), bodies?: [names] (default every visible \
              body), fixtures?: [names] (checked against, never cut), tolerance?: mm (default 0.01; bodies are tessellated at half of it), \
-             tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | roughing | waterline | indexed \
-             {a_deg, operation} | rotary_finish | rotary_roughing | wrap, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
+             stock?: {box: {min, max}} | {cylinder: {radius, x_min, x_max}} | {around_part: {margin: [x,y,z]}} (work coordinates; no \
+             rapid may pass through it), tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | \
+             roughing | waterline | indexed {a_deg, operation} | rotary_finish | rotary_roughing | wrap | face {bottom, top?, retract?, \
+             clearance?, stepdown?, stepover?, angle_deg?, zigzag?, overhang?, rect?}, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
              and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
              operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, warnings}], \
              program_lines, program_head, readback: {max_tip_deviation, max_axis_deviation_deg, allowed_tip, allowed_axis_deg, \
-             cut_minutes, pass}, gouge: {worst, tolerance, hits, skipped, pass}, holder_collisions, passed, failures, dry_run, outputs: \
-             {gcode?, preview?}, notes. Without dry_run or allow_unsafe a failed check refuses and nothing is written",
+             cut_minutes, pass}, gouge: {worst, tolerance, hits, skipped, pass}, holder_collisions, rapids: {checked, hits, worst, pass, \
+             from_unknown, first: [{line, operation?, kind, depth, at}]}, travel: {checked, violation?, pass} | null, stock, passed, \
+             failures, dry_run, outputs: {gcode?, preview?}, notes. Without dry_run or allow_unsafe a failed check refuses and nothing is written",
         ),
     CommandSpec::new("cam.posts", "CAM Posts", crate::checked!("cam.posts", posts))
         .noundo()
@@ -552,6 +555,7 @@ struct Ctx<'a> {
     part: &'a Surface,
     origin: Vec3,
     tol: f64,
+    stock: Option<&'a solidcraft_cam::stock::Stock>,
 }
 
 impl Ctx<'_> {
@@ -928,6 +932,7 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             let path = rotary_roughing(ctx.part, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
             Ok(continuous(c, r, "rotary_roughing", path))
         }
+        OperationSpec::Face(o) => cam_stock::plan_face(ctx, o, arc_tol),
         OperationSpec::Wrap(o) => {
             let c = o.common();
             needs_rotary(ctx, c.name)?;
@@ -1001,11 +1006,12 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let tools = tools_of(cmd, &job, base)?;
     let surfaces = surfaces_of(cmd, s, &job, origin, tol)?;
     let mut notes = surfaces.notes.clone();
+    let stock = cam_stock::stock_of(cmd, &job, &surfaces, tol, &mut notes)?;
     if job.work_offset.is_some() && !post.base.writes_work_offset() {
         notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
     }
 
-    let ctx = Ctx { cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, origin, tol };
+    let ctx = Ctx { cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, origin, tol, stock: stock.as_ref() };
     let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
     for spec in &job.operations {
         planned.push(plan(&ctx, spec, post.base.arc_tolerance)?);
@@ -1048,6 +1054,8 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     gouge.pass = gouge.hits == 0;
+    // Every rapid of the program as written, and every position against the machine's travel.
+    let (rapids, travel) = cam_stock::check_motion(cmd, &text, &program, &post, &machine, &surfaces, stock.as_ref(), tol, &mut failures)?;
     let readback = ReadbackReport {
         max_tip_deviation: rb.max_tip_deviation,
         max_axis_deviation_deg: rb.max_axis_deviation.to_degrees(),
@@ -1109,6 +1117,9 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         readback,
         gouge,
         holder_collisions: holder_total,
+        rapids,
+        travel,
+        stock: stock.as_ref().map(cam_stock::stock_report),
         passed,
         failures,
         dry_run,
@@ -1363,6 +1374,9 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
     reply.rapid_minutes = params.rapid_rate.map(|r| reply.rapid_length / r);
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
+
+#[path = "cam_stock.rs"]
+mod cam_stock;
 
 #[cfg(test)]
 #[path = "cam_tests.rs"]

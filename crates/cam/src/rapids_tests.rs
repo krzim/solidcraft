@@ -1,0 +1,255 @@
+//! Tests of the rapid and travel checks of written programs: rapids through a fixture, the
+//! stock and a holder's reach, a 4th-axis turn at a low height beside a square bar, the tool of
+//! every block found per operation, and hostile input.
+
+use solidcore_record::Vec3;
+
+use crate::foundation_tests::block;
+use crate::gcode5::{MachineOperation, MachineProgram, Post5, emit_program};
+use crate::indexed::IndexedOperation;
+use crate::kinematics::Machine;
+use crate::rapids::{RAPID_STEP, RapidCheck, RapidHitKind, check_rapids, check_travel};
+use crate::rotary::rotary_pose;
+use crate::stock::Stock;
+use crate::*;
+
+fn flat(number: u32, diameter: f64) -> Tool {
+    Tool::new(number, ToolKind::FlatEndmill, diameter, 10.0)
+}
+
+/// A 3-axis operation of rapids alone, through `points`, then a short cut at the last.
+fn rapids_op(name: &str, tool: Tool, points: &[Vec3]) -> MachineOperation {
+    let mut moves: Vec<Move> = points.iter().map(|&to| Move::Rapid { to }).collect();
+    if let Some(last) = points.last() {
+        moves.push(Move::Feed { to: *last + Vec3::new(0.0, 0.0, -0.5), feed: 300.0 });
+        moves.push(Move::Rapid { to: *last });
+    }
+    MachineOperation::Indexed(IndexedOperation {
+        name: name.into(),
+        tool,
+        spindle_rpm: 12000.0,
+        coolant: false,
+        rotary: Vec::new(),
+        path: Toolpath { moves },
+    })
+}
+
+fn program(operations: Vec<MachineOperation>) -> MachineProgram {
+    MachineProgram { name: "rapids".into(), operations, work_offset: None }
+}
+
+/// A part, a 20 mm square block with its top at Z 0, and a clamp beside it rising to Z 5.
+fn part() -> Surface {
+    block(Vec3::new(-10.0, -10.0, -10.0), Vec3::new(10.0, 10.0, 0.0))
+}
+
+fn part_and_clamp() -> Surface {
+    let mut tris = part().triangles().to_vec();
+    tris.extend_from_slice(block(Vec3::new(15.0, -5.0, -10.0), Vec3::new(20.0, 5.0, 5.0)).triangles());
+    Surface::new(tris).unwrap()
+}
+
+fn check3(program: &MachineProgram, post: &Post5, stock: Option<&Stock>) -> RapidCheck {
+    let machine = Machine::three_axis();
+    let text = emit_program(program, post, &machine).unwrap();
+    check_rapids(&text, program, post, &machine, &part_and_clamp(), &part(), stock, 0.01, RAPID_STEP).unwrap()
+}
+
+#[test]
+fn a_rapid_through_a_clamp_is_found() {
+    let post = Post5::mach3_4axis();
+    // Across the clamp at Z 3: through it. At Z 8: over it.
+    let low = program(vec![rapids_op("low", flat(1, 6.0), &[Vec3::new(-30.0, 0.0, 3.0), Vec3::new(30.0, 0.0, 3.0)])]);
+    let r = check3(&low, &post, None);
+    assert!(!r.pass() && r.tools_known, "{r:?}");
+    let hit = r.hits.iter().find(|h| h.kind == RapidHitKind::Part).unwrap();
+    assert_eq!(hit.operation, Some(0));
+    assert!(hit.depth > 1.9 && (12.0..=23.0).contains(&hit.at.x), "{hit:?}");
+    let high = program(vec![rapids_op("high", flat(1, 6.0), &[Vec3::new(-30.0, 0.0, 8.0), Vec3::new(30.0, 0.0, 8.0)])]);
+    let r = check3(&high, &post, None);
+    assert!(r.pass(), "{r:?}");
+    assert!(r.checked >= 3 && r.samples > 100, "every rapid is sampled every half millimetre: {r:?}");
+    // Down onto the part top beside nothing, then a rapid down into the part: found.
+    let into = program(vec![rapids_op("into", flat(1, 6.0), &[Vec3::new(0.0, 0.0, 10.0), Vec3::new(0.0, 0.0, -2.0)])]);
+    assert!(check3(&into, &post, None).hits.iter().any(|h| h.kind == RapidHitKind::Part));
+}
+
+#[test]
+fn a_rapid_below_the_stock_top_over_the_stock_is_found() {
+    let post = Post5::mach3_4axis();
+    let stock = Stock::Box { min: Vec3::new(-15.0, -15.0, -12.0), max: Vec3::new(15.0, 15.0, 1.0) };
+    // Over the part's top by 0.5, but below the stock's top: clear of the part, in the stock.
+    let skim = program(vec![rapids_op("skim", flat(1, 6.0), &[Vec3::new(-30.0, 0.0, 10.0), Vec3::new(-30.0, 0.0, 0.5), Vec3::new(0.0, 0.0, 0.5)])]);
+    let r = check3(&skim, &post, None);
+    assert!(r.pass(), "{r:?}");
+    let r = check3(&skim, &post, Some(&stock));
+    let hit = r.hits.iter().find(|h| h.kind == RapidHitKind::Stock).unwrap();
+    assert!((hit.depth - 0.49).abs() < 1e-6, "{hit:?}");
+    // Down beside the stock, the whole cutter clear of it: fine.
+    let beside =
+        program(vec![rapids_op("beside", flat(1, 6.0), &[Vec3::new(-30.0, 0.0, 10.0), Vec3::new(-18.5, 0.0, 10.0), Vec3::new(-18.5, 0.0, -5.0)])]);
+    assert!(check3(&beside, &post, Some(&stock)).pass());
+    let touching =
+        program(vec![rapids_op("touching", flat(1, 6.0), &[Vec3::new(-30.0, 0.0, 10.0), Vec3::new(-17.0, 0.0, 10.0), Vec3::new(-17.0, 0.0, -5.0)])]);
+    assert!(!check3(&touching, &post, Some(&stock)).pass());
+    // Straight up out of a cut in the stock: through room the tool already fills. Up and
+    // then across below the stock's top: through the stock.
+    let out_of = |to: Vec3| {
+        let moves = vec![
+            Move::Rapid { to: Vec3::new(0.0, 0.0, 10.0) },
+            Move::Feed { to: Vec3::new(0.0, 0.0, 0.5), feed: 300.0 },
+            Move::Feed { to: Vec3::new(5.0, 0.0, 0.5), feed: 300.0 },
+            Move::Rapid { to },
+        ];
+        let op = IndexedOperation {
+            name: "out".into(),
+            tool: flat(1, 6.0),
+            spindle_rpm: 12000.0,
+            coolant: false,
+            rotary: Vec::new(),
+            path: Toolpath { moves },
+        };
+        program(vec![MachineOperation::Indexed(op)])
+    };
+    let r = check3(&out_of(Vec3::new(5.0, 0.0, 10.0)), &post, Some(&stock));
+    assert!(r.pass(), "{r:?}");
+    let r = check3(&out_of(Vec3::new(9.0, 0.0, 0.8)), &post, Some(&stock));
+    assert!(r.hits.iter().any(|h| h.kind == RapidHitKind::Stock), "{r:?}");
+}
+
+#[test]
+fn a_holder_over_a_tall_clamp_is_found() {
+    let post = Post5::mach3_4axis();
+    let mut tool = flat(1, 6.0);
+    tool.stickout = Some(30.0);
+    tool.holder = vec![HolderSection { diameter: 40.0, length: 30.0 }];
+    let mut tris = part().triangles().to_vec();
+    tris.extend_from_slice(block(Vec3::new(15.0, -5.0, -10.0), Vec3::new(20.0, 5.0, 40.0)).triangles());
+    let obstacles = Surface::new(tris).unwrap();
+    // Past the clamp 4 mm clear of the cutter; the holder, 33 mm up and 20 in radius, is not.
+    let op = program(vec![rapids_op("past", tool.clone(), &[Vec3::new(-30.0, 12.0, 3.0), Vec3::new(30.0, 12.0, 3.0)])]);
+    let machine = Machine::three_axis();
+    let text = emit_program(&op, &post, &machine).unwrap();
+    let r = check_rapids(&text, &op, &post, &machine, &obstacles, &part(), None, 0.01, RAPID_STEP).unwrap();
+    assert!(r.hits.iter().any(|h| h.kind == RapidHitKind::Holder), "{r:?}");
+    assert!(!r.hits.iter().any(|h| h.kind == RapidHitKind::Part), "{r:?}");
+}
+
+/// The tool of every block is its operation's: a small tool's rapid beside the clamp passes
+/// although the face mill of the next operation would not fit there.
+#[test]
+fn each_rapid_is_checked_with_its_own_tool() {
+    let post = Post5::mach3_4axis();
+    let ops = program(vec![
+        rapids_op("small", flat(1, 6.0), &[Vec3::new(17.5, -30.0, 3.0), Vec3::new(17.5, -10.0, 3.0), Vec3::new(30.0, -10.0, 3.0)]),
+        rapids_op("big", flat(2, 32.0), &[Vec3::new(-60.0, 0.0, 20.0), Vec3::new(-60.0, 0.0, 10.0)]),
+    ]);
+    let r = check3(&ops, &post, None);
+    assert!(r.pass() && r.tools_known, "{r:?}");
+    // The same path cut with the face mill is through the clamp.
+    let ops =
+        program(vec![rapids_op("big", flat(2, 32.0), &[Vec3::new(17.5, -30.0, 3.0), Vec3::new(17.5, -10.0, 3.0), Vec3::new(30.0, -10.0, 3.0)])]);
+    assert!(check3(&ops, &post, None).hits.iter().any(|h| h.kind == RapidHitKind::Part));
+    // A post whose tool changes write nothing for the first tool still names every block's.
+    let r = check3(&program(vec![rapids_op("a", flat(1, 6.0), &[Vec3::new(-30.0, 0.0, 8.0)])]), &Post5::grblhal_4axis(), None);
+    assert!(r.pass() && r.tools_known, "{r:?}");
+}
+
+/// A square bar 20 mm across (corners 14.1 mm from the A axis), the tool at radius 12, turned
+/// A 0 to 45°: the corner sweeps through the tool. At radius 20, clear.
+#[test]
+fn an_a_turn_low_beside_a_square_bar_is_found() {
+    let bar = block(Vec3::new(-20.0, -10.0, -10.0), Vec3::new(20.0, 10.0, 10.0));
+    let machine = Machine::four_axis_a();
+    let tool = flat(1, 6.0);
+    let turn_at = |rho: f64| {
+        let path = Toolpath5 {
+            moves: vec![
+                Move5::Rapid { to: rotary_pose(0.0, 0.0, 40.0) },
+                Move5::Rapid { to: rotary_pose(0.0, 0.0, rho) },
+                Move5::Rapid { to: rotary_pose(0.0, 45f64.to_radians(), rho) },
+                Move5::Rapid { to: rotary_pose(0.0, 45f64.to_radians(), 40.0) },
+            ],
+        };
+        program(vec![MachineOperation::Continuous(Operation5 {
+            name: "turn".into(),
+            tool: tool.clone(),
+            spindle_rpm: 12000.0,
+            coolant: false,
+            path,
+        })])
+    };
+    // A post that turns where the tool is, without rising first.
+    let mut post = Post5::mach3_4axis();
+    post.clearance_retract = false;
+    let check = |p: &MachineProgram, post: &Post5, stock: Option<&Stock>| {
+        let text = emit_program(p, post, &machine).unwrap();
+        assert!(text.contains("A45"), "{text}");
+        check_rapids(&text, p, post, &machine, &bar, &bar, stock, 0.01, RAPID_STEP).unwrap()
+    };
+    let r = check(&turn_at(12.0), &post, None);
+    let hit = r.hits.iter().find(|h| h.kind == RapidHitKind::Turn).unwrap();
+    assert!((hit.depth - (200f64.sqrt() + 0.01 - 12.0)).abs() < 0.05, "{hit:?}");
+    assert!(r.hits.iter().any(|h| h.kind == RapidHitKind::Part), "the corner meets the cutter: {r:?}");
+    assert!(check(&turn_at(20.0), &post, None).pass());
+    // With round stock of radius 22 the turn at 20 is inside what the stock sweeps.
+    let round = Stock::Cylinder { radius: 22.0, x_min: -25.0, x_max: 25.0 };
+    assert!(check(&turn_at(20.0), &post, Some(&round)).hits.iter().any(|h| h.kind == RapidHitKind::Turn));
+    assert!(check(&turn_at(23.0), &post, Some(&round)).pass());
+    // A post that returns to the machine's top before a turn: the turn is made up there.
+    let mut safe = post.clone();
+    safe.safe_rotate = vec!["G28 G91 Z0.".into(), "G90".into()];
+    let r = check(&turn_at(12.0), &safe, None);
+    assert!(!r.hits.iter().any(|h| h.kind == RapidHitKind::Turn) && r.from_unknown > 0, "{r:?}");
+}
+
+#[test]
+fn positions_beyond_the_travel_are_found() {
+    let post = Post5::mach3_4axis();
+    let p = program(vec![rapids_op("a", flat(1, 6.0), &[Vec3::new(-30.0, 0.0, 8.0), Vec3::new(30.0, 0.0, 8.0)])]);
+    let free = Machine::three_axis();
+    let text = emit_program(&p, &post, &free).unwrap();
+    assert_eq!(check_travel(&text, &free).unwrap(), None);
+    let mut tight = Machine::three_axis();
+    tight.linear_limits = Some((Vec3::new(-100.0, -100.0, -50.0), Vec3::new(100.0, 100.0, 5.0)));
+    let t = check_travel(&text, &tight).unwrap().unwrap();
+    let v = t.violation.unwrap();
+    assert_eq!(v.axis, 'Z');
+    assert!((v.value - 8.0).abs() < 1e-9 && v.line > 0, "{v:?}");
+    tight.linear_limits = Some((Vec3::new(-100.0, -100.0, -50.0), Vec3::new(100.0, 100.0, 50.0)));
+    let t = check_travel(&text, &tight).unwrap().unwrap();
+    assert!(t.violation.is_none() && t.checked > 3, "{t:?}");
+    tight.linear_limits = Some((Vec3::new(-20.0, -100.0, -50.0), Vec3::new(100.0, 100.0, 50.0)));
+    assert_eq!(check_travel(&text, &tight).unwrap().unwrap().violation.map(|v| v.axis), Some('X'));
+}
+
+#[test]
+fn hostile_rapid_checks_are_refused_without_panics() {
+    let post = Post5::mach3_4axis();
+    let machine = Machine::three_axis();
+    let p = program(vec![rapids_op("a", flat(1, 6.0), &[Vec3::new(-30.0, 0.0, 8.0)])]);
+    let text = emit_program(&p, &post, &machine).unwrap();
+    let s = part();
+    for (tol, step) in [(f64::NAN, 0.5), (-1.0, 0.5), (0.01, 0.0), (0.01, f64::INFINITY), (0.01, 1e-9), (2.0, 0.5)] {
+        assert!(check_rapids(&text, &p, &post, &machine, &s, &s, None, tol, step).is_err(), "{tol} {step}");
+    }
+    let bad = Stock::Box { min: Vec3::new(1.0, 0.0, 0.0), max: Vec3::new(0.0, 1.0, 1.0) };
+    assert!(check_rapids(&text, &p, &post, &machine, &s, &s, Some(&bad), 0.01, 0.5).is_err());
+    for junk in ["G0 X1 Y2 Z3\nG91 G0 X5\n", "G1 X1 Y0 Z0 F0\n", "G2 X1 Y1\n", "\u{0}(\n"] {
+        assert!(check_rapids(junk, &p, &post, &machine, &s, &s, None, 0.01, 0.5).is_err(), "{junk:?}");
+    }
+    // A program that is not the one written: blocks of no known operation, checked with every tool.
+    let other = "G0 X-30 Y0 Z8\nG0 X30 Y0 Z8\n";
+    let r = check_rapids(other, &p, &post, &machine, &part_and_clamp(), &s, None, 0.01, 0.5).unwrap();
+    assert!(!r.tools_known && r.pass() && r.checked == 2, "{r:?}");
+    // A rapid of a kilometre is sampled within the limits; far beyond them it is refused.
+    let far = "G0 X-500000 Y0 Z8\nG0 X500000 Y0 Z8\n";
+    assert!(check_rapids(far, &p, &post, &machine, &s, &s, None, 0.01, 0.01).is_err());
+    let empty = program(Vec::new());
+    assert!(check_rapids("", &empty, &post, &machine, &s, &s, None, 0.01, 0.5).unwrap().pass());
+    let mut limits = Machine::three_axis();
+    limits.linear_limits = Some((Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+    assert!(check_travel(&text, &limits).is_err());
+    limits.linear_limits = Some((Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)));
+    assert!(check_travel("G0 X1 Y2 Z3\nG91 G0 X5\n", &limits).is_err());
+}

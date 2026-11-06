@@ -1,0 +1,478 @@
+//! Rapid safety and travel of a written program: every `G0` block as the controller moves
+//! through it, held against the part, the fixtures and the stock, and every position against
+//! the machine's travel.
+//!
+//! The program is read with [`parse5`] and the machine is moved through each rapid block as the
+//! controller would (every axis evenly from the block's start to its end), sampled every
+//! `step` of the tip's travel and of a point at the tool's reach. At each sample, through
+//! [`forward`] into work coordinates:
+//!
+//! - the cutter, as a cylinder of its radius without end above its tip (the shank and spindle
+//!   are there too), must not be in the part or a fixture by more than the tolerance (the
+//!   gouge test of [`crate::collision`]), nor the tool's shank and holder touch them;
+//! - with a stock, the cutter must not be in the stock (as given: what earlier cuts removed is
+//!   not tracked, so a rapid below the stock's top over it fails), except on a retract straight
+//!   up the tool's axis, which only passes through room the tool already fills;
+//! - a block that turns the rotary of a 4th axis (a table about X) must keep the cutter
+//!   outside the radius the stock sweeps (without a stock, the part's largest radius and the
+//!   tolerance), all through the turn, wherever the stock is level with it along X.
+//!
+//! A block after a return to the machine's home (`G28`, `G30`), a move in machine coordinates
+//! (`G53`) or a tool change starts from where the reader cannot follow: only its end is
+//! checked, which with the cutter endless above covers the way down from the machine's top.
+//! Rotaries turned there (a post's safe rotate) are taken to turn at the machine's top, clear
+//! of the work, and a tool change to be made where the new tool clears everything (at the
+//! machine's top, where the post's safe retract takes it).
+//!
+//! The tool of each block is found by writing the program again with a marker at the start of
+//! every operation: the marked program must move exactly as the real one, and the marker before
+//! a block names its operation. Should that fail, every block is checked with every tool.
+
+use serde::{Deserialize, Serialize};
+use solidcore_record::{Vec2, Vec3};
+use solidcraft_geom::prelude::*;
+
+use crate::collision::{Moves, gouges_in, holder_collisions_in};
+use crate::cutter::Cutter;
+use crate::gcode::words;
+use crate::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, emit_program, parse5};
+use crate::kinematics::{Carrier, Joints, Machine, forward, head_point, table_point, tool_axis};
+use crate::multiaxis::{Move5, Pose, Toolpath5};
+use crate::stock::{Stock, axis_intrusion};
+use crate::surface::Surface;
+use crate::tool::Tool;
+use crate::{CamError, Result, invalid};
+
+/// The default distance between the samples of a rapid (mm).
+pub const RAPID_STEP: f64 = 0.5;
+/// Most samples along the whole program, and along one block.
+const MAX_SAMPLES: usize = 20_000_000;
+const MAX_BLOCK_SAMPLES: usize = 2_000_000;
+/// Most hits kept in full (all are counted).
+const MAX_HITS_KEPT: usize = 1000;
+/// The line written at the start of every operation of the marked program.
+const MARK: &str = "(SOLIDCRAFT RAPID CHECK OPERATION START)";
+
+/// What a rapid runs into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RapidHitKind {
+    /// The cutter in the part or a fixture.
+    Part,
+    /// The tool's shank or holder touching the part or a fixture.
+    Holder,
+    /// The cutter in the stock.
+    Stock,
+    /// A rotary turning the work into the tool.
+    Turn,
+}
+
+impl RapidHitKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RapidHitKind::Part => "through the part or a fixture",
+            RapidHitKind::Holder => "the shank or holder through the part or a fixture",
+            RapidHitKind::Stock => "through the stock",
+            RapidHitKind::Turn => "turns the work into the tool",
+        }
+    }
+}
+
+/// A rapid block that runs into something.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RapidHit {
+    /// The program line (from 1).
+    pub line: usize,
+    /// The operation it belongs to (index into the program's operations), when known.
+    pub operation: Option<usize>,
+    pub kind: RapidHitKind,
+    /// How deep, at its deepest sample (mm): how far the cutter is in the part or stock, how far
+    /// the holder overlaps, how far inside the swept radius the cutter is during a turn.
+    pub depth: f64,
+    /// The tip there, work coordinates.
+    pub at: Vec3,
+}
+
+/// What [`check_rapids`] found.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RapidCheck {
+    /// Rapid blocks checked.
+    pub checked: usize,
+    /// Samples taken along them.
+    pub samples: usize,
+    /// Rapid blocks that run into something, counting each block once per kind.
+    pub hit_count: usize,
+    /// The first [`MAX_HITS_KEPT`] of them.
+    pub hits: Vec<RapidHit>,
+    /// The deepest of them (mm; 0 with none).
+    pub worst: f64,
+    /// Rapid blocks that start where the reader cannot follow the machine (after a return to
+    /// its home, a move in machine coordinates or a tool change), of which only the end is checked.
+    pub from_unknown: usize,
+    /// Whether every block's tool was known (otherwise every block was checked with every tool).
+    pub tools_known: bool,
+}
+
+impl RapidCheck {
+    pub fn pass(&self) -> bool {
+        self.hit_count == 0
+    }
+
+    fn hit(&mut self, hit: RapidHit) {
+        self.hit_count += 1;
+        self.worst = self.worst.max(hit.depth);
+        if self.hits.len() < MAX_HITS_KEPT {
+            self.hits.push(hit);
+        }
+    }
+}
+
+/// Where the axes are after a block.
+#[derive(Clone, Debug)]
+struct State {
+    linear: Vec3,
+    rotary: Vec<f64>,
+    tcp: bool,
+    line: usize,
+    /// The number of the tool in the spindle, when known.
+    tool: Option<u32>,
+}
+
+fn tool_of(op: &MachineOperation) -> &Tool {
+    match op {
+        MachineOperation::Continuous(o) => &o.tool,
+        MachineOperation::Indexed(o) => &o.tool,
+    }
+}
+
+fn pose_at(machine: &Machine, linear: Vec3, rotary: &[f64], tcp: bool) -> Pose {
+    if tcp { Pose { tip: linear, axis: tool_axis(machine, rotary) } } else { forward(machine, &Joints { linear, rotary: rotary.to_vec() }) }
+}
+
+/// Whether line `line` returns to the machine's home or moves in machine coordinates.
+fn homes(line: &str) -> bool {
+    words(line, 0).is_ok_and(|ws| ws.iter().any(|&(c, v)| c == 'G' && matches!((v * 10.0).round() as i64, 280 | 300 | 530)))
+}
+
+fn same_motion(a: &JointWords, b: &JointWords) -> bool {
+    match (a, b) {
+        (JointWords::Rapid { linear: l1, rotary: r1, tcp: t1, .. }, JointWords::Rapid { linear: l2, rotary: r2, tcp: t2, .. })
+        | (JointWords::Feed { linear: l1, rotary: r1, tcp: t1, .. }, JointWords::Feed { linear: l2, rotary: r2, tcp: t2, .. })
+        | (JointWords::Arc { linear: l1, rotary: r1, tcp: t1, .. }, JointWords::Arc { linear: l2, rotary: r2, tcp: t2, .. }) => {
+            l1 == l2 && r1 == r2 && t1 == t2
+        }
+        (JointWords::Dwell { seconds: s1, .. }, JointWords::Dwell { seconds: s2, .. }) => s1 == s2,
+        _ => false,
+    }
+}
+
+fn line_of(b: &JointWords) -> usize {
+    match b {
+        JointWords::Rapid { line, .. } | JointWords::Feed { line, .. } | JointWords::Arc { line, .. } | JointWords::Dwell { line, .. } => *line,
+    }
+}
+
+/// The operation of every block of `blocks` (read from the program as written), from the
+/// program written again with a marker before every operation; `None` when the two do not move
+/// alike.
+fn owners(program: &MachineProgram, post: &Post5, machine: &Machine, blocks: &[JointWords]) -> Option<Vec<usize>> {
+    let mut marked = post.clone();
+    marked.base.operation_start.insert(0, MARK.into());
+    let text = emit_program(program, &marked, machine).ok()?;
+    let again = parse5(&text, &machine.letters()).ok()?;
+    if again.len() != blocks.len() || !again.iter().zip(blocks).all(|(a, b)| same_motion(a, b)) {
+        return None;
+    }
+    let marks: Vec<usize> = text.lines().enumerate().filter(|(_, l)| l.contains(MARK)).map(|(i, _)| i + 1).collect();
+    if marks.len() != program.operations.len() {
+        return None;
+    }
+    Some(again.iter().map(|b| marks.partition_point(|&m| m < line_of(b)).saturating_sub(1)).collect())
+}
+
+/// What a 4th axis turn must keep the cutter out of: the line of the table about X (its Y and Z
+/// in work coordinates), the radius it sweeps and its extent along X.
+#[derive(Clone, Copy, Debug)]
+struct TurnZone {
+    center: Vec2,
+    radius: f64,
+    x: (f64, f64),
+}
+
+fn turn_zone(machine: &Machine, part: &Surface, stock: Option<&Stock>, tol: f64) -> Option<TurnZone> {
+    let [axis] = machine.rotaries.as_slice() else { return None };
+    if axis.carrier != Carrier::Table || axis.direction.normalized().map_or(0.0, |d| d.x.abs()) < 1.0 - 1e-9 {
+        return None;
+    }
+    let c = axis.center - machine.work_origin;
+    let center = Vec2::new(c.y, c.z);
+    match stock {
+        Some(s) => Some(TurnZone { center, radius: s.radius_about_x(center) - tol, x: s.x_range() }),
+        None => {
+            let b = part.bounds();
+            let radius = part.triangles().iter().flatten().map(|p| (p.y - center.x).hypot(p.z - center.y)).fold(0.0, f64::max);
+            (!b.is_empty()).then_some(TurnZone { center, radius: radius + tol, x: (b.min.x, b.max.x) })
+        }
+    }
+}
+
+/// The farthest any point of `tool` that is checked lies from its tip (mm).
+fn reach(tool: &Tool) -> f64 {
+    tool.envelopes().iter().map(|e| e.top).fold(tool.flute_length, f64::max) + tool.radius()
+}
+
+/// The cutter a rapid is checked with: the tool's, or for a drill a flat end of its diameter.
+fn rapid_cutter(tool: &Tool) -> Result<Cutter> {
+    tool.cutter().or_else(|_| Cutter::flat(tool.radius()))
+}
+
+/// Checks every rapid of `text` (written from `program` through `post` for `machine`) against
+/// `obstacles` (the part and the fixtures), `stock` and, for 4th-axis turns, the radius of the
+/// stock or of `part`; see the module notes. `tol` is how deep the cutter may be before it
+/// counts, `step` the distance between samples.
+#[allow(clippy::too_many_arguments)]
+pub fn check_rapids(
+    text: &str,
+    program: &MachineProgram,
+    post: &Post5,
+    machine: &Machine,
+    obstacles: &Surface,
+    part: &Surface,
+    stock: Option<&Stock>,
+    tol: f64,
+    step: f64,
+) -> Result<RapidCheck> {
+    post.validate()?;
+    machine.validate()?;
+    if !(tol >= 0.0) || !(tol <= 1.0) {
+        return invalid("the rapid check's tolerance must be from 0 to 1 mm");
+    }
+    if !(step >= 0.01) || !(step <= 100.0) {
+        return invalid("the rapid check's sample step must be from 0.01 to 100 mm");
+    }
+    if let Some(s) = stock {
+        s.validate()?;
+    }
+    if program.operations.is_empty() {
+        return Ok(RapidCheck { tools_known: true, ..RapidCheck::default() });
+    }
+    let blocks = parse5(text, &machine.letters())?;
+    let owner = owners(program, post, machine, &blocks);
+    let mut out = RapidCheck { tools_known: owner.is_some(), ..RapidCheck::default() };
+    let tools: Vec<&Tool> = program.operations.iter().map(tool_of).collect();
+    let cutters: Vec<Cutter> = tools.iter().map(|t| rapid_cutter(t)).collect::<Result<_>>()?;
+    // Every operation's index, but one per tool number: what a block of no known operation is
+    // checked with.
+    let mut every: Vec<usize> = Vec::new();
+    for (i, t) in tools.iter().enumerate() {
+        if !every.iter().any(|&k| tools.get(k).is_some_and(|u| u.number == t.number)) {
+            every.push(i);
+        }
+    }
+    let zone = turn_zone(machine, part, stock, tol);
+    let lever = machine.work_origin.len() + machine.rotaries.iter().map(|r| r.center.len()).sum::<f64>();
+    // Lines that return home, counted up to each line, so a gap between two blocks is seen at once.
+    let mut homed = vec![0usize];
+    for l in text.lines() {
+        let last = homed.last().copied().unwrap_or(0);
+        homed.push(last + usize::from(homes(l)));
+    }
+    let homes_between = |a: usize, b: usize| homed.get(b.saturating_sub(1)).zip(homed.get(a)).is_some_and(|(x, y)| x > y);
+
+    // The tool number of block `i`, when its operation is known.
+    let tool_at = |i: usize| owner.as_ref().and_then(|o| o.get(i)).and_then(|&k| tools.get(k)).map(|t| t.number);
+    let mut state: Option<State> = None;
+    for (i, b) in blocks.iter().enumerate() {
+        let (line, linear, rotary, tcp, rapid) = match b {
+            JointWords::Rapid { line, linear, rotary, tcp } => (*line, *linear, rotary, *tcp, true),
+            JointWords::Feed { line, linear, rotary, tcp, .. } | JointWords::Arc { line, linear, rotary, tcp, .. } => {
+                (*line, *linear, rotary, *tcp, false)
+            }
+            JointWords::Dwell { .. } => continue,
+        };
+        let to = State { linear, rotary: rotary.clone(), tcp, line, tool: tool_at(i) };
+        if rapid {
+            // A tool change may leave the tool anywhere (the post's own lines take it to the
+            // machine's top, where a post has them).
+            let from = state.as_ref().filter(|s| s.tcp == tcp && !homes_between(s.line, line) && s.tool == to.tool);
+            if from.is_none() && state.is_some() {
+                out.from_unknown += 1;
+            }
+            let ops: Vec<usize> = match owner.as_ref().and_then(|o| o.get(i)) {
+                Some(&k) => vec![k],
+                None => every.clone(),
+            };
+            out.checked += 1;
+            for k in ops {
+                let (Some(tool), Some(cutter)) = (tools.get(k), cutters.get(k)) else { continue };
+                let poses = samples(machine, from, &to, reach(tool) + lever, step, &mut out.samples)?;
+                check_block(&mut out, &poses, (line, owner.as_ref().map(|_| k)), tool, cutter, obstacles, stock, tol, step)?;
+                let turns = from.is_some_and(|f| f.rotary.iter().zip(&to.rotary).any(|(a, b)| (a - b).abs() > 1e-9));
+                if let (true, Some(z)) = (turns, zone) {
+                    let deepest = poses
+                        .iter()
+                        .filter_map(|p| axis_intrusion(p, tool.radius(), z.center, z.radius, z.x.0, z.x.1).map(|d| (d, p.tip)))
+                        .reduce(|a, b| if b.0 > a.0 { b } else { a });
+                    if let Some((depth, at)) = deepest {
+                        out.hit(RapidHit { line, operation: owner.as_ref().map(|_| k), kind: RapidHitKind::Turn, depth, at });
+                    }
+                }
+            }
+        }
+        state = Some(to);
+    }
+    Ok(out)
+}
+
+/// The poses along a rapid from `from` (the block's start; `None` where it is not known: only
+/// its end then) to `to`, at most `step` apart for the tip and for a point `reach` up the tool.
+fn samples(machine: &Machine, from: Option<&State>, to: &State, reach: f64, step: f64, total: &mut usize) -> Result<Vec<Pose>> {
+    let end = pose_at(machine, to.linear, &to.rotary, to.tcp);
+    let Some(from) = from else {
+        *total = total.saturating_add(1);
+        return Ok(vec![end]);
+    };
+    let start = pose_at(machine, from.linear, &from.rotary, from.tcp);
+    let a = Joints { linear: from.linear, rotary: from.rotary.clone() };
+    let b = Joints { linear: to.linear, rotary: to.rotary.clone() };
+    let turn = a.rotary_change(&b);
+    let lever = start.tip.len().max(end.tip.len()) + reach;
+    let length = from.linear.dist(to.linear) + start.tip.dist(end.tip) + turn * lever;
+    let n = (length / step).ceil().max(1.0);
+    if !(n <= MAX_BLOCK_SAMPLES as f64) {
+        return Err(CamError::TooLarge(format!("a rapid of the program needs more than {MAX_BLOCK_SAMPLES} samples")));
+    }
+    let n = n as usize;
+    *total = total.saturating_add(n + 1);
+    if *total > MAX_SAMPLES {
+        return Err(CamError::TooLarge(format!("the program's rapids need more than {MAX_SAMPLES} samples")));
+    }
+    Ok((0..=n)
+        .map(|k| {
+            let j = a.lerp(&b, k as f64 / n as f64);
+            if to.tcp {
+                Pose { tip: from.linear.lerp(to.linear, k as f64 / n as f64), axis: tool_axis(machine, &j.rotary) }
+            } else {
+                pose_at(machine, j.linear, &j.rotary, false)
+            }
+        })
+        .collect())
+}
+
+/// Checks the poses of one rapid block (`at`: its line and the operation whose tool it is, when known).
+#[allow(clippy::too_many_arguments)]
+fn check_block(
+    out: &mut RapidCheck,
+    poses: &[Pose],
+    at: (usize, Option<usize>),
+    tool: &Tool,
+    cutter: &Cutter,
+    obstacles: &Surface,
+    stock: Option<&Stock>,
+    tol: f64,
+    step: f64,
+) -> Result<()> {
+    let (line, op) = at;
+    let path = Toolpath5 { moves: poses.iter().map(|&to| Move5::Rapid { to }).collect() };
+    let hits = gouges_in(obstacles, cutter, &path, tol, step, Moves::All)?;
+    if let Some(h) = hits.iter().max_by(|a, b| a.distance.total_cmp(&b.distance)) {
+        out.hit(RapidHit { line, operation: op, kind: RapidHitKind::Part, depth: h.distance, at: h.pose.tip });
+    }
+    if !tool.envelopes().is_empty() {
+        let hits = holder_collisions_in(obstacles, tool, &path, 0.0, step, Moves::All)?;
+        if let Some(h) = hits.iter().min_by(|a, b| a.distance.total_cmp(&b.distance)) {
+            out.hit(RapidHit { line, operation: op, kind: RapidHitKind::Holder, depth: (-h.distance).max(0.0), at: h.pose.tip });
+        }
+    }
+    // Straight up the tool's axis out of where it is (a retract out of the cut), the tool only
+    // passes through room it already fills: the stock does not count against it.
+    if let Some(s) = stock.filter(|_| !retract(poses)) {
+        let deepest =
+            poses.iter().filter_map(|p| s.intrusion(p, tool.radius(), tol).map(|d| (d, p.tip))).reduce(|a, b| if b.0 > a.0 { b } else { a });
+        if let Some((depth, at)) = deepest {
+            out.hit(RapidHit { line, operation: op, kind: RapidHitKind::Stock, depth, at });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `poses` (a rapid's samples) run straight out along the tool axis of the first,
+/// the axis held.
+fn retract(poses: &[Pose]) -> bool {
+    let (Some(a), Some(b)) = (poses.first(), poses.last()) else { return false };
+    let d = b.tip - a.tip;
+    poses.len() > 1 && poses.iter().all(|p| p.axis_angle(a) <= 1e-9 && (p.tip - a.tip).cross(a.axis).len() <= 1e-6) && d.dot(a.axis) > 0.0
+}
+
+/// A position beyond the machine's travel.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TravelViolation {
+    /// The program line (from 1).
+    pub line: usize,
+    /// `X`, `Y` or `Z`.
+    pub axis: char,
+    /// Where the axis would be (mm, machine coordinates).
+    pub value: f64,
+    pub low: f64,
+    pub high: f64,
+}
+
+/// What [`check_travel`] found.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Travel {
+    /// Motion blocks checked.
+    pub checked: usize,
+    /// The first position beyond the travel.
+    pub violation: Option<TravelViolation>,
+}
+
+/// Every position the linear axes of `machine` reach in `text` (the end of every block, and
+/// along every arc) against its linear limits; `None` for a machine without them. With tool
+/// centre point control the axes are found from the tip through the kinematics.
+pub fn check_travel(text: &str, machine: &Machine) -> Result<Option<Travel>> {
+    machine.validate()?;
+    let Some((lo, hi)) = machine.linear_limits else { return Ok(None) };
+    let blocks = parse5(text, &machine.letters())?;
+    let mut out = Travel::default();
+    let axes = |linear: Vec3, rotary: &[f64], tcp: bool| {
+        if tcp { table_point(machine, rotary, machine.work_origin + linear) - head_point(machine, rotary, Vec3::ZERO) } else { linear }
+    };
+    let mut last: Option<Vec3> = None;
+    for b in &blocks {
+        let (line, points) = match b {
+            JointWords::Rapid { line, linear, rotary, tcp } | JointWords::Feed { line, linear, rotary, tcp, .. } => {
+                (*line, vec![axes(*linear, rotary, *tcp)])
+            }
+            JointWords::Arc { line, linear, center, ccw, rotary, tcp, .. } => {
+                let mut pts = Vec::new();
+                if let Some(from) = last
+                    && !*tcp
+                {
+                    let start = Vec2::new(from.x, from.y) - *center;
+                    let sweep = crate::path::arc_sweep(from, *linear, *center, *ccw);
+                    for k in 1..64 {
+                        let t = k as f64 / 64.0;
+                        let q = *center + Vec2::from_angle(start.angle() + sweep * t) * start.len();
+                        pts.push(Vec3::new(q.x, q.y, from.z + (linear.z - from.z) * t));
+                    }
+                }
+                pts.push(axes(*linear, rotary, *tcp));
+                (*line, pts)
+            }
+            JointWords::Dwell { .. } => continue,
+        };
+        out.checked += 1;
+        if out.violation.is_none() {
+            'points: for p in &points {
+                for (axis, v, a, b) in [('X', p.x, lo.x, hi.x), ('Y', p.y, lo.y, hi.y), ('Z', p.z, lo.z, hi.z)] {
+                    if !(v >= a - 1e-6 && v <= b + 1e-6) {
+                        out.violation = Some(TravelViolation { line, axis, value: v, low: a, high: b });
+                        break 'points;
+                    }
+                }
+            }
+        }
+        last = points.last().copied();
+    }
+    Ok(Some(out))
+}

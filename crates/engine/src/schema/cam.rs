@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::cam_stock::{FaceOp, RapidsReport, StockReport, StockSpec, TravelReport};
 use super::types::SketchRef;
 
 /// Plan and check a CAM job and write its G-code: toolpaths for every operation on the design's
@@ -88,6 +89,12 @@ pub struct CamJob {
     /// Default: 0.01.
     #[serde(default)]
     pub tolerance: Option<f64>,
+    /// The raw material, in work coordinates: `{box: {min, max}}`, `{cylinder: {radius, x_min,
+    /// x_max}}` (a bar about work X) or `{around_part: {margin: [x, y, z]}}`. No rapid may pass
+    /// through it below its top, and `face` faces it. Default: none (rapids are checked against
+    /// the part and fixtures only).
+    #[serde(default)]
+    pub stock: Option<StockSpec>,
     /// The tools, as the CAM crate's `Tool` JSON (`number`, `kind`, `diameter`, `flute_length`,
     /// ...). Give this or `tool_library_path`.
     #[serde(default)]
@@ -532,6 +539,7 @@ pub enum OperationSpec {
     RotaryFinish(RotaryFinishOp),
     RotaryRoughing(RotaryRoughingOp),
     Wrap(WrapOp),
+    Face(FaceOp),
 }
 
 /// What `cam.job` returns.
@@ -556,6 +564,12 @@ pub struct CamJobReply {
     /// Moves along which a tool's shank or holder comes closer to the part or fixtures than
     /// zero (tools with holder data only); `null` when no tool has holder data.
     pub holder_collisions: Option<usize>,
+    /// Every rapid of the program as written against the part, fixtures and stock.
+    pub rapids: RapidsReport,
+    /// The linear axes against the machine's `linear_limits`; `null` for a machine without them.
+    pub travel: Option<TravelReport>,
+    /// The job's stock as checked against; `null` without one.
+    pub stock: Option<StockReport>,
     /// Whether every check passed.
     pub passed: bool,
     /// The checks that failed.
