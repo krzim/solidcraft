@@ -3,9 +3,9 @@
 //!
 //! A controller moves no axis faster than its top rate: a rapid takes as long as its slowest
 //! axis needs, every axis at its own rapid rate, and a cut written faster than an axis can go
-//! (a feed above the machine's top feed, or an inverse-time block, `G93`, that turns a rotary
-//! faster than it can turn) is slowed until every axis keeps within its rate, so the cut takes
-//! longer than its `F` says. [`machine_time`] reads a program with [`parse5`] and times every
+//! (a feed above the machine's top feed, or a cut that turns a rotary faster than it can turn,
+//! in inverse time, `G93`, or not) is slowed until every axis keeps within its rate, so the cut
+//! takes longer than its `F` says. [`machine_time`] reads a program with [`parse5`] and times every
 //! block that way against a machine's [`MachineRates`]: the cut time as written and as run, the
 //! rapid time, the spindle's start-up waits, and the blocks the controller would slow, with a
 //! warning for each kind. Acceleration is left out (a controller blending moves at constant
@@ -178,7 +178,7 @@ pub struct MachineTime {
     pub rotary_over: usize,
     /// Of those, blocks that ask a linear axis for more than its top feed.
     pub feed_over: usize,
-    /// The highest rotary rate an inverse-time block asks for (degrees a minute) and its line.
+    /// The highest rotary rate a cut asks for (degrees a minute) and its line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_rotary_deg_min: Option<(usize, f64)>,
     /// The highest feed of the linear axes a cut asks for (mm/min) and its line.
@@ -228,6 +228,9 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
     let mut high = [f64::NEG_INFINITY; 3];
     let mut untimed_turns = 0usize;
     let (mut first_rotary_over, mut first_feed_over) = (None, None);
+    // The fastest feed among the blocks slowed for a linear axis: the feed the warning names
+    // (the fastest of all may be a diagonal no single axis is too slow for).
+    let mut worst_feed_over: Option<(usize, f64)> = None;
     for w in &written {
         let (line, linear, rotary) = match w {
             JointWords::Dwell { seconds, .. } => {
@@ -269,7 +272,9 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
                 if !(nominal.is_finite() && nominal > 0.0) {
                     continue;
                 }
-                if *inverse_time && turn > 0.0 {
+                // Every cut that turns a rotary asks it for a rate, whether its `F` is inverse
+                // time or along the linear axes (or, for a turn alone, in degrees a minute).
+                if turn > 0.0 {
                     peak(&mut t.peak_rotary_deg_min, line, turn / nominal);
                 }
                 if len > 1e-12 {
@@ -287,6 +292,7 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
                     if axis_minutes(d, 0.0, xy, z, None) > nominal * (1.0 + SLOWED) {
                         t.feed_over += 1;
                         first_feed_over.get_or_insert(line);
+                        peak(&mut worst_feed_over, line, len / nominal);
                     }
                 }
             }
@@ -308,6 +314,7 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
                     t.slowed_blocks += 1;
                     t.feed_over += 1;
                     first_feed_over.get_or_insert(line);
+                    peak(&mut worst_feed_over, line, len / nominal);
                 }
             }
             JointWords::Dwell { .. } => {}
@@ -365,7 +372,7 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
     if t.feed_over > 0
         && let Some(first) = first_feed_over
     {
-        let peak = t.peak_feed_mm_min.map_or(String::new(), |(l, p)| format!(" (up to {} mm/min at line {l})", fmt(p)));
+        let peak = worst_feed_over.map_or(String::new(), |(l, p)| format!(" (up to {} mm/min at line {l})", fmt(p)));
         t.warnings.push(format!(
             "{} cutting blocks (the first at line {first}) ask a linear axis for more than its top feed{peak}: the controller \
              slows them, so they take longer than written",

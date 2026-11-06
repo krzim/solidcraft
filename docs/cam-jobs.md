@@ -175,9 +175,9 @@ elsewhere are read on a best-effort basis and stop at the first block it cannot 
 
 A controller moves no axis faster than its top rate. A rapid takes as long as its slowest axis
 needs, and a cut written faster than an axis can go is slowed down, so it takes longer than
-its `F` says. That includes a feed above the machine's top feed, and an inverse-time block
-(`G93`) that turns A faster than A can turn. Give the job the machine's rates and `cam.job`
-times the program as the machine runs it:
+its `F` says. That includes a feed above the machine's top feed, and a cut that turns A
+faster than A can turn, in inverse time (`G93`) or not. Give the job the machine's rates and
+`cam.job` times the program as the machine runs it:
 
 ```json
 "machine_rates": {"rapid_xyz_mm_min": 8000, "rapid_z_mm_min": 4000, "rapid_a_deg_min": 8000,

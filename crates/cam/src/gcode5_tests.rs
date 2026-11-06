@@ -1186,3 +1186,30 @@ fn coolant_can_come_on_after_the_first_turn_of_a() {
     assert!(!serde_json::to_string(&dialect()).unwrap().contains("coolant_after_turn"));
     assert!(!serde_json::to_string(&Post5::mach3_4axis()).unwrap().contains("coolant_after_turn"));
 }
+
+/// With `coolant_after_turn`, through tool changes, an operation without coolant and a wrapped
+/// cut that rewinds, with and without `safe_rotate_first`: every `M8` comes right after a turn
+/// of A, never before it or after a cut, and every program reads back.
+#[test]
+fn coolant_after_turn_follows_every_index() {
+    let machine = limited_a();
+    let side = |name: &str, t: u32, a: f64| with_coolant(indexed_op(name, t, vec![deg(a)], contour_path().moves));
+    let mut helix = op5("helix", helix_of(3));
+    helix.tool = Tool::new(5, ToolKind::BallEndmill, 6.0, 20.0);
+    let dry = match side("c", 4, 180.0) {
+        MachineOperation::Indexed(o) => MachineOperation::Indexed(IndexedOperation { coolant: false, ..o }),
+        other => other,
+    };
+    let program = MachineProgram {
+        name: "p".into(),
+        operations: vec![side("a", 3, 0.0), side("b", 4, 90.0), dry, MachineOperation::Continuous(helix), side("d", 5, 270.0)],
+        work_offset: None,
+    };
+    for first in [true, false] {
+        let post = Post5 { coolant_after_turn: true, safe_rotate_first: first, ..dialect() };
+        let text = emit_program(&program, &post, &machine).unwrap();
+        println!("=== safe_rotate_first {first}\n{text}");
+        let rb = readback_program(&text, &program, &post, &machine).unwrap();
+        assert!(rb.within(), "{rb:?}");
+    }
+}

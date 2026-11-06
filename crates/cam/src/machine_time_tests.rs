@@ -201,3 +201,37 @@ fn a_multi_axis_program_with_a_dwell_reads_back_in_milliseconds() {
         close(t.written_cut_minutes, rb.cut_minutes, 1e-9);
     }
 }
+
+#[test]
+fn rotary_rates_are_checked_outside_inverse_time_too() {
+    // A post without inverse time writes a turn of A alone at an `F` in degrees a minute, and a
+    // cut that moves and turns at an `F` along the linear axes: both can ask A for more than it
+    // can turn, the controller slows them just the same, and the reply must say so.
+    let a = [AxisLetter::A];
+    let text = "G90 G94 G17 G21\nG0 X0. Y0. Z10. A0.\nG1 A90. F12000.\nG1 X10. A270. F1000.\nM30\n";
+    let t = machine_time(text, &a, &rates(), DwellUnit::Seconds).unwrap();
+    assert_eq!((t.slowed_blocks, t.rotary_over, t.feed_over), (2, 2, 0), "{t:?}");
+    // The second asks for 180° in 0.01 minutes: 18000°/min.
+    assert_eq!(t.peak_rotary_deg_min.map(|(l, _)| l), Some(4), "{t:?}");
+    close(t.peak_rotary_deg_min.map_or(0.0, |(_, r)| r), 18000.0, 1e-6);
+    close(t.cut_minutes, 90.0 / 8000.0 + 180.0 / 8000.0, 1e-12);
+    let all = t.warnings.join("\n");
+    assert!(all.contains("2 cutting blocks (the first at line 3) ask A to turn faster than its 8000°/min (up to 18000°/min at line 4)"), "{all}");
+}
+
+#[test]
+fn the_feed_warning_names_a_block_that_is_slowed() {
+    // A plunge at 5000 mm/min is slowed to Z's 4000; a diagonal at 7000 mm/min is not (X and Y
+    // each move at 4950). The warning must point at the plunge, not at the faster diagonal.
+    let a = [AxisLetter::A];
+    let text = "G90 G94 G17 G21\nG0 X0. Y0. Z10. A0.\nG1 Z0. F5000.\nG1 X100. Y100. F7000.\nM30\n";
+    let t = machine_time(text, &a, &rates(), DwellUnit::Seconds).unwrap();
+    assert_eq!((t.slowed_blocks, t.feed_over), (1, 1), "{t:?}");
+    // The highest feed asked for is still reported as it is.
+    assert_eq!(t.peak_feed_mm_min.map(|(l, _)| l), Some(4), "{t:?}");
+    let all = t.warnings.join("\n");
+    assert!(
+        all.contains("1 cutting blocks (the first at line 3) ask a linear axis for more than its top feed (up to 5000 mm/min at line 3)"),
+        "{all}"
+    );
+}

@@ -26,8 +26,8 @@ pub struct MachineRatesSpec {
     /// Top feed of Z, where it differs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_feed_z_mm_min: Option<f64>,
-    /// Top rate of the rotaries while cutting: an inverse-time block (`G93`) asking more is
-    /// slowed by the controller, and the reply warns.
+    /// Top rate of the rotaries while cutting: a cut asking more, in inverse time (`G93`) or
+    /// not, is slowed by the controller, and the reply warns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_a_deg_min: Option<f64>,
     /// The spindle's lowest and highest speed, rpm: the controller runs any other `S` at the
@@ -71,7 +71,7 @@ pub struct MachineTimeReport {
     pub rotary_over: usize,
     /// Of those, blocks asking a linear axis for more than its top feed.
     pub feed_over: usize,
-    /// The highest rotary rate an inverse-time block asks for, degrees a minute.
+    /// The highest rotary rate a cut asks for, degrees a minute.
     pub peak_rotary_deg_min: Option<f64>,
     /// Its program line.
     pub peak_rotary_line: Option<usize>,
