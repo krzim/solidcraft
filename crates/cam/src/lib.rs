@@ -27,6 +27,7 @@ mod cutter;
 pub mod drill;
 mod dropcutter;
 pub mod engagement;
+pub mod findings;
 pub mod finish3d;
 mod frame;
 mod gcode;
@@ -35,12 +36,14 @@ pub mod helical;
 pub mod indexed;
 pub mod kinematics;
 mod leads;
+pub mod machine_model;
 pub mod machine_time;
 mod multiaxis;
 mod offset;
 mod ops;
 mod path;
 mod piece;
+pub mod playback;
 mod post;
 pub mod rapids;
 mod readback;
@@ -49,10 +52,13 @@ pub mod rotary;
 pub mod setup_sheet;
 pub mod sim;
 pub mod stock;
+pub mod stock_mesh;
 pub mod strategies5;
 mod surface;
 pub mod surface_ops;
 mod tool;
+pub mod tool_mesh;
+pub mod workholding;
 pub mod wrapped;
 
 pub use chamfer::{ChamferGeometry, ChamferParams, DEFAULT_TIP_OFFSET, chamfer, chamfer_geometry};
@@ -127,7 +133,11 @@ mod kinematics_tests;
 #[cfg(test)]
 mod leads_tests;
 #[cfg(test)]
+mod machine_model_tests;
+#[cfg(test)]
 mod machine_time_tests;
+#[cfg(test)]
+mod playback_tests;
 #[cfg(test)]
 mod rapids_tests;
 #[cfg(test)]
@@ -144,5 +154,7 @@ mod strategies5_tests;
 mod surface_ops_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod workholding_tests;
 #[cfg(test)]
 mod wrapped_tests;

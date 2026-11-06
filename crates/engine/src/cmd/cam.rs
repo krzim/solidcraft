@@ -1,7 +1,7 @@
 //! CAM (`cam.job`, `cam.posts`, `cam.check`): toolpaths for a design's bodies and G-code for a
 //! machine, through the `solidcraft-cam` crate. The job (machine, post, tools, operations) is a
 //! JSON file next to the design, never part of it, so nothing new is saved in a design
-//! (docs/cam-jobs.md).
+//! (docs/cam-jobs.md). The simulation view's commands (`cam.view.*`) are in `cam_view.rs`.
 //!
 //! `cam.job` tessellates the part's bodies from their exact surfaces at half the job's
 //! tolerance into a surface in work coordinates (the design less the job's origin), runs every
@@ -46,6 +46,8 @@ use crate::{EngineError, Result, Session};
 const JOB_CONTRACT: TypedContract<CamJobParams> = TypedContract::new();
 const POSTS_CONTRACT: TypedContract<CamPostsParams> = TypedContract::new();
 const CHECK_CONTRACT: TypedContract<CamCheckParams> = TypedContract::new();
+
+pub(crate) use view::COMMANDS as VIEW_COMMANDS;
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.job", "CAM Job", crate::checked!("cam.job", job))
@@ -1038,6 +1040,81 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
     }
 }
 
+/// A job planned and its program written in memory: what `cam.job` checks and writes, and what
+/// `cam.view.load` plays.
+struct PlannedJob {
+    name: String,
+    machine: Machine,
+    post_name: String,
+    post: Post5,
+    tools: Vec<Tool>,
+    machine_rates: Option<solidcraft_cam::machine_time::MachineRates>,
+    surfaces: Surfaces,
+    notes: Vec<String>,
+    stock: Option<solidcraft_cam::stock::Stock>,
+    planned: Vec<Planned>,
+    program: MachineProgram,
+    text: String,
+    tol: f64,
+    origin: Vec3,
+}
+
+/// Plans every operation of `job` (from the folder `base` when it came from a file) and writes
+/// its program in memory through its post.
+fn plan_job(cmd: &str, s: &Session, job: &CamJob, base: Option<&Path>) -> Result<PlannedJob> {
+    if job.operations.is_empty() || job.operations.len() > MAX_OPERATIONS {
+        return Err(bad(cmd, format!("a job has 1 to {MAX_OPERATIONS} operations")));
+    }
+    let tol = job.tolerance.unwrap_or(0.01);
+    if !(tol.is_finite() && (TOLERANCE_RANGE.0..=TOLERANCE_RANGE.1).contains(&tol)) {
+        return Err(bad(cmd, "the job's `tolerance` must be from 0.0001 to 1 mm"));
+    }
+    let origin = job.origin.unwrap_or([0.0; 3]);
+    finite_point(&origin, "`origin`").map_err(|e| bad(cmd, e))?;
+    let origin = v3(origin);
+    if job.work_offset.is_some_and(|w| !(1..=6).contains(&w)) {
+        return Err(bad(cmd, "`work_offset` must be 1 to 6 (G54 to G59)"));
+    }
+    let name = match &job.name {
+        Some(n) if n.chars().count() > 200 || n.chars().any(char::is_control) => {
+            return Err(bad(cmd, "the job's `name` must be at most 200 characters, without control characters"));
+        }
+        Some(n) => n.clone(),
+        None => s.doc.name.clone(),
+    };
+    let machine = machine_of(cmd, job)?;
+    let (post_name, post) = post_of(cmd, job, base)?;
+    let tools = tools_of(cmd, job, base)?;
+    let machine_rates = rates::rates_of(cmd, job, base)?;
+    let surfaces = surfaces_of(cmd, s, job, origin, tol)?;
+    let mut notes = surfaces.notes.clone();
+    let stock = cam_stock::stock_of(cmd, job, &surfaces, tol, &mut notes)?;
+    if job.work_offset.is_some() && !post.base.writes_work_offset() {
+        notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
+    }
+
+    let ctx = Ctx {
+        adaptive: Default::default(),
+        cmd,
+        s,
+        machine: &machine,
+        tools: &tools,
+        part: &surfaces.part,
+        all: &surfaces.all,
+        origin,
+        tol,
+        stock: stock.as_ref(),
+    };
+    let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
+    for spec in &job.operations {
+        xrotary::plan_into(&ctx, spec, &post, &mut planned)?;
+    }
+
+    let program = MachineProgram { name: name.clone(), operations: planned.iter().map(|p| p.op.clone()).collect(), work_offset: job.work_offset };
+    let text = emit_program(&program, &post, &machine).map_err(|e| cam_err(cmd, "writing the program", e))?;
+    Ok(PlannedJob { name, machine, post_name, post, tools, machine_rates, surfaces, notes, stock, planned, program, text, tol, origin })
+}
+
 /// `cam.job`.
 fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.job";
@@ -1074,56 +1151,8 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         }
     };
     let base = base.as_deref();
-    if job.operations.is_empty() || job.operations.len() > MAX_OPERATIONS {
-        return Err(bad(cmd, format!("a job has 1 to {MAX_OPERATIONS} operations")));
-    }
-    let tol = job.tolerance.unwrap_or(0.01);
-    if !(tol.is_finite() && (TOLERANCE_RANGE.0..=TOLERANCE_RANGE.1).contains(&tol)) {
-        return Err(bad(cmd, "the job's `tolerance` must be from 0.0001 to 1 mm"));
-    }
-    let origin = job.origin.unwrap_or([0.0; 3]);
-    finite_point(&origin, "`origin`").map_err(|e| bad(cmd, e))?;
-    let origin = v3(origin);
-    if job.work_offset.is_some_and(|w| !(1..=6).contains(&w)) {
-        return Err(bad(cmd, "`work_offset` must be 1 to 6 (G54 to G59)"));
-    }
-    let name = match &job.name {
-        Some(n) if n.chars().count() > 200 || n.chars().any(char::is_control) => {
-            return Err(bad(cmd, "the job's `name` must be at most 200 characters, without control characters"));
-        }
-        Some(n) => n.clone(),
-        None => s.doc.name.clone(),
-    };
-    let machine = machine_of(cmd, &job)?;
-    let (post_name, post) = post_of(cmd, &job, base)?;
-    let tools = tools_of(cmd, &job, base)?;
-    let machine_rates = rates::rates_of(cmd, &job, base)?;
-    let surfaces = surfaces_of(cmd, s, &job, origin, tol)?;
-    let mut notes = surfaces.notes.clone();
-    let stock = cam_stock::stock_of(cmd, &job, &surfaces, tol, &mut notes)?;
-    if job.work_offset.is_some() && !post.base.writes_work_offset() {
-        notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
-    }
-
-    let ctx = Ctx {
-        adaptive: Default::default(),
-        cmd,
-        s,
-        machine: &machine,
-        tools: &tools,
-        part: &surfaces.part,
-        all: &surfaces.all,
-        origin,
-        tol,
-        stock: stock.as_ref(),
-    };
-    let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
-    for spec in &job.operations {
-        xrotary::plan_into(&ctx, spec, &post, &mut planned)?;
-    }
-
-    let program = MachineProgram { name: name.clone(), operations: planned.iter().map(|p| p.op.clone()).collect(), work_offset: job.work_offset };
-    let text = emit_program(&program, &post, &machine).map_err(|e| cam_err(cmd, "writing the program", e))?;
+    let PlannedJob { name, machine, post_name, post, tools, machine_rates, surfaces, mut notes, stock, mut planned, program, text, tol, origin } =
+        plan_job(cmd, s, &job, base)?;
     let rb = readback_program(&text, &program, &post, &machine).map_err(|e| cam_err(cmd, "reading the program back", e))?;
     let machine_time = match &machine_rates {
         Some(r) => Some(rates::time_report(cmd, &text, &machine, &post, r)?),
@@ -1560,6 +1589,8 @@ mod rates;
 mod sheet;
 #[path = "cam_sim.rs"]
 mod sim;
+#[path = "cam_view.rs"]
+mod view;
 #[path = "cam_xrotary.rs"]
 mod xrotary;
 

@@ -1,0 +1,5 @@
+{
+  "en": { "cmd.cam.view.load": "Simulation View", "cmd.cam.view.seek": "Go To in Simulation", "cmd.cam.view.play": "Play Simulation", "cmd.cam.view.pause": "Pause Simulation", "cmd.cam.view.show": "Simulation Layers", "cmd.cam.view.state": "Simulation State", "cmd.cam.view.close": "Close Simulation", "cmd.cam.view.export_stock": "Export Simulated Stock" },
+  "de": { "cmd.cam.view.load": "Simulationsansicht", "cmd.cam.view.seek": "In der Simulation springen", "cmd.cam.view.play": "Simulation abspielen", "cmd.cam.view.pause": "Simulation anhalten", "cmd.cam.view.show": "Simulationsebenen", "cmd.cam.view.state": "Simulationsstand", "cmd.cam.view.close": "Simulation schließen", "cmd.cam.view.export_stock": "Simuliertes Rohteil exportieren" },
+  "fr": { "cmd.cam.view.load": "Vue de simulation", "cmd.cam.view.seek": "Aller à dans la simulation", "cmd.cam.view.play": "Lire la simulation", "cmd.cam.view.pause": "Mettre la simulation en pause", "cmd.cam.view.show": "Calques de simulation", "cmd.cam.view.state": "État de la simulation", "cmd.cam.view.close": "Fermer la simulation", "cmd.cam.view.export_stock": "Exporter le brut simulé" }
+}

@@ -45,11 +45,22 @@
 //! within the tolerance of the wall is not a gouge. Leftover is the height (radius) of the
 //! stock above the part, along Z (along the ray), over the cells that were cut: material left
 //! beside a steep wall counts its full height.
+//!
+//! [`simulate`] runs in three parts that can also be driven one at a time, for a view that
+//! plays the program move by move ([`crate::playback`]): [`plan_sim`] reads the program into
+//! steps (one per motion block) and the grid; [`SimState`] is the stock part way through, and
+//! [`SimState::advance`] cuts it on to a later step, or part of the way through one (lowering a
+//! cell is a minimum over the tool's positions, so cutting the first part of a move and then the
+//! rest leaves what cutting all of it does, to rounding); [`SimState::finish`] holds what is left
+//! against the part. Advancing whole steps in any number of calls leaves the stock bit for bit
+//! as one call does. The stock keeps, per tile of [`TILE`] × [`TILE`] cells, an upper bound of
+//! its heights (radii) for quick rejects and a version that changes whenever a cell of the tile
+//! is cut, and per cell the tool that cut it last, for a view.
 
 use std::cell::Cell;
 use std::f64::consts::{PI, TAU};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use solidcore_record::{Vec2, Vec3};
 use solidcraft_geom::prelude::*;
@@ -90,6 +101,12 @@ const BISECTIONS: usize = 60;
 const MAX_COORD: f64 = 1.0e6;
 /// A slope taken as vertical (a tool's flank at its rim).
 const STEEP: f64 = 1.0e12;
+/// Cells along a side of a tile of the stock (its quick-reject maxima and versions).
+pub const TILE: usize = 16;
+/// The tool slot of a cell no tool has cut.
+pub const UNCUT: u8 = 255;
+/// Estimated cell visits above which one advance runs its bands on threads.
+const THREADED_VISITS: f64 = 250_000.0;
 
 /// The stock before the program runs, in work coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -479,16 +496,123 @@ impl Profile {
 }
 
 /// What one sweep removed.
-#[derive(Clone, Copy, Debug, Default)]
-struct Removed {
-    volume: f64,
-    depth: f64,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Removed {
+    /// Material removed (mm³).
+    pub volume: f64,
+    /// The deepest it cut into the stock as it was (mm, along Z or the radius), and where (the
+    /// bottom of that cut).
+    pub depth: f64,
+    pub at: Vec3,
+    /// The most material that stood above the cutting length where it cut (mm: above the tip
+    /// plus the flute length; the shank rubbing), and where.
+    pub above: f64,
+    pub above_at: Vec3,
+    /// The deepest it cut below the part's surface along Z (along the ray) where a part floor
+    /// is given ([`SimState::set_floor`]), and where; a gouge only once measured in 3D.
+    pub gouge: f64,
+    pub gouge_at: Vec3,
+}
+
+impl Default for Removed {
+    fn default() -> Removed {
+        Removed { volume: 0.0, depth: 0.0, at: Vec3::ZERO, above: 0.0, above_at: Vec3::ZERO, gouge: 0.0, gouge_at: Vec3::ZERO }
+    }
 }
 
 impl Removed {
     fn add(&mut self, o: Removed) {
         self.volume += o.volume;
-        self.depth = self.depth.max(o.depth);
+        if o.depth > self.depth {
+            self.depth = o.depth;
+            self.at = o.at;
+        }
+        if o.above > self.above {
+            self.above = o.above;
+            self.above_at = o.above_at;
+        }
+        if o.gouge > self.gouge {
+            self.gouge = o.gouge;
+            self.gouge_at = o.gouge_at;
+        }
+    }
+}
+
+/// Per tile of [`TILE`] × [`TILE`] cells of a band: an upper bound of the values in it (exact
+/// unless stale), whether a cell was cut since it was found, and a version that changes with
+/// every cut.
+#[derive(Clone, Debug)]
+struct Tiles {
+    tx: usize,
+    max: Vec<f64>,
+    stale: Vec<bool>,
+    version: Vec<u32>,
+}
+
+impl Tiles {
+    fn new(nu: usize, nv: usize, value: f64) -> Tiles {
+        let n = nu.div_ceil(TILE).max(1) * nv.div_ceil(TILE).max(1);
+        Tiles { tx: nu.div_ceil(TILE).max(1), max: vec![value; n], stale: vec![false; n], version: vec![0; n] }
+    }
+
+    /// Cell `(i, j)` of the band (`j` from the band's first row) was cut.
+    fn mark(&mut self, i: usize, j: usize) {
+        let t = (j / TILE) * self.tx + i / TILE;
+        if let Some(s) = self.stale.get_mut(t) {
+            *s = true;
+        }
+        if let Some(v) = self.version.get_mut(t) {
+            *v = v.wrapping_add(1);
+        }
+    }
+
+    /// The highest of `values` (`nu` a row) over the cells `i0..=i1`, `j0..=j1`, by whole tiles:
+    /// at least the highest of those cells (stale tiles found again first).
+    fn max_in(&mut self, values: &[f64], nu: usize, (i0, i1): (usize, usize), (j0, j1): (usize, usize)) -> f64 {
+        let mut m = f64::NEG_INFINITY;
+        let nv = values.len() / nu.max(1);
+        for tj in j0 / TILE..=j1 / TILE {
+            for ti in i0 / TILE..=i1 / TILE {
+                let t = tj * self.tx + ti;
+                if self.stale.get(t) == Some(&true) {
+                    let mut best = f64::NEG_INFINITY;
+                    for j in tj * TILE..((tj + 1) * TILE).min(nv) {
+                        for i in ti * TILE..((ti + 1) * TILE).min(nu) {
+                            if let Some(&v) = values.get(j * nu + i) {
+                                best = best.max(v);
+                            }
+                        }
+                    }
+                    if let (Some(slot), Some(s)) = (self.max.get_mut(t), self.stale.get_mut(t)) {
+                        *slot = best;
+                        *s = false;
+                    }
+                }
+                m = m.max(self.max.get(t).copied().unwrap_or(f64::NEG_INFINITY));
+            }
+        }
+        m
+    }
+}
+
+/// What a cut of one cell from `old` down to `new` (along Z or the ray) means beyond the
+/// material: the shank above the flutes (`flute` above the cut), and the part's floor `floor`
+/// (NaN: none) passed by more than `tol`. `point(v)` is the cell's point at height (radius) `v`.
+fn note_cut(out: &mut Removed, old: f64, new: f64, flute: f64, floor: f64, tol: f64, point: impl Fn(f64) -> Vec3) {
+    let cut = old - new;
+    if cut > out.depth {
+        out.depth = cut;
+        out.at = point(new);
+    }
+    let above = old - (new + flute);
+    if flute > 0.0 && above > tol && above > out.above {
+        out.above = above;
+        out.above_at = point(new + flute);
+    }
+    let below = floor - new;
+    if below > tol && below > out.gouge {
+        out.gouge = below;
+        out.gouge_at = point(new);
     }
 }
 
@@ -513,6 +637,7 @@ fn count(visits: &AtomicU64, n: u64) -> Result<()> {
 
 /// The heightfield stock (3-axis), or one band of its rows: rows `j0..j0 + ny` of the whole
 /// grid, which starts at `y0`.
+#[derive(Clone)]
 struct Heights {
     x0: f64,
     y0: f64,
@@ -525,6 +650,16 @@ struct Heights {
     top: f64,
     h: Vec<f64>,
     visits: Arc<AtomicU64>,
+    tiles: Tiles,
+    /// The tool slot that cut each cell last ([`UNCUT`]: none).
+    last: Vec<u8>,
+    /// The part's height over every cell of the whole grid (NaN: no part there), when gouges
+    /// are watched for as the stock is cut.
+    floor: Option<Arc<Vec<f64>>>,
+    tol: f64,
+    /// The tool cutting now: its slot and flute length.
+    slot: u8,
+    flute: f64,
 }
 
 impl Heights {
@@ -565,14 +700,45 @@ impl Heights {
     fn lower(&mut self, c: usize, z: f64, out: &mut Removed) {
         let area = self.dx * self.dy;
         let bottom = self.bottom;
-        if let Some(h) = self.h.get_mut(c) {
-            let z = z.max(bottom);
-            if z < *h {
-                out.volume += (*h - z) * area;
-                out.depth = out.depth.max(*h - z);
-                *h = z;
+        let Some(h) = self.h.get_mut(c) else { return };
+        let z = z.max(bottom);
+        if !(z < *h) {
+            return;
+        }
+        let old = *h;
+        out.volume += (old - z) * area;
+        *h = z;
+        let nx = self.nx.max(1);
+        let (i, j) = (c % nx, c / nx);
+        self.tiles.mark(i, j);
+        if let Some(l) = self.last.get_mut(c) {
+            *l = self.slot;
+        }
+        let floor = self.floor.as_ref().and_then(|f| f.get(self.j0 * self.nx + c).copied()).unwrap_or(f64::NAN);
+        let (x, y) = self.centre(i, j);
+        note_cut(out, old, z, self.flute, floor, self.tol, |v| Vec3::new(x, y, v));
+    }
+
+    /// The highest material over the cells whose centres are within `[x0, x1] × [y0, y1]` and
+    /// satisfy `inside`, above `z`: the first such cell's top, or `None`.
+    fn above(&mut self, (x0, x1): (f64, f64), (y0, y1): (f64, f64), z: f64, inside: &dyn Fn(f64, f64) -> bool) -> Option<Vec3> {
+        if z >= self.top {
+            return None;
+        }
+        let ((i0, i1), (j0, j1)) = (self.columns(x0, x1)?, self.rows(y0, y1)?);
+        if self.tiles.max_in(&self.h, self.nx, (i0, i1), (j0, j1)) <= z {
+            return None;
+        }
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let Some(&h) = self.h.get(j * self.nx + i) else { continue };
+                let (x, y) = self.centre(i, j);
+                if h > z && h > self.bottom && inside(x, y) {
+                    return Some(Vec3::new(x, y, h));
+                }
             }
         }
+        None
     }
 
     /// The tool swept straight from tip `a` to tip `b`.
@@ -632,10 +798,13 @@ impl Heights {
     }
 
     /// The tool swept along an arc in XY about `center` from tip `a` to tip `b`, turning `sweep`.
-    fn sweep_arc(&mut self, p: &Profile, a: Vec3, b: Vec3, center: Vec2, sweep: f64, tol: f64) -> Result<Removed> {
+    /// A helix is followed as chords; `part` (fractions from and to) cuts only the chords of that
+    /// part of it, so that cutting it in parts leaves what cutting it whole does.
+    fn sweep_arc(&mut self, p: &Profile, a: Vec3, b: Vec3, center: Vec2, sweep: f64, part: (f64, f64)) -> Result<Removed> {
+        let tol = self.tol;
         let rho = Vec2::new(a.x, a.y).dist(center);
         let r = p.radius;
-        if (b.z - a.z).abs() > 1e-12 || rho <= 1e-9 || sweep.abs() <= 1e-12 {
+        if chorded(a, b, center, sweep) {
             // A helix (or a degenerate arc): chords at most a quarter of the tolerance inside it.
             let e = (tol * 0.25).min(rho);
             let step = if rho > 1e-9 { 2.0 * (1.0 - e / rho).clamp(-1.0, 1.0).acos() } else { TAU };
@@ -645,11 +814,15 @@ impl Heights {
             }
             let n = n as usize;
             let start = Vec2::new(a.x - center.x, a.y - center.y).angle();
-            let mut out = Removed::default();
-            let mut prev = a;
-            for k in 1..=n {
+            let at = |k: usize| {
                 let t = k as f64 / n as f64;
-                let q = if k == n { b } else { (center + Vec2::from_angle(start + sweep * t) * rho).extend(a.z + (b.z - a.z) * t) };
+                if k == n { b } else { (center + Vec2::from_angle(start + sweep * t) * rho).extend(a.z + (b.z - a.z) * t) }
+            };
+            let (k0, k1) = (done(n, part.0), done(n, part.1));
+            let mut out = Removed::default();
+            let mut prev = if k0 == 0 { a } else { at(k0) };
+            for k in k0 + 1..=k1 {
+                let q = at(k);
                 out.add(self.sweep_line(p, prev, q)?);
                 prev = q;
             }
@@ -710,6 +883,12 @@ impl Heights {
     }
 }
 
+/// Whether an arc from `a` to `b` about `center` turning `sweep` is followed as chords (a helix,
+/// or a degenerate arc).
+fn chorded(a: Vec3, b: Vec3, center: Vec2, sweep: f64) -> bool {
+    (b.z - a.z).abs() > 1e-12 || Vec2::new(a.x, a.y).dist(center) <= 1e-9 || sweep.abs() <= 1e-12
+}
+
 /// The turn of an arc from `from` to `to` about `center` as the controller runs it (signed,
 /// radians): an arc whose end is written at its start is a whole turn, not none.
 fn arc_turn(from: Vec3, to: Vec3, center: Vec2, ccw: bool) -> f64 {
@@ -727,6 +906,7 @@ fn within_sweep(ang: f64, start: f64, sweep: f64) -> bool {
 
 /// The radial stock (a 4th axis about X), or one band of its angles: angles `k0..k0 + nt` of
 /// the `nt_all` round.
+#[derive(Clone)]
 struct Radii {
     x0: f64,
     dx: f64,
@@ -743,6 +923,12 @@ struct Radii {
     tol: f64,
     /// Cells a tool position cut beside their ray, inside the material (not modelled).
     tunnels: u64,
+    tiles: Tiles,
+    last: Vec<u8>,
+    /// The part's radius along every ray of the whole grid (NaN: none).
+    floor: Option<Arc<Vec<f64>>>,
+    slot: u8,
+    flute: f64,
 }
 
 impl Radii {
@@ -821,10 +1007,15 @@ impl Radii {
                     }
                     if at < have {
                         out.volume += (have * have - at * at) * area;
-                        out.depth = out.depth.max(have - at);
                         if let Some(slot) = self.rho.get_mut(cell) {
                             *slot = at;
                         }
+                        self.tiles.mark(i, kk);
+                        if let Some(l) = self.last.get_mut(cell) {
+                            *l = self.slot;
+                        }
+                        let floor = self.floor.as_ref().and_then(|f| f.get(self.k0 * self.nx + cell).copied()).unwrap_or(f64::NAN);
+                        note_cut(&mut out, have, at, self.flute, floor, self.tol, |v| Vec3::new(cx, v * st, v * ct));
                     }
                 }
             }
@@ -844,6 +1035,7 @@ impl Radii {
     }
 }
 
+#[derive(Clone)]
 enum Model {
     Heights(Heights),
     Radii(Radii),
@@ -855,6 +1047,61 @@ impl Model {
             Model::Heights(h) => h.owns(p),
             Model::Radii(r) => r.owns(p),
         }
+    }
+
+    fn set_visits(&mut self, v: &Arc<AtomicU64>) {
+        match self {
+            Model::Heights(h) => h.visits = Arc::clone(v),
+            Model::Radii(r) => r.visits = Arc::clone(v),
+        }
+    }
+
+    fn set_floor(&mut self, f: &Arc<Vec<f64>>) {
+        match self {
+            Model::Heights(h) => h.floor = Some(Arc::clone(f)),
+            Model::Radii(r) => r.floor = Some(Arc::clone(f)),
+        }
+    }
+
+    fn set_tool(&mut self, slot: u8, flute: f64) {
+        match self {
+            Model::Heights(h) => (h.slot, h.flute) = (slot, flute),
+            Model::Radii(r) => (r.slot, r.flute) = (slot, flute),
+        }
+    }
+
+    /// The band's first row (angle) and its rows (angles).
+    fn span(&self) -> (usize, usize) {
+        match self {
+            Model::Heights(h) => (h.j0, h.ny),
+            Model::Radii(r) => (r.k0, r.nt),
+        }
+    }
+
+    fn values(&self) -> &[f64] {
+        match self {
+            Model::Heights(h) => &h.h,
+            Model::Radii(r) => &r.rho,
+        }
+    }
+
+    fn last(&self) -> &[u8] {
+        match self {
+            Model::Heights(h) => &h.last,
+            Model::Radii(r) => &r.last,
+        }
+    }
+
+    fn tiles(&self) -> &Tiles {
+        match self {
+            Model::Heights(h) => &h.tiles,
+            Model::Radii(r) => &r.tiles,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        let t = self.tiles();
+        self.values().len() * 9 + t.max.len() * 13
     }
 }
 
@@ -883,9 +1130,11 @@ fn too_many(n: usize) -> CamError {
     CamError::TooLarge(format!("the stock needs {n} cells at this resolution, more than {MAX_CELLS}: give a coarser one"))
 }
 
-/// The stock's grid before it is split into bands.
-#[derive(Clone, Copy, Debug)]
-enum Grid {
+/// The stock's grid before it is split into bands: a heightfield over XY (cell `(i, j)` centred
+/// at `(x0 + (i + ½)·dx, y0 + (j + ½)·dy)`, its top `top` to start with), or radii over (x, θ)
+/// (cell `(i, k)` at `x0 + (i + ½)·dx`, `θ = (k + ½)·2π / nt`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Grid {
     Heights { x0: f64, y0: f64, dx: f64, dy: f64, nx: usize, ny: usize, bottom: f64, top: f64 },
     Radii { x0: f64, dx: f64, nx: usize, nt: usize, radius: f64 },
 }
@@ -899,13 +1148,65 @@ impl Grid {
         }
     }
 
+    /// Cells along a row (along X).
+    pub fn columns(&self) -> usize {
+        match *self {
+            Grid::Heights { nx, .. } | Grid::Radii { nx, .. } => nx,
+        }
+    }
+
+    /// Rows (angles round).
+    pub fn rows(&self) -> usize {
+        self.lines()
+    }
+
+    /// Tiles along a row and rows of tiles.
+    pub fn tiles(&self) -> (usize, usize) {
+        (self.columns().div_ceil(TILE).max(1), self.lines().div_ceil(TILE).max(1))
+    }
+
+    /// The point at height (radius) `v` over the centre of cell `(i, j)`, in work coordinates.
+    pub fn point(&self, i: usize, j: usize, v: f64) -> Vec3 {
+        match *self {
+            Grid::Heights { x0, y0, dx, dy, .. } => Vec3::new(x0 + (i as f64 + 0.5) * dx, y0 + (j as f64 + 0.5) * dy, v),
+            Grid::Radii { x0, dx, nt, .. } => {
+                let (s, c) = ((j as f64 + 0.5) * TAU / nt.max(1) as f64).sin_cos();
+                Vec3::new(x0 + (i as f64 + 0.5) * dx, v * s, v * c)
+            }
+        }
+    }
+
+    /// The value every cell starts at: the stock's top, or its radius.
+    pub fn initial(&self) -> f64 {
+        match *self {
+            Grid::Heights { top, .. } => top,
+            Grid::Radii { radius, .. } => radius,
+        }
+    }
+
     /// Rows (angles) `from..to` of the stock as it starts.
     fn band(&self, from: usize, to: usize, visits: &Arc<AtomicU64>, tol: f64) -> Model {
         let n = to.saturating_sub(from);
         match *self {
-            Grid::Heights { x0, y0, dx, dy, nx, bottom, top, .. } => {
-                Model::Heights(Heights { x0, y0, dx, dy, nx, j0: from, ny: n, bottom, top, h: vec![top; nx * n], visits: Arc::clone(visits) })
-            }
+            Grid::Heights { x0, y0, dx, dy, nx, bottom, top, .. } => Model::Heights(Heights {
+                x0,
+                y0,
+                dx,
+                dy,
+                nx,
+                j0: from,
+                ny: n,
+                bottom,
+                top,
+                h: vec![top; nx * n],
+                visits: Arc::clone(visits),
+                tiles: Tiles::new(nx, n, top),
+                last: vec![UNCUT; nx * n],
+                floor: None,
+                tol,
+                slot: 0,
+                flute: 0.0,
+            }),
             Grid::Radii { x0, dx, nx, nt, radius } => {
                 let dt = TAU / nt as f64;
                 let (sin, cos): (Vec<f64>, Vec<f64>) = (from..to).map(|k| ((k as f64 + 0.5) * dt).sin_cos()).unzip();
@@ -923,6 +1224,11 @@ impl Grid {
                     visits: Arc::clone(visits),
                     tol,
                     tunnels: 0,
+                    tiles: Tiles::new(nx, n, radius),
+                    last: vec![UNCUT; nx * n],
+                    floor: None,
+                    slot: 0,
+                    flute: 0.0,
                 })
             }
         }
@@ -992,6 +1298,10 @@ struct Scan {
     /// Lines in the XZ or YZ plane (`G18`, `G19`), with their `I J K` words (0 when not
     /// written, in the program's units), in line order.
     planes: Vec<(usize, Plane, [f64; 3])>,
+    /// The spindle after each line that changes it (`S`, `M3`, `M4`, `M5`, `M2`, `M30`), in line
+    /// order: its speed when it turns, 0 when it is stopped. Before the first `M3`/`M4`/`M5` it is
+    /// not known (a program that never says is not taken as cutting with it stopped).
+    spindle: Vec<(usize, f64)>,
 }
 
 impl Scan {
@@ -999,13 +1309,18 @@ impl Scan {
         let mut scan = Scan::default();
         let mut pending: Option<u32> = None;
         let mut plane = Plane::Xy;
+        let (mut rpm, mut on): (f64, Option<bool>) = (0.0, None);
         for (i, line) in text.lines().enumerate() {
             let n = i + 1;
             let ws = words(line, n)?;
             let mut m6 = false;
             let mut ijk = [0.0; 3];
+            let was = (rpm, on);
             for &(c, v) in &ws {
                 match c {
+                    'S' if v.is_finite() && v >= 0.0 => rpm = v,
+                    'M' if [3.0, 4.0].iter().any(|m| (v - m).abs() < 1e-9) => on = Some(true),
+                    'M' if [5.0, 2.0, 30.0].iter().any(|m| (v - m).abs() < 1e-9) => on = Some(false),
                     'T' => {
                         if !((0.0..=1.0e6).contains(&v) && v.fract() == 0.0) {
                             return Err(CamError::Parse(n, "a tool number must be a whole number".into()));
@@ -1029,6 +1344,11 @@ impl Scan {
             if plane != Plane::Xy {
                 scan.planes.push((n, plane, ijk));
             }
+            if (rpm, on) != was
+                && let Some(turning) = on
+            {
+                scan.spindle.push((n, if turning { rpm } else { 0.0 }));
+            }
             if m6 {
                 let Some(t) = pending else { return Err(CamError::Parse(n, "a tool change (M6) without a tool number (T)".into())) };
                 scan.changes.push((n, t));
@@ -1037,23 +1357,28 @@ impl Scan {
         Ok(scan)
     }
 
+    /// The spindle's speed at `line` (0: stopped), when the program has said.
+    fn rpm_at(&self, line: usize) -> Option<f64> {
+        let k = self.spindle.partition_point(|(l, _)| *l <= line).checked_sub(1)?;
+        self.spindle.get(k).map(|(_, r)| *r)
+    }
+
     /// The plane and `I J K` of `line`, when it is not XY.
     fn plane_at(&self, line: usize) -> Option<(Plane, [f64; 3])> {
         self.planes.binary_search_by_key(&line, |(n, _, _)| *n).ok().and_then(|k| self.planes.get(k)).map(|(_, p, ijk)| (*p, *ijk))
     }
 }
 
-/// The tool in the spindle at `line`.
-fn tool_at<'a>(changes: &[(usize, u32)], tools: &'a [(u32, Profile)], line: usize) -> Result<&'a Profile> {
+/// The tool in the spindle at `line`: its slot in `tools`.
+fn tool_at(changes: &[(usize, u32)], tools: &[(u32, Profile)], line: usize) -> Result<usize> {
     let loaded = changes.partition_point(|(l, _)| *l <= line).checked_sub(1).and_then(|k| changes.get(k)).map(|(_, t)| *t);
     match loaded {
         Some(t) => tools
             .iter()
-            .find(|(n, _)| *n == t)
-            .map(|(_, p)| p)
+            .position(|(n, _)| *n == t)
             .ok_or_else(|| CamError::Parse(line, format!("the program uses tool {t}, which is not among the tools given"))),
         None => match tools {
-            [(_, p)] => Ok(p),
+            [_] => Ok(0),
             _ => Err(CamError::Parse(line, "a move before any tool change (T… M6), with more than one tool given".into())),
         },
     }
@@ -1180,93 +1505,160 @@ struct Step {
     /// Where the material must be for a cut at the tool's full width: under the tool and at
     /// both sides of it, halfway along.
     probes: Option<[Vec3; 3]>,
+    line: usize,
+    rapid: bool,
+    /// The tool's slot among the tools given, and its flute length.
+    slot: u8,
+    flute: f64,
+    /// The spindle's speed (0: stopped), when the program has said.
+    rpm: Option<f64>,
+    /// The axes at its end, and at its start when known.
+    to: Joints,
+    from: Option<Joints>,
+    /// The distance the tool travels (mm; with the rotaries' sweep on a 4th axis).
+    travel: f64,
+    /// About how many cells it visits.
+    cost: f64,
 }
 
-/// What one band found of every step: material removed, and which probes were in the stock.
-struct BandRun {
-    model: Model,
-    removed: Vec<Removed>,
-    probes: Vec<u8>,
-    cmp: Comparison,
+impl Step {
+    /// The pose a fraction `t` of the way along, as the 4th axis's tool positions are placed.
+    fn pose_frac(&self, machine: &Machine, t: f64) -> Pose {
+        match &self.how {
+            How::Straight => Pose { tip: self.start.tip.lerp(self.end.tip, t), axis: self.end.axis },
+            How::Joint { from, to, tcp } => {
+                let j = from.lerp(to, t);
+                pose_at(machine, j.linear, &j.rotary, *tcp)
+            }
+            How::Arc { from, to, center, sweep, rotary, tcp, .. } => pose_at(machine, arc_linear(*from, *to, *center, *sweep, t), rotary, *tcp),
+            How::Tilted { arc, rotary, tcp, .. } => pose_at(machine, arc.at(t), rotary, *tcp),
+        }
+    }
+
+    /// The axes a fraction `t` of the way along (a block from an unknown position: its end's,
+    /// shifted with the tip).
+    fn joints_frac(&self, machine: &Machine, t: f64) -> Joints {
+        match &self.how {
+            How::Joint { from, to, .. } => from.lerp(to, t),
+            How::Arc { from, to, center, sweep, rotary, .. } => Joints { linear: arc_linear(*from, *to, *center, *sweep, t), rotary: rotary.clone() },
+            How::Tilted { arc, rotary, .. } => Joints { linear: arc.at(t), rotary: rotary.clone() },
+            How::Straight => Joints { linear: self.to.linear + (self.pose_frac(machine, t).tip - self.end.tip), rotary: self.to.rotary.clone() },
+        }
+    }
+
+    /// The 4th axis's tool positions: indices `first..=last` of [`Step::pose_frac`] at `k / n`.
+    fn pose_range(&self) -> (usize, usize) {
+        let n = self.points.max(1);
+        match self.how {
+            How::Straight => (0, n),
+            _ => (1, n),
+        }
+    }
 }
 
-/// The tool positions of `step` on a 4th axis, after its start, one at a time (a block may
-/// have up to [`MAX_BLOCK_POINTS`], and every band walks them).
-fn each_pose(machine: &Machine, step: &Step, mut f: impl FnMut(&Pose) -> Result<()>) -> Result<()> {
+/// The linear axes a fraction `t` round an arc of them from `from` to `to` about `center`.
+fn arc_linear(from: Vec3, to: Vec3, center: Vec2, sweep: f64, t: f64) -> Vec3 {
+    if t >= 1.0 {
+        return to;
+    }
+    let st = Vec2::new(from.x, from.y) - center;
+    (center + Vec2::from_angle(st.angle() + sweep * t) * st.len()).extend(from.z + (to.z - from.z) * t)
+}
+
+/// Of `total` pieces of work, those done a fraction `f` of the way.
+fn done(total: usize, f: f64) -> usize {
+    if f >= 1.0 { total } else { ((f.max(0.0) * total as f64).floor() as usize).min(total) }
+}
+
+/// The point a fraction `f` round a level arc (or helix) from `a` to `b` about `center`.
+fn arc_point(a: Vec3, b: Vec3, center: Vec2, sweep: f64, f: f64) -> Vec3 {
+    if f <= 0.0 {
+        return a;
+    }
+    arc_linear(a, b, center, sweep, f)
+}
+
+/// The tool positions of `step` on a 4th axis with indices `ks` (at `k / n`), one at a time (a
+/// block may have up to [`MAX_BLOCK_POINTS`], and every band walks them).
+fn each_pose(machine: &Machine, step: &Step, ks: std::ops::RangeInclusive<usize>, mut f: impl FnMut(&Pose) -> Result<()>) -> Result<()> {
     let n = step.points.max(1);
-    let t = |k: usize| k as f64 / n as f64;
-    match &step.how {
-        How::Straight => {
-            for k in 0..=n {
-                f(&Pose { tip: step.start.tip.lerp(step.end.tip, t(k)), axis: step.end.axis })?;
-            }
-        }
-        How::Joint { from, to, tcp } => {
-            for k in 1..=n {
-                let j = from.lerp(to, t(k));
-                f(&pose_at(machine, j.linear, &j.rotary, *tcp))?;
-            }
-        }
-        How::Arc { from, to, center, sweep, rotary, tcp, .. } => {
-            let st = Vec2::new(from.x, from.y) - *center;
-            let rad = st.len();
-            for k in 1..=n {
-                let q =
-                    if k == n { *to } else { (*center + Vec2::from_angle(st.angle() + sweep * t(k)) * rad).extend(from.z + (to.z - from.z) * t(k)) };
-                f(&pose_at(machine, q, rotary, *tcp))?;
-            }
-        }
-        How::Tilted { arc, rotary, tcp, .. } => {
-            for k in 1..=n {
-                f(&pose_at(machine, arc.at(t(k)), rotary, *tcp))?;
-            }
-        }
+    for k in ks {
+        f(&step.pose_frac(machine, k as f64 / n as f64))?;
     }
     Ok(())
 }
 
-/// Runs every step through one band of the stock, then holds the band against the part.
-fn run_band(mut model: Model, steps: &[Step], machine: &Machine, part: &Surface, tol: f64, initial: f64, refine: usize) -> Result<BandRun> {
-    let mut removed = Vec::with_capacity(steps.len());
-    let mut probes = Vec::with_capacity(steps.len());
-    for step in steps {
+/// Cuts the part of `step` from fraction `f0` to `f1` of the way along through one band.
+fn cut(model: &mut Model, step: &Step, machine: &Machine, f0: f64, f1: f64) -> Result<Removed> {
+    model.set_tool(step.slot, step.flute);
+    let whole = f0 <= 0.0 && f1 >= 1.0;
+    Ok(match model {
+        Model::Heights(h) => match &step.how {
+            How::Arc { work_center, sweep, .. } => {
+                let (a, b) = (step.start.tip, step.end.tip);
+                if whole || chorded(a, b, *work_center, *sweep) {
+                    h.sweep_arc(&step.profile, a, b, *work_center, *sweep, (f0, f1))?
+                } else {
+                    let (p, q) = (arc_point(a, b, *work_center, *sweep, f0), arc_point(a, b, *work_center, *sweep, f1));
+                    h.sweep_arc(&step.profile, p, q, *work_center, *sweep * (f1 - f0), (0.0, 1.0))?
+                }
+            }
+            How::Tilted { arc, chords, rotary, tcp } => {
+                let (k0, k1) = (done(*chords, f0), done(*chords, f1));
+                let n = (*chords).max(1) as f64;
+                let mut out = Removed::default();
+                let mut prev = if k0 == 0 { step.start.tip } else { pose_at(machine, arc.at(k0 as f64 / n), rotary, *tcp).tip };
+                for k in k0 + 1..=k1 {
+                    let tip = pose_at(machine, arc.at(k as f64 / n), rotary, *tcp).tip;
+                    out.add(h.sweep_line(&step.profile, prev, tip)?);
+                    prev = tip;
+                }
+                out
+            }
+            _ => {
+                let a = if f0 <= 0.0 { step.start.tip } else { step.start.tip.lerp(step.end.tip, f0) };
+                let b = if f1 >= 1.0 { step.end.tip } else { step.start.tip.lerp(step.end.tip, f1) };
+                h.sweep_line(&step.profile, a, b)?
+            }
+        },
+        Model::Radii(r) => {
+            let (first, last) = step.pose_range();
+            let total = last + 1 - first;
+            let (d0, d1) = (done(total, f0), done(total, f1));
+            let mut out = Removed::default();
+            if d1 > d0 {
+                each_pose(machine, step, first + d0..=first + d1 - 1, |pose| {
+                    out.add(r.stamp(&step.profile, pose)?);
+                    Ok(())
+                })?;
+            }
+            out
+        }
+    })
+}
+
+/// A piece of work: step `k` from fraction `f0` to `f1` of the way along.
+type Work = (usize, f64, f64);
+
+/// Runs `work` through one band: what each piece removed, and which probes were in the stock
+/// before its step started.
+fn band_advance(model: &mut Model, plan: &SimPlan, work: &[Work]) -> Result<Vec<(Removed, u8)>> {
+    let mut out = Vec::with_capacity(work.len());
+    for &(k, f0, f1) in work {
+        let Some(step) = plan.steps.get(k) else { continue };
         let mut bits = 0u8;
-        if let Some(ps) = &step.probes {
+        if f0 <= 0.0
+            && let Some(ps) = &step.probes
+        {
             for (b, p) in ps.iter().enumerate() {
                 if model.owns(*p) == Some(true) {
                     bits |= 1 << b;
                 }
             }
         }
-        probes.push(bits);
-        let out = match &mut model {
-            Model::Heights(h) => match &step.how {
-                How::Arc { work_center, sweep, .. } => h.sweep_arc(&step.profile, step.start.tip, step.end.tip, *work_center, *sweep, tol)?,
-                How::Tilted { arc, chords, rotary, tcp } => {
-                    let mut out = Removed::default();
-                    let mut prev = step.start.tip;
-                    for k in 1..=*chords {
-                        let tip = pose_at(machine, arc.at(k as f64 / *chords as f64), rotary, *tcp).tip;
-                        out.add(h.sweep_line(&step.profile, prev, tip)?);
-                        prev = tip;
-                    }
-                    out
-                }
-                _ => h.sweep_line(&step.profile, step.start.tip, step.end.tip)?,
-            },
-            Model::Radii(r) => {
-                let mut out = Removed::default();
-                each_pose(machine, step, |pose| {
-                    out.add(r.stamp(&step.profile, pose)?);
-                    Ok(())
-                })?;
-                out
-            }
-        };
-        removed.push(out);
+        out.push((cut(model, step, &plan.machine, f0, f1)?, bits));
     }
-    let cmp = compare(&model, part, tol, initial, refine);
-    Ok(BandRun { model, removed, probes, cmp })
+    Ok(out)
 }
 
 /// Bands to split `lines` rows (angles) into: one per core up to [`MAX_THREADS`], each at least
@@ -1284,27 +1676,31 @@ fn band_count(lines: usize) -> usize {
     }
 }
 
-/// Every band run, each on a thread of its own where one can be had, in band order.
-fn run_bands(grid: &Grid, steps: &[Step], machine: &Machine, part: &Surface, tol: f64, initial: f64) -> Result<Vec<BandRun>> {
-    let lines = grid.lines();
-    let bands = band_count(lines);
-    let visits = Arc::new(AtomicU64::new(0));
-    let refine = (MAX_REFINED / bands).max(1);
-    let range = |b: usize| (b * lines / bands, (b + 1) * lines / bands);
-    if bands <= 1 {
-        let (from, to) = range(0);
-        return Ok(vec![run_band(grid.band(from, to, &visits, tol), steps, machine, part, tol, initial, refine)?]);
+/// `f` run for every item, each on a thread of its own when `threaded` and one can be had (else
+/// here), the results in order.
+fn each_threaded<T: Send, R: Send>(items: Vec<T>, threaded: bool, f: impl Fn(T) -> Result<R> + Sync) -> Result<Vec<R>> {
+    if !threaded || items.len() <= 1 {
+        return items.into_iter().map(&f).collect();
     }
+    let f = &f;
+    let lost = || CamError::Unsupported("a simulation thread lost its work".into());
     std::thread::scope(|scope| {
-        let mut pending = Vec::with_capacity(bands);
-        for b in 0..bands {
-            let (from, to) = range(b);
-            let v = Arc::clone(&visits);
-            let job = move || run_band(grid.band(from, to, &v, tol), steps, machine, part, tol, initial, refine);
+        let mut pending = Vec::with_capacity(items.len());
+        for (b, item) in items.into_iter().enumerate() {
+            // The item goes through a slot the thread takes it from, so that it is still here
+            // when no thread can be had.
+            let slot = Arc::new(Mutex::new(Some(item)));
+            let mine = Arc::clone(&slot);
+            let job = move || match mine.lock().ok().and_then(|mut s| s.take()) {
+                Some(item) => f(item),
+                None => Err(lost()),
+            };
             match std::thread::Builder::new().name(format!("cam-sim-{b}")).spawn_scoped(scope, job) {
                 Ok(h) => pending.push(Err(h)),
-                // No thread to be had: this band runs here.
-                Err(_) => pending.push(Ok(run_band(grid.band(from, to, &visits, tol), steps, machine, part, tol, initial, refine))),
+                Err(_) => pending.push(Ok(match slot.lock().ok().and_then(|mut s| s.take()) {
+                    Some(item) => f(item),
+                    None => Err(lost()),
+                })),
             }
         }
         pending
@@ -1317,9 +1713,515 @@ fn run_bands(grid: &Grid, steps: &[Step], machine: &Machine, part: &Surface, tol
     })
 }
 
+/// A program read for the simulation: its steps (one per motion block whose position is known),
+/// the grid of the stock and what times it. See [`plan_sim`].
+pub struct SimPlan {
+    machine: Machine,
+    steps: Vec<Step>,
+    grid: Grid,
+    cell: f64,
+    tol: f64,
+    initial: f64,
+    minutes: f64,
+    feed_length: f64,
+    rapid_length: f64,
+    /// The tools by slot: number.
+    tools: Vec<u32>,
+    /// The rows (angles) of each band, from and to (multiples of [`TILE`], the last excepted).
+    bands: Vec<(usize, usize)>,
+}
+
+/// One step of a [`SimPlan`], as a view shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepView {
+    /// The G-code line, from 1.
+    pub line: usize,
+    pub rapid: bool,
+    /// An arc (in any plane).
+    pub arc: bool,
+    pub tool: u32,
+    pub slot: u8,
+    /// The spindle's speed (0: stopped), when the program has said.
+    pub rpm: Option<f64>,
+    pub start: Pose,
+    pub end: Pose,
+    /// Whether the position before it was known (otherwise it comes down the tool axis from
+    /// above the stock).
+    pub known: bool,
+    /// The distance it travels, mm.
+    pub travel: f64,
+}
+
+impl SimPlan {
+    /// Steps: motion blocks simulated.
+    pub fn moves(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn step(&self, k: usize) -> Option<StepView> {
+        let s = self.steps.get(k)?;
+        Some(StepView {
+            line: s.line,
+            rapid: s.rapid,
+            arc: matches!(s.how, How::Arc { .. } | How::Tilted { .. }),
+            tool: self.tools.get(usize::from(s.slot)).copied().unwrap_or(0),
+            slot: s.slot,
+            rpm: s.rpm,
+            start: s.start,
+            end: s.end,
+            known: s.from.is_some(),
+            travel: s.travel,
+        })
+    }
+
+    /// The tool's pose a fraction `f` (0 to 1) along step `k`.
+    pub fn pose(&self, k: usize, f: f64) -> Option<Pose> {
+        let f = if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 };
+        self.steps.get(k).map(|s| s.pose_frac(&self.machine, f))
+    }
+
+    /// The axes a fraction `f` along step `k`.
+    pub fn joints(&self, k: usize, f: f64) -> Option<Joints> {
+        let f = if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 };
+        self.steps.get(k).map(|s| s.joints_frac(&self.machine, f))
+    }
+
+    /// Poses along step `k` at most `spacing` mm of its travel apart (its start and end
+    /// included; at most `max` + 1; a straight move of a 3-axis machine is its two ends).
+    pub fn samples(&self, k: usize, spacing: f64, max: usize) -> Vec<Pose> {
+        let Some(s) = self.steps.get(k) else { return Vec::new() };
+        let spacing = if spacing.is_finite() && spacing > 1e-6 { spacing } else { 1.0 };
+        let straight = match &s.how {
+            How::Straight => true,
+            How::Joint { from, to, .. } => from.rotary == to.rotary,
+            _ => false,
+        };
+        let n = if straight { 1 } else { ((s.travel / spacing).ceil() as usize).clamp(1, max.max(1)) };
+        (0..=n).map(|i| s.pose_frac(&self.machine, i as f64 / n as f64)).collect()
+    }
+
+    pub fn grid(&self) -> &Grid {
+        &self.grid
+    }
+
+    /// The cell size (mm).
+    pub fn cell(&self) -> f64 {
+        self.cell
+    }
+
+    pub fn cells(&self) -> usize {
+        self.grid.columns().saturating_mul(self.grid.rows())
+    }
+
+    pub fn tolerance(&self) -> f64 {
+        self.tol
+    }
+
+    pub fn machine(&self) -> &Machine {
+        &self.machine
+    }
+
+    /// The number of the tool in `slot`.
+    pub fn tool_number(&self, slot: u8) -> Option<u32> {
+        self.tools.get(usize::from(slot)).copied()
+    }
+
+    /// Time at feed as the controller times it, dwells included (minutes).
+    pub fn minutes(&self) -> f64 {
+        self.minutes
+    }
+
+    /// About how many cells cutting `work` visits.
+    fn cost(&self, work: &[Work]) -> f64 {
+        work.iter().map(|&(k, f0, f1)| self.steps.get(k).map_or(0.0, |s| s.cost * (f1 - f0).max(0.0))).sum()
+    }
+
+    /// About how many cells cutting step `k` visits.
+    pub fn step_cost(&self, k: usize) -> f64 {
+        self.steps.get(k).map_or(0.0, |s| s.cost)
+    }
+
+    /// The part's height over every cell (its radius along every ray on a 4th axis) where a
+    /// ray from above (from outside) first meets it; NaN where none does. For gouges found as
+    /// the stock is cut ([`SimState::set_floor`]).
+    pub fn part_floor(&self, part: &Surface) -> Vec<f64> {
+        let (nu, nv) = (self.grid.columns(), self.grid.rows());
+        let grid = self.grid;
+        let threaded = !part.is_empty() && nu.saturating_mul(nv) > 100_000;
+        let rows = each_threaded(self.bands.clone(), threaded, |(from, to)| {
+            let mut out = Vec::with_capacity(nu * to.saturating_sub(from));
+            for j in from..to {
+                for i in 0..nu {
+                    out.push(if part.is_empty() { f64::NAN } else { floor_at(&grid, part, i, j) });
+                }
+            }
+            Ok(out)
+        });
+        let mut all = Vec::with_capacity(nu * nv);
+        for r in rows.unwrap_or_default() {
+            all.extend(r);
+        }
+        all.resize(nu * nv, f64::NAN);
+        all
+    }
+}
+
+/// The part's height (radius) over cell `(i, j)` of `grid`, NaN when the ray misses it.
+fn floor_at(grid: &Grid, part: &Surface, i: usize, j: usize) -> f64 {
+    match *grid {
+        Grid::Heights { top, bottom, .. } => {
+            let span = (top - bottom).max(0.0) + 2.0;
+            let p = grid.point(i, j, top + 1.0);
+            part.raycast(p, Vec3::new(0.0, 0.0, -span)).map_or(f64::NAN, |(t, _)| top + 1.0 - t * span)
+        }
+        Grid::Radii { radius, .. } => {
+            let out = radius + 1.0;
+            let p = grid.point(i, j, out);
+            part.raycast(p, Vec3::new(p.x, 0.0, 0.0) - p).map_or(f64::NAN, |(t, _)| out * (1.0 - t))
+        }
+    }
+}
+
+/// An outline seen along the tool axis (from above on a 3-axis machine), work coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Footprint {
+    Circle { x: f64, y: f64, r: f64 },
+    Rect { x0: f64, x1: f64, y0: f64, y1: f64 },
+}
+
+impl Footprint {
+    pub fn bounds(self) -> (f64, f64, f64, f64) {
+        match self {
+            Footprint::Circle { x, y, r } => (x - r, x + r, y - r, y + r),
+            Footprint::Rect { x0, x1, y0, y1 } => (x0, x1, y0, y1),
+        }
+    }
+
+    pub fn contains(self, px: f64, py: f64) -> bool {
+        match self {
+            Footprint::Circle { x, y, r } => (px - x).powi(2) + (py - y).powi(2) <= r * r,
+            Footprint::Rect { x0, x1, y0, y1 } => px >= x0 && px <= x1 && py >= y0 && py <= y1,
+        }
+    }
+}
+
+/// The stock part way through a program: every band of it, and what each step removed so far.
+/// Cloning it (a keyframe) copies the stock.
+pub struct SimState {
+    bands: Vec<Model>,
+    /// What each step removed, every band's share added in band order.
+    removed: Vec<Removed>,
+    probes: Vec<u8>,
+    /// Steps before `next` are done, and `frac` of step `next`.
+    next: usize,
+    frac: f64,
+    visits: Arc<AtomicU64>,
+    failed: bool,
+}
+
+impl Clone for SimState {
+    fn clone(&self) -> SimState {
+        let visits = Arc::new(AtomicU64::new(0));
+        let mut bands = self.bands.clone();
+        for b in &mut bands {
+            b.set_visits(&visits);
+        }
+        SimState { bands, removed: self.removed.clone(), probes: self.probes.clone(), next: self.next, frac: self.frac, visits, failed: self.failed }
+    }
+}
+
+impl SimState {
+    /// The stock before the program.
+    pub fn new(plan: &SimPlan) -> SimState {
+        let visits = Arc::new(AtomicU64::new(0));
+        let bands = plan.bands.iter().map(|&(from, to)| plan.grid.band(from, to, &visits, plan.tol)).collect();
+        SimState { bands, removed: Vec::new(), probes: Vec::new(), next: 0, frac: 0.0, visits, failed: false }
+    }
+
+    /// Watches for cuts below `floor` (from [`SimPlan::part_floor`]) as the stock is cut: each
+    /// step's [`Removed::gouge`].
+    pub fn set_floor(&mut self, floor: &Arc<Vec<f64>>) {
+        for b in &mut self.bands {
+            b.set_floor(floor);
+        }
+    }
+
+    /// How far it is: every step before the first number is cut, and the second's fraction of
+    /// that step.
+    pub fn at(&self) -> (usize, f64) {
+        (self.next, self.frac)
+    }
+
+    /// What each step cut so far, in step order (the step under way included).
+    pub fn removed(&self) -> &[Removed] {
+        &self.removed
+    }
+
+    /// Cuts on to step `to`, and a fraction `fraction` of it (steps past the program's end are
+    /// its end). A position before the state's own is refused: start again from an earlier state.
+    pub fn advance(&mut self, plan: &SimPlan, to: usize, fraction: f64) -> Result<()> {
+        if self.failed {
+            return invalid("this simulation state stopped part way through a step: start again from an earlier one");
+        }
+        let n = plan.steps.len();
+        let (mut to, mut fraction) = (to, if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 });
+        if fraction >= 1.0 {
+            to = to.saturating_add(1);
+            fraction = 0.0;
+        }
+        if to >= n {
+            to = n;
+            fraction = 0.0;
+        }
+        if to < self.next || (to == self.next && fraction < self.frac) {
+            return invalid("the stock cannot be cut back to an earlier move: start again from an earlier state");
+        }
+        let mut work: Vec<Work> = Vec::new();
+        let (mut k, mut f0) = (self.next, self.frac);
+        while k < to {
+            work.push((k, f0, 1.0));
+            k += 1;
+            f0 = 0.0;
+        }
+        if k < n && fraction > f0 {
+            work.push((k, f0, fraction));
+        }
+        if work.is_empty() {
+            return Ok(());
+        }
+        self.visits.store(0, Ordering::Relaxed);
+        let threaded = plan.cost(&work) > THREADED_VISITS;
+        let bands: Vec<&mut Model> = self.bands.iter_mut().collect();
+        let results = match each_threaded(bands, threaded, |m| band_advance(m, plan, &work)) {
+            Ok(r) => r,
+            Err(e) => {
+                self.failed = true;
+                return Err(e);
+            }
+        };
+        for (w, &(k, _, _)) in work.iter().enumerate() {
+            while self.removed.len() <= k {
+                self.removed.push(Removed::default());
+                self.probes.push(0);
+            }
+            for band in &results {
+                if let Some(&(r, bits)) = band.get(w) {
+                    if let Some(slot) = self.removed.get_mut(k) {
+                        slot.add(r);
+                    }
+                    if let Some(p) = self.probes.get_mut(k) {
+                        *p |= bits;
+                    }
+                }
+            }
+        }
+        (self.next, self.frac) = (to, fraction);
+        Ok(())
+    }
+
+    /// The stock as it is now.
+    pub fn grid(&self, plan: &SimPlan) -> StockGrid {
+        let mut values = Vec::with_capacity(plan.cells());
+        for b in &self.bands {
+            values.extend_from_slice(b.values());
+        }
+        stock_grid(&plan.grid, values)
+    }
+
+    /// The band holding row (angle) `j`, and the row within it.
+    fn band_of(&self, j: usize) -> Option<(&Model, usize)> {
+        let b = self.bands.partition_point(|m| m.span().0 <= j).checked_sub(1)?;
+        let m = self.bands.get(b)?;
+        let (j0, n) = m.span();
+        (j < j0 + n).then_some((m, j - j0))
+    }
+
+    /// The height (radius) of cell `(i, j)` of the whole grid.
+    pub fn value(&self, plan: &SimPlan, i: usize, j: usize) -> Option<f64> {
+        let nx = plan.grid.columns();
+        if i >= nx {
+            return None;
+        }
+        let (m, jj) = self.band_of(j)?;
+        m.values().get(jj * nx + i).copied()
+    }
+
+    /// The slot of the tool that cut cell `(i, j)` last ([`UNCUT`]: none).
+    pub fn last_tool(&self, plan: &SimPlan, i: usize, j: usize) -> u8 {
+        let nx = plan.grid.columns();
+        if i >= nx {
+            return UNCUT;
+        }
+        self.band_of(j).and_then(|(m, jj)| m.last().get(jj * nx + i).copied()).unwrap_or(UNCUT)
+    }
+
+    /// The version of tile `(ti, tj)`: it changes whenever a cell of the tile is cut.
+    pub fn tile_version(&self, ti: usize, tj: usize) -> u32 {
+        let Some((m, jj)) = self.band_of(tj * TILE) else { return 0 };
+        let t = m.tiles();
+        if ti >= t.tx {
+            return 0;
+        }
+        t.version.get((jj / TILE) * t.tx + ti).copied().unwrap_or(0)
+    }
+
+    /// Every tile's version, row of tiles after row ([`Grid::tiles`]).
+    pub fn tile_versions(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for b in &self.bands {
+            out.extend_from_slice(&b.tiles().version);
+        }
+        out
+    }
+
+    /// Material higher than `z` inside `fp` (3-axis stock; `None` on a 4th axis): a point on its
+    /// top. Exact over the cells' centres; tiles whose highest cell is below `z` are skipped.
+    pub fn material_above(&mut self, fp: Footprint, z: f64) -> Option<Vec3> {
+        let (x0, x1, y0, y1) = fp.bounds();
+        if ![x0, x1, y0, y1, z].iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let inside = |x: f64, y: f64| fp.contains(x, y);
+        for b in &mut self.bands {
+            if let Model::Heights(h) = b
+                && let Some(p) = h.above((x0, x1), (y0, y1), z, &inside)
+            {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// The highest of the cells `i0..=i1` by `j0..=j1` by whole tiles (at least their highest).
+    pub fn max_in(&mut self, plan: &SimPlan, (i0, i1): (usize, usize), (j0, j1): (usize, usize)) -> f64 {
+        let nx = plan.grid.columns();
+        let mut m = f64::NEG_INFINITY;
+        for b in &mut self.bands {
+            let (b0, n) = b.span();
+            let (lo, hi) = (j0.max(b0), j1.min(b0 + n.saturating_sub(1)));
+            if n == 0 || lo > hi || i0 > i1 || i0 >= nx {
+                continue;
+            }
+            let (values, tiles) = match b {
+                Model::Heights(h) => (&h.h, &mut h.tiles),
+                Model::Radii(r) => (&r.rho, &mut r.tiles),
+            };
+            m = m.max(tiles.max_in(values, nx, (i0, i1.min(nx - 1)), (lo - b0, hi - b0)));
+        }
+        m
+    }
+
+    /// Whether `p` (work coordinates) is inside the stock.
+    pub fn contains(&self, p: Vec3) -> bool {
+        self.bands.iter().find_map(|b| b.owns(p)).unwrap_or(false)
+    }
+
+    /// The memory the stock takes, about (bytes).
+    pub fn bytes(&self) -> usize {
+        self.bands.iter().map(Model::bytes).sum::<usize>() + self.removed.len() * (std::mem::size_of::<Removed>() + 1)
+    }
+
+    /// What is left held against `part`, and the report [`simulate`] gives.
+    pub fn finish(self, plan: &SimPlan, part: &Surface) -> SimReport {
+        let (tol, initial) = (plan.tol, plan.initial);
+        let refine = (MAX_REFINED / self.bands.len().max(1)).max(1);
+        let threaded = self.bands.len() > 1 && plan.cells() > 100_000;
+        let models: Vec<&Model> = self.bands.iter().collect();
+        let cmps = each_threaded(models, threaded, |m| Ok(compare(m, part, tol, initial, refine))).unwrap_or_default();
+        let mut removals = Vec::new();
+        for (k, step) in plan.steps.iter().enumerate() {
+            let r = self.removed.get(k).copied().unwrap_or_default();
+            let slot = self.probes.get(k).copied().unwrap_or(0) == 0b111;
+            if r.volume > 0.0 || slot {
+                removals.push(BlockRemoval { line: step.line, rapid: step.rapid, volume: r.volume, depth: r.depth, slot });
+            }
+        }
+        let rapids_in_material: Vec<BlockRemoval> = removals.iter().filter(|r| r.rapid && r.depth > tol).copied().collect();
+        let removed_volume = removals.iter().map(|r| r.volume).sum();
+        let mut warnings = Vec::new();
+        if plan.steps.is_empty() {
+            warnings.push(
+                "no move of the program was simulated: none comes after every axis of the machine (its rotary included) is written, so \
+                 nothing was checked"
+                    .into(),
+            );
+        }
+        let slots: Vec<usize> = removals.iter().filter(|r| r.slot).map(|r| r.line).collect();
+        if !slots.is_empty() {
+            let shown: Vec<String> = slots.iter().take(10).map(usize::to_string).collect();
+            warnings.push(format!(
+                "{} cutting moves take the tool's full width (a slot), lines {}{}: on a light machine keep their depth and feed low",
+                slots.len(),
+                shown.join(", "),
+                if slots.len() > shown.len() { ", …" } else { "" }
+            ));
+        }
+        let mut cmp = Comparison::default();
+        for c in &cmps {
+            cmp.add(c);
+        }
+        if cmp.unrefined > 0 {
+            warnings.push(format!("{} gouged cells were measured along Z (or the radius) only: too many to measure in 3D", cmp.unrefined));
+        }
+        let tunnels: u64 = self.bands.iter().map(|b| if let Model::Radii(m) = b { m.tunnels } else { 0 }).sum();
+        if tunnels > 0 {
+            warnings.push(format!(
+                "{tunnels} times the tool cut beside a ray from the A axis without reaching out of the material along it (a feature in \
+                 the side of the part): the round stock model leaves those cuts out, so they are not checked here (the job's gouge check \
+                 covers them)"
+            ));
+        }
+        let mut values = Vec::with_capacity(plan.cells());
+        for b in self.bands {
+            match b {
+                Model::Heights(h) => values.extend(h.h),
+                Model::Radii(r) => values.extend(r.rho),
+            }
+        }
+        let stock = stock_grid(&plan.grid, values);
+        SimReport {
+            cell: plan.cell,
+            cells: match &stock {
+                StockGrid::Heights { heights, .. } => heights.len(),
+                StockGrid::Radii { radii, .. } => radii.len(),
+            },
+            stock,
+            moves: plan.steps.len(),
+            removals,
+            rapids_in_material,
+            removed_volume,
+            gouge_worst: cmp.worst,
+            gouge_cells: cmp.gouged,
+            leftover_max: cmp.leftover_max,
+            leftover_mean: if cmp.machined > 0 { cmp.leftover_sum / cmp.machined as f64 } else { 0.0 },
+            machined_cells: cmp.machined,
+            minutes: plan.minutes,
+            feed_length: plan.feed_length,
+            rapid_length: plan.rapid_length,
+            warnings,
+        }
+    }
+}
+
+fn stock_grid(grid: &Grid, values: Vec<f64>) -> StockGrid {
+    match *grid {
+        Grid::Heights { x0, y0, dx, dy, nx, ny, bottom, top } => StockGrid::Heights { x0, y0, dx, dy, nx, ny, bottom, top, heights: values },
+        Grid::Radii { x0, dx, nx, nt, radius } => StockGrid::Radii { x0, dx, nx, nt, radius, radii: values },
+    }
+}
+
 /// Simulates `text` (G-code for `machine`, in absolute coordinates) cutting `stock` with
 /// `tools` (by number), and compares what is left with `part`. See the module documentation.
 pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShape, part: &Surface, params: &SimParams) -> Result<SimReport> {
+    let plan = plan_sim(text, machine, tools, stock, params)?;
+    let mut state = SimState::new(&plan);
+    state.advance(&plan, plan.moves(), 0.0)?;
+    Ok(state.finish(&plan, part))
+}
+
+/// Reads `text` (G-code for `machine`, in absolute coordinates) into the steps that cut `stock`
+/// with `tools` (by number): the first part of [`simulate`].
+pub fn plan_sim(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShape, params: &SimParams) -> Result<SimPlan> {
     let tol = params.tolerance;
     if !(1e-4..=1.0).contains(&tol) {
         return invalid("the tolerance must be from 0.0001 to 1 mm");
@@ -1348,10 +2250,13 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
         StockShape::Cylinder { x_min, x_max, radius } => ((x_max - x_min).hypot(2.0 * radius), radius),
     };
     let lever_extra = machine.work_origin.len() + machine.rotaries.iter().map(|r| r.center.len()).sum::<f64>();
+    let area = match grid {
+        Grid::Heights { dx, dy, .. } => dx * dy,
+        Grid::Radii { dx, nt, radius, .. } => dx * (TAU * radius / nt.max(1) as f64),
+    };
 
     // The blocks as steps, in order.
     let mut steps: Vec<Step> = Vec::with_capacity(blocks.len());
-    let mut lines: Vec<(usize, bool)> = Vec::with_capacity(blocks.len());
     let (mut minutes, mut feed_length, mut rapid_length) = (0.0, 0.0, 0.0);
     let mut stamps = 0usize;
     let mut state: Option<State> = None;
@@ -1366,7 +2271,9 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
                 continue;
             }
         };
-        let profile = *tool_at(&scan.changes, &profiles, line)?;
+        let slot = tool_at(&scan.changes, &profiles, line)?;
+        let Some(&(_, profile)) = profiles.get(slot) else { return Err(CamError::Parse(line, "a tool that is not among the tools given".into())) };
+        let flute = tools.get(slot).map_or(0.0, |t| t.flute_length);
         // The position before this block, unless the program lost it since the last one.
         let gaps = &scan.gaps;
         let lost = |since: usize| gaps.partition_point(|g| *g <= since) < gaps.partition_point(|g| *g <= line);
@@ -1462,102 +2369,46 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
                 [mid.tip + mid.axis * up, rim + side * w, rim - side * w]
             })
         });
-        steps.push(Step { profile, start, end, how, points, probes: probes.flatten() });
-        lines.push((line, rapid));
+        let d = 2.0 * profile.radius;
+        let cost = if kind == Kind::Rotary { points as f64 * (d * d / area + 1.0) } else { (travel.min(reach * 4.0) + d) * d / area + 1.0 };
+        let from_joints = from.as_ref().map(|f| Joints { linear: f.linear, rotary: f.rotary.clone() });
+        let to_joints = Joints { linear: to.linear, rotary: to.rotary.clone() };
+        steps.push(Step {
+            profile,
+            start,
+            end,
+            how,
+            points,
+            probes: probes.flatten(),
+            line,
+            rapid,
+            slot: u8::try_from(slot).unwrap_or(UNCUT - 1).min(UNCUT - 1),
+            flute,
+            rpm: scan.rpm_at(line),
+            to: to_joints,
+            from: from_joints,
+            travel,
+            cost,
+        });
         state = Some(to);
     }
-
-    let runs = run_bands(&grid, &steps, machine, part, tol, initial)?;
-    let mut removals = Vec::new();
-    for (k, (line, rapid)) in lines.iter().enumerate() {
-        let mut r = Removed::default();
-        let mut bits = 0u8;
-        for run in &runs {
-            if let Some(o) = run.removed.get(k) {
-                r.add(*o);
-            }
-            bits |= run.probes.get(k).copied().unwrap_or(0);
-        }
-        let slot = bits == 0b111;
-        if r.volume > 0.0 || slot {
-            removals.push(BlockRemoval { line: *line, rapid: *rapid, volume: r.volume, depth: r.depth, slot });
-        }
-    }
-    let rapids_in_material: Vec<BlockRemoval> = removals.iter().filter(|r| r.rapid && r.depth > tol).copied().collect();
-    let removed_volume = removals.iter().map(|r| r.volume).sum();
-    let mut warnings = Vec::new();
-    if steps.is_empty() {
-        warnings.push(
-            "no move of the program was simulated: none comes after every axis of the machine (its rotary included) is written, so \
-             nothing was checked"
-                .into(),
-        );
-    }
-    let slots: Vec<usize> = removals.iter().filter(|r| r.slot).map(|r| r.line).collect();
-    if !slots.is_empty() {
-        let shown: Vec<String> = slots.iter().take(10).map(usize::to_string).collect();
-        warnings.push(format!(
-            "{} cutting moves take the tool's full width (a slot), lines {}{}: on a light machine keep their depth and feed low",
-            slots.len(),
-            shown.join(", "),
-            if slots.len() > shown.len() { ", …" } else { "" }
-        ));
-    }
-    let mut cmp = Comparison::default();
-    for run in &runs {
-        cmp.add(&run.cmp);
-    }
-    if cmp.unrefined > 0 {
-        warnings.push(format!("{} gouged cells were measured along Z (or the radius) only: too many to measure in 3D", cmp.unrefined));
-    }
-    let tunnels: u64 = runs.iter().map(|r| if let Model::Radii(m) = &r.model { m.tunnels } else { 0 }).sum();
-    if tunnels > 0 {
-        warnings.push(format!(
-            "{tunnels} times the tool cut beside a ray from the A axis without reaching out of the material along it (a feature in \
-             the side of the part): the round stock model leaves those cuts out, so they are not checked here (the job's gouge check \
-             covers them)"
-        ));
-    }
-    let stock_grid = match grid {
-        Grid::Heights { x0, y0, dx, dy, nx, ny, bottom, top } => {
-            let mut heights = Vec::with_capacity(nx * ny);
-            for run in runs {
-                if let Model::Heights(h) = run.model {
-                    heights.extend(h.h);
-                }
-            }
-            StockGrid::Heights { x0, y0, dx, dy, nx, ny, bottom, top, heights }
-        }
-        Grid::Radii { x0, dx, nx, nt, radius } => {
-            let mut radii = Vec::with_capacity(nx * nt);
-            for run in runs {
-                if let Model::Radii(r) = run.model {
-                    radii.extend(r.rho);
-                }
-            }
-            StockGrid::Radii { x0, dx, nx, nt, radius, radii }
-        }
-    };
-    Ok(SimReport {
+    // Bands of whole tiles, so that the tiles of the bands are the tiles of the grid.
+    let lines = grid.lines();
+    let count = band_count(lines);
+    let tiles = lines.div_ceil(TILE).max(1);
+    let bands = (0..count).map(|b| ((b * tiles / count * TILE).min(lines), ((b + 1) * tiles / count * TILE).min(lines))).collect();
+    Ok(SimPlan {
+        machine: machine.clone(),
+        steps,
+        grid,
         cell,
-        cells: match &stock_grid {
-            StockGrid::Heights { heights, .. } => heights.len(),
-            StockGrid::Radii { radii, .. } => radii.len(),
-        },
-        stock: stock_grid,
-        moves: steps.len(),
-        removals,
-        rapids_in_material,
-        removed_volume,
-        gouge_worst: cmp.worst,
-        gouge_cells: cmp.gouged,
-        leftover_max: cmp.leftover_max,
-        leftover_mean: if cmp.machined > 0 { cmp.leftover_sum / cmp.machined as f64 } else { 0.0 },
-        machined_cells: cmp.machined,
+        tol,
+        initial,
         minutes,
         feed_length,
         rapid_length,
-        warnings,
+        tools: profiles.iter().map(|(n, _)| *n).collect(),
+        bands,
     })
 }
 
@@ -1592,7 +2443,7 @@ impl Comparison {
 }
 
 /// The distance from `p` to `surface`, or `cap` when that is nearer.
-fn distance_within(surface: &Surface, p: Vec3, cap: f64) -> f64 {
+pub(crate) fn distance_within(surface: &Surface, p: Vec3, cap: f64) -> f64 {
     let best = Cell::new(cap);
     surface.visit(
         |b: &Aabb3| {

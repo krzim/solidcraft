@@ -127,6 +127,16 @@ pub struct CamJob {
     /// A JSON file holding `machine_rates`, read from the job file's folder when relative.
     #[serde(default)]
     pub machine_rates_path: Option<String>,
+    /// A machine model file (`solidcraft.machine_model`: the table, the spindle's nose and the
+    /// machine's parts) for the simulation view (`cam.view.load`), read from the job file's
+    /// folder when relative. `cam.job` does not use it.
+    #[serde(default)]
+    pub machine_model_path: Option<String>,
+    /// A workholding file (`solidcraft.workholding`: a vise, clamps, the table or a rotary unit)
+    /// for the simulation view, read from the job file's folder when relative. `cam.job` does not
+    /// use it.
+    #[serde(default)]
+    pub workholding_path: Option<String>,
 }
 
 /// A machine: a preset's name or the CAM crate's `Machine` JSON.

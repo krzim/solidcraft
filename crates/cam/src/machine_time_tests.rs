@@ -24,6 +24,7 @@ fn rates() -> MachineRates {
         spindle_rpm: Some([10000.0, 24000.0]),
         spindle_start_seconds: Some(6.0),
         travel_mm: Some([300.0, 170.0, 130.0]),
+        ..MachineRates::default()
     }
 }
 
@@ -234,4 +235,50 @@ fn the_feed_warning_names_a_block_that_is_slowed() {
         all.contains("1 cutting blocks (the first at line 3) ask a linear axis for more than its top feed (up to 5000 mm/min at line 3)"),
         "{all}"
     );
+}
+
+#[test]
+fn a_long_move_speeds_up_and_slows_down() {
+    // 1000 mm at 100 mm/s, 2000 mm/s²: 2.5 mm to speed up and 2.5 to stop, 0.05 s each.
+    close(trapezoid(1000.0, 0.0, 100.0, 0.0, 2000.0), 0.05 + 0.05 + 995.0 / 100.0, 1e-9);
+    // Too short to reach the speed: a triangle, peak √(a·l).
+    close(trapezoid(2.0, 0.0, 100.0, 0.0, 2000.0), 2.0 * (2000.0f64 * 2.0).sqrt() / 2000.0, 1e-9);
+    assert_eq!(trapezoid(0.0, 0.0, 100.0, 0.0, 2000.0), 0.0);
+    close(trapezoid(10.0, 0.0, 100.0, 0.0, f64::INFINITY), 0.1, 1e-12);
+}
+
+#[test]
+fn blocks_are_timed_with_acceleration_when_the_rates_give_it() {
+    let program = "G21\nT1 M6\nS12000 M3\nG0 X0. Y0. Z0.\nG1 X1000. F6000.\nG4 P2.\nM5\n";
+    let plain =
+        MachineRates { rapid_xyz_mm_min: 6000.0, spindle_start_seconds: Some(6.0), tool_change_seconds: Some(20.0), ..MachineRates::default() };
+    let t = block_times(program, &[], &plain, DwellUnit::Seconds).unwrap();
+    assert!(!t.accelerated);
+    assert_eq!(t.lines, [4, 5, 6]);
+    // The first block only says where the axes are; 1000 mm at 6000 mm/min is 10 s; the dwell 2.
+    assert_eq!(t.seconds, [0.0, 10.0, 2.0]);
+    assert_eq!(t.waits.iter().map(|w| (w.line, w.kind)).collect::<Vec<_>>(), [(2, WaitKind::ToolChange), (3, WaitKind::SpindleStart)]);
+    close(t.total, 10.0 + 2.0 + 6.0 + 20.0, 1e-9);
+    // With 2000 mm/s²: the hand calculation, 10.05 s.
+    let accel = MachineRates { accel_mm_s2: Some(2000.0), ..plain.clone() };
+    let t = block_times(program, &[], &accel, DwellUnit::Seconds).unwrap();
+    assert!(t.accelerated);
+    close(t.seconds[1], 10.05, 1e-9);
+    // A square of short moves takes longer with it than without; a straight line of them does
+    // not stop at their joins.
+    let square = "G21\nG0 X0. Y0. Z0.\nG1 X5. F6000.\nY5.\nX0.\nY0.\n";
+    let line = "G21\nG0 X0. Y0. Z0.\nG1 X5. F6000.\nX10.\nX15.\nX20.\n";
+    let sum = |text: &str, r: &MachineRates| block_times(text, &[], r, DwellUnit::Seconds).unwrap().total;
+    assert!(sum(square, &accel) > sum(square, &plain) + 0.1);
+    close(sum(line, &accel), trapezoid(20.0, 0.0, 100.0, 0.0, 2000.0), 1e-9);
+    // Without acceleration the cut time is the one `machine_time` gives.
+    let mt = machine_time(PROGRAM, &[AxisLetter::A], &rates(), DwellUnit::Seconds).unwrap();
+    let bt = block_times(PROGRAM, &[AxisLetter::A], &rates(), DwellUnit::Seconds).unwrap();
+    close(bt.total, (mt.total_minutes) * 60.0, 1e-6);
+    // Hostile accelerations are refused.
+    for bad in [Some(0.0), Some(-1.0), Some(f64::NAN), Some(1e9)] {
+        assert!(MachineRates { accel_mm_s2: bad, ..plain.clone() }.validate().is_err());
+    }
+    assert!(MachineRates { accel_z_mm_s2: Some(100.0), ..plain.clone() }.validate().is_err(), "Z's acceleration alone");
+    assert!(MachineRates { tool_change_seconds: Some(-1.0), ..plain }.validate().is_err());
 }
