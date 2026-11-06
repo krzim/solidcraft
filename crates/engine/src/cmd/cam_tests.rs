@@ -3079,3 +3079,127 @@ fn the_simulation_and_the_setup_sheet_start_from_the_jobs_stock() {
     let r = run(&mut s, "cam.job", json!({"job": bare, "dry_run": true}));
     assert!(r["summary"]["stock"].is_null(), "{}", r["summary"]);
 }
+
+/// A helical groove `turns` times round the bar of radius 10, 10 mm along X a turn, 0.5 deep,
+/// as a wrap operation's flat points.
+fn groove_points(turns: f64) -> Vec<[f64; 3]> {
+    let around = std::f64::consts::TAU * 10.0;
+    let n = (turns * 120.0).round() as usize;
+    (0..=n).map(|k| k as f64 / 120.0).map(|t| [-15.0 + 10.0 * t, around * t, -0.5]).collect()
+}
+
+#[test]
+fn operation_minutes_add_up_with_their_rewinds() {
+    let mut s = bar();
+    let dir = Dir::new("rewind");
+    let mut post = run(&mut s, "cam.posts", json!({"name": "mach3"}))["post"].clone();
+    post["rewind"] = json!({"distance": 25.0, "retract_feed": 500.0, "plunge_feed": 250.0});
+    let post_path = dir.file("rewind.post.json");
+    std::fs::write(&post_path, post.to_string()).unwrap();
+    let job = json!({
+        "machine": "4axis_a", "a_limits_deg": [-360, 360], "post_path": post_path, "tools": [ball(3, 2.0)],
+        "operations": [{"name": "groove", "type": "wrap", "tool": 3, "radius": 10, "points": groove_points(3.0), "gouge_check": false}]
+    });
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_eq!(r["passed"], true, "{r}");
+    // Three turns within ±360°: one rewind, and its feeds are in the operation's minutes.
+    assert_eq!(r["operations"][0]["rewinds"], 1, "{r}");
+    let total: f64 = r["operations"].as_array().unwrap().iter().filter_map(|o| o["cut_minutes"].as_f64()).sum();
+    let read = r["readback"]["cut_minutes"].as_f64().unwrap();
+    assert!((total - read).abs() <= 2e-3 * read, "{total} min against {read} min read back: {r}");
+}
+
+#[test]
+fn an_operation_without_the_gouge_check_is_still_checked_against_the_fixtures() {
+    let mut s = bar();
+    // A clamp over the top of the bar where an engraving runs along it.
+    run(&mut s, "solid.box", json!({"length": 10, "width": 6, "height": 4, "corner": [-5, -3, 8.5], "operation": "new", "body_name": "Clamp"}));
+    let job = |fixtures: Value| {
+        json!({
+            "machine": "4axis_a", "post": "mach3_4axis", "tools": [ball(3, 2.0)], "bodies": ["Bar"], "fixtures": fixtures,
+            "operations": [{"name": "engrave", "type": "wrap", "tool": 3, "radius": 10, "points": [[-12, 0, -0.5], [12, 0, -0.5]], "gouge_check": false}]
+        })
+    };
+    let r = run(&mut s, "cam.job", json!({"job": job(json!(["Clamp"])), "dry_run": true}));
+    assert_eq!(r["passed"], false, "{r}");
+    assert_eq!(r["gouge"]["skipped"], json!(["engrave"]), "{r}");
+    assert!(r["gouge"]["hits"].as_u64().is_some_and(|h| h > 0), "{r}");
+    assert!(r["failures"].as_array().unwrap().iter().any(|f| f.as_str().is_some_and(|f| f.contains("into a fixture"))), "{r}");
+    // Without the clamp as a fixture the engraving passes: the part itself is not checked.
+    let r = run(&mut s, "cam.job", json!({"job": job(Value::Null), "dry_run": true}));
+    assert_eq!(r["passed"], true, "{r}");
+    assert_eq!(r["gouge"]["skipped"], json!(["engrave"]), "{r}");
+}
+
+#[test]
+fn output_and_preview_are_never_the_same_file() {
+    let mut s = dome();
+    let dir = Dir::new("same");
+    std::fs::create_dir_all(dir.0.join("sub")).unwrap();
+    let out = dir.file("a.tap");
+    let mut spellings = vec![dir.0.join(".").join("a.tap"), dir.0.join("sub").join("..").join("a.tap")];
+    if cfg!(windows) {
+        spellings.push(dir.0.join("A.TAP"));
+        // Windows drops dots and spaces at the end of a name: these open `a.tap` too.
+        spellings.push(dir.0.join("a.tap."));
+        spellings.push(dir.0.join("a.tap. ."));
+    }
+    for page in spellings {
+        let page = page.to_string_lossy().into_owned();
+        let e = s.execute("cam.job", &json!({"job": dome_job(), "output": out, "preview": page})).unwrap_err();
+        assert!(e.to_string().contains("different files"), "{page}: {e}");
+    }
+    assert!(!PathBuf::from(&out).exists(), "nothing was written");
+    let r = run(&mut s, "cam.job", json!({"job": dome_job(), "output": out, "preview": dir.file("a.html")}));
+    assert_clean(&r);
+}
+
+#[test]
+fn a_dry_run_says_when_the_output_is_not_the_posts_extension() {
+    let mut s = dome();
+    let dir = Dir::new("ext");
+    let r = run(&mut s, "cam.job", json!({"job": dome_job(), "output": dir.file("dome.nc"), "dry_run": true}));
+    let notes: Vec<&str> = r["notes"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(notes.iter().any(|n| n.contains("writes .tap files; this one is .nc")), "{notes:?}");
+    assert!(!PathBuf::from(dir.file("dome.nc")).exists());
+}
+
+#[test]
+fn every_example_in_the_cam_jobs_doc_is_accepted() {
+    let doc = include_str!("../../../../docs/cam-jobs.md");
+    let blocks: Vec<&str> = doc.split("```json").skip(1).filter_map(|b| b.split("```").next()).collect();
+    assert!(blocks.len() >= 2, "{blocks:?}");
+    let mut jobs = 0;
+    for block in blocks {
+        let v: Value = serde_json::from_str(block).unwrap_or_else(|e| panic!("{e}: {block}"));
+        if v.get("operations").is_some() {
+            serde_json::from_value::<crate::schema::cam::CamJob>(v.clone()).unwrap_or_else(|e| panic!("{e}: {block}"));
+            // Planned on a part with a built-in post in place of the example's post file.
+            let mut job = v;
+            if let Some(o) = job.as_object_mut() {
+                o.remove("post_path");
+                o.insert("post".into(), json!("mach3_4axis"));
+            }
+            let r = pocketed_block().execute("cam.job", &json!({"job": job.clone(), "dry_run": true})).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(r["operations"].as_array().map(Vec::len), job["operations"].as_array().map(Vec::len), "{r}");
+            jobs += 1;
+        } else {
+            serde_json::from_value::<crate::schema::cam::CamJobParams>(v).unwrap_or_else(|e| panic!("{e}: {block}"));
+        }
+    }
+    assert!(jobs >= 1);
+    // An indexed operation takes its name from itself when the inner one has none; with neither,
+    // and an operation without a name, are refused.
+    let mut job = side_pocket_job();
+    job["operations"][0]["name"] = json!("wrapped");
+    job["operations"][0]["operation"].as_object_mut().unwrap().remove("name");
+    let r = pocketed_block().execute("cam.job", &json!({"job": job.clone(), "dry_run": true})).unwrap();
+    assert_eq!(r["operations"][0]["name"], "wrapped", "{r}");
+    job["operations"][0].as_object_mut().unwrap().remove("name");
+    let e = pocketed_block().execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("needs a `name`"), "{e}");
+    let mut job = dome_job();
+    job["operations"][0].as_object_mut().unwrap().remove("name");
+    let e = dome().execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("needs a `name`"), "{e}");
+}

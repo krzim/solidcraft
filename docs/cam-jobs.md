@@ -24,7 +24,7 @@ Units are millimetres and mm/min. Angles in a job are degrees (`a_deg`, `angle_d
 | `job` | The job as an object. Give this or `job_path`. |
 | `job_path` | A `.json` file holding the job. Relative `post_path` and `tool_library_path` in it are read from the file's folder. |
 | `output` | The G-code file. Required unless `dry_run`. |
-| `preview` | An HTML page of the part and every toolpath: self-contained (no network), one view per operation and one for the whole job, orbit and zoom, a slider that plays the moves, rapids dashed. |
+| `preview` | An HTML page of the part and every toolpath: self-contained (no network), one view per operation and one for the whole job, orbit and zoom, a slider that plays the moves, rapids dashed. It must be another file than `output`, however the two are spelt. |
 | `setup_sheet` | The setup sheet for the machine operator: a `.html` page (self-contained, print styles) or a `.md` file. See [Setup sheet](#setup-sheet). |
 | `dry_run` | Plan and check, write nothing; the reply says whether the checks pass instead of refusing. |
 | `allow_unsafe` | Write the program even when a check fails. |
@@ -43,7 +43,7 @@ The command never writes a program that fails one of these unless `allow_unsafe`
 - **Gouges.** Every cutting move of every operation is sampled and the cutter (shrunk by the
   job's tolerance) must not meet the part or a fixture. An operation that cuts what the model
   does not show (an engraving) sets `gouge_check: false`; the reply lists it under
-  `gouge.skipped`.
+  `gouge.skipped`, and it is still checked against the fixtures.
 - **Holder.** For tools with holder data (`stickout` above the flutes, `shank_diameter`,
   `holder`), the shank and holder must not touch the part or a fixture along a cutting move.
 - **Rapids.** Every `G0` of the program as written, the stock and the turns of a 4th axis
@@ -68,7 +68,7 @@ message. With `dry_run`, the reply carries `passed: false` and `failures`.
 
 ### The reply
 
-`operations` (each with `name`, `kind`, `tool`, `moves`, `cut_length`, `cut_minutes`,
+`operations` (each with `name`, `kind`, `tool`, `moves`, `cut_length`, `cut_minutes`, `rewinds`,
 `max_tilt_deg`, `a_deg` when indexed, `gouge`, `holder_collisions`, `warnings`), `program_lines`,
 `program_head` (the first lines), `readback`, `cut_minutes` (as the machine runs it with
 `machine_rates`, else as written), `rapid_minutes` and `machine_time` (with `machine_rates`, else
@@ -76,10 +76,12 @@ message. With `dry_run`, the reply carries `passed: false` and `failures`.
 `travel` (`checked`, `violation`, `pass`; `null` without `linear_limits`), `stock` (as checked
 against; `null` without one), `passed`, `failures`, `dry_run`, `outputs` (`gcode`, `preview`,
 `setup_sheet`), `notes` (how the bodies were tessellated, a post that writes no work offset, an
-output extension other than the post's), `simulation` (with `simulate`, as `cam.simulate`
+output extension other than the post's, in a dry run too), `simulation` (with `simulate`, as `cam.simulate`
 replies) and `summary`, the setup sheet's tables in compact form (see
 [Setup sheet](#setup-sheet)), on a dry run too. An adaptive operation's entry in `operations`
-also has `adaptive`, the engagement measured along its path.
+also has `adaptive`, the engagement measured along its path. An operation's `cut_minutes` is
+its time at feed with the feeds of its rewinds (below), so the operations' minutes add up to
+`readback.cut_minutes`, the program's as the controller times it.
 
 ## The job
 
@@ -196,7 +198,7 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `adaptive` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown` (tool's, else its diameter); `optimal_load` (tool's `stepover`, else 10% of its diameter); `min_engagement_deg`, `max_engagement_deg` (from the load: see [Adaptive clearing](#adaptive-clearing)); `helix_diameter` (80% of the tool's); `ramp_angle_deg` (2); `climb`; `stock_to_leave` (0); `tolerance`; `compare` (true) |
 | `adaptive_roughing` | `heights` (`top` is the stock's top); `stepdown`; `optimal_load`; `min_engagement_deg`, `max_engagement_deg`; `helix_diameter`; `ramp_angle_deg`; `climb`; `boundary` (the stock's extent; the part's extent); `stock_to_leave` (0.25); `flats` (true); `tolerance` |
 | `chamfer` | `sketch` + `profiles?` or `polygon`; `heights: {clearance, retract, top}` (no `bottom`: the depth follows from the width); `width` (across the top); `tip_offset` (0.2); `side`: `outside` \| `inside` (outside); `climb` (true); `tolerance`. A chamfer mill only; see [Chamfers](#chamfers) |
-| `indexed` | `a_deg` and `operation`: any of the 3-axis operations above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
+| `indexed` | `a_deg` and `operation`: any of the 3-axis operations above, run with A held at `a_deg` (3+1); optionally `name`, used when the inner operation has none. The inner operation carries the tool and feeds. |
 | `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}`, `{type: "helix", pitch}` or `{type: "rings", stepover, zigzag?}` (below); `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
 | `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
 | `bore` | `sketch` (its circles) + `diameter_range?: [min, max]` or `holes: [{center: [x, y], diameter}]`; `heights` (`top` the hole's top, `bottom` its floor); `pitch` or `ramp_angle_deg` (2, the pitch at most `stepdown`: the tool's, else 10% of its diameter); `stepover` (between rings; the tool's, else 40% of its diameter); `climb` (true); `finish_passes` (0); `stock_to_leave` (0.1 with finishing passes, else 0) |
@@ -221,6 +223,28 @@ the post says so.
 `{}` lists the built-in posts with a one-line description and their other names; `{"name":
 "mach3_4axis"}` returns that post's JSON. Save it as a file, change it, and point a job's
 `post_path` at it. Keep a machine-specific post outside the repository.
+
+A post with tool centre point control (`tcp`, `G43.4`) may not set `base.tool_length_on_first_z`
+or write `G43`, another `G43.x` or `G49` in lines it writes while that control is on (spindle,
+operation start and end, coolant, the dwell, `safe_rotate`): any of them would turn it off. The
+read-back takes them as turning it off too.
+
+### Rewinds
+
+A post's `rewind: {distance, retract_feed, plunge_feed}` lets a continuous cut carry on past the
+limits of a rotary that has room for a whole turn (`a_limits_deg` of 360° or more): where the cut
+reaches a limit the tool is fed 1 mm out of the cut at `retract_feed`, rises the rest of
+`distance` at rapid (at least to the operation's clearance, where its own links turn A; less
+where the machine's Z travel ends, never below that clearance; a job that cannot is refused,
+naming the operation and the Z it needs), takes the
+`safe_rotate` lines, turns A back by whole turns, comes back at rapid to 1 mm above the cut and
+feeds the rest of the way in at the operation's plunge feed (`plunge_feed` when it has none),
+then goes on. Each operation starts at the whole turn that needs the fewest rewinds, so one that
+begins where the last ended at a limit does not rewind right after its first plunge.
+
+With `safe_rotate` or `clearance_retract`, a run of rapids that each turn A (a rotary toolpath's
+link at clearance) is written as one retract and one turn of A, not a retract for every step.
+Feed per minute (`G94`) always comes back before a rapid after a cut in inverse time (`G93`).
 
 ## `cam.check`
 

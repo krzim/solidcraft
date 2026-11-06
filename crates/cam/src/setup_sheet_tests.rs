@@ -339,6 +339,7 @@ fn wrap_op() -> MachineOperation {
         spindle_rpm: 12000.0,
         coolant: false,
         path: path(&poses),
+        plunge_feed: None,
     })
 }
 

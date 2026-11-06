@@ -120,7 +120,7 @@ fn a_wrapped_slot_measures_its_width_in_the_written_program() {
     let path = wrap_pocket(&[rect(-w / 2.0, 0.0, w / 2.0, quarter)], &flat(d), &p).unwrap();
     let machine = Machine::four_axis_a();
     let post = Post5::mach3_4axis();
-    let op = Operation5 { name: "slot".into(), tool: flat(d), spindle_rpm: 12000.0, coolant: false, path };
+    let op = Operation5 { name: "slot".into(), tool: flat(d), spindle_rpm: 12000.0, coolant: false, path, plunge_feed: None };
     let program = MachineProgram { name: "slot".into(), operations: vec![MachineOperation::Continuous(op)], work_offset: None };
     let text = emit_program(&program, &post, &machine).unwrap();
     assert!(text.contains("G93"), "cuts that turn A are in inverse time");

@@ -223,7 +223,9 @@ macro_rules! operation {
         #[derive(Clone, Debug, Deserialize, JsonSchema)]
         #[serde(deny_unknown_fields)]
         pub struct $name {
-            /// The operation's name, written as a comment in the program.
+            /// The operation's name, written as a comment in the program. Required, except
+            /// inside `indexed`, which may carry it instead.
+            #[serde(default)]
             pub name: String,
             /// The `number` of the tool it cuts with.
             pub tool: u32,
@@ -237,8 +239,8 @@ macro_rules! operation {
             #[serde(default)]
             pub coolant: Option<bool>,
             /// Check this operation for gouges into the part. Turn it off only for a cut the
-            /// model does not show (an engraving); the holder and read-back checks still run.
-            /// Default: true.
+            /// model does not show (an engraving); the fixtures, holder and read-back checks
+            /// still run. Default: true.
             #[serde(default)]
             pub gouge_check: Option<bool>,
             $($(#[$fdoc])* pub $field: $ty,)*
@@ -612,6 +614,9 @@ pub enum Op3Spec {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IndexedOp {
+    /// The operation's name, for an inner operation without one of its own.
+    #[serde(default)]
+    pub name: Option<String>,
     /// The A angle, degrees.
     pub a_deg: f64,
     /// The 3-axis operation (`adaptive`, `adaptive_roughing`, `contour`, `pocket`, `parallel`,
@@ -716,8 +721,11 @@ pub struct OperationReport {
     pub moves: usize,
     /// Distance at feed, mm.
     pub cut_length: f64,
-    /// Time at feed, minutes.
+    /// Time at feed, minutes: the toolpath's, and the feeds of its rewinds (see `rewinds`).
     pub cut_minutes: f64,
+    /// Times A is drawn out of the cut and turned back a whole turn to carry on within its
+    /// limits (a post with `rewind`); the time at feed they add is in `cut_minutes`.
+    pub rewinds: usize,
     /// Largest angle between the tool axis and work +Z, degrees.
     pub max_tilt_deg: f64,
     /// The A angle it is indexed at, degrees (indexed operations only).
@@ -758,7 +766,8 @@ pub struct GougeReport {
     pub tolerance: f64,
     /// Moves with a gouge.
     pub hits: usize,
-    /// Operations not checked (`gouge_check: false`).
+    /// Operations not checked against the part (`gouge_check: false`); they are still checked
+    /// against the fixtures.
     pub skipped: Vec<String>,
     pub pass: bool,
 }

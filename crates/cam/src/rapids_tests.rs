@@ -177,6 +177,7 @@ fn an_a_turn_low_beside_a_square_bar_is_found() {
             spindle_rpm: 12000.0,
             coolant: false,
             path,
+            plunge_feed: None,
         })])
     };
     // A post that turns where the tool is, without rising first.
@@ -340,6 +341,7 @@ fn an_a_turn_is_held_to_the_part_where_the_tool_is_along_x() {
             spindle_rpm: 12000.0,
             coolant: false,
             path,
+            plunge_feed: None,
         })]);
         let text = emit_program(&p, &post, &machine).unwrap();
         check_rapids(&text, &p, &post, &machine, &bar, &bar, None, 0.01, RAPID_STEP).unwrap()

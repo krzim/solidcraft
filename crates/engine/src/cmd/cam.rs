@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use solidcore_record::{Loop2, Region2, Seg2, Vec2, Vec3};
 use solidcraft_cam::collision::holder_collisions;
 use solidcraft_cam::drill::tool_gouges;
-use solidcraft_cam::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, Rewind, Tcp, emit_program, parse5};
+use solidcraft_cam::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, Rewind, Tcp, emit_program_report, parse5};
 use solidcraft_cam::indexed::{IndexedOperation, frame_for_index};
 use solidcraft_cam::kinematics::{AxisLetter, Carrier, Machine, RotaryAxis};
 use solidcraft_cam::readback5::readback_program;
@@ -63,15 +63,17 @@ pub static COMMANDS: &[CommandSpec] = &[
              travel_mm?: [x, y, z]} | machine_rates_path (the machine's top rates: times the program as it runs and warns about blocks \
              the controller slows), operations: [{name, type: contour | pocket | parallel | \
              roughing | waterline | scallop | steep_shallow | pencil | rest_finish | drill | chamfer {heights: {clearance, retract, top}, \
-             width, tip_offset?, side?} | indexed {a_deg, operation} | indexed_pattern {a_deg: [..] | count, start_deg?, operation} | \
+             width, tip_offset?, side?} | indexed {a_deg, operation, name?} | indexed_pattern {a_deg: [..] | count, start_deg?, operation} | \
              rotary_finish | rotary_roughing (pattern: lines | helix | rings) | wrap | wrap_pocket | wrap_contour | bore | thread_mill | face \
              {bottom, top?, retract?, clearance?, stepdown?, stepover?, angle_deg?, zigzag?, overhang?, rect?}, tool: number, spindle_rpm?, \
              feeds?: {cut, plunge}, coolant?, \
-             gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
+             gouge_check? (false: not against the part, still against fixtures), …}]; unknown keys are refused); output: G-code path \
+             (required unless dry_run); preview?: HTML path, another file than output (the part \
              and toolpaths, self-contained); setup_sheet?: .html | .md path (the operator's sheet: work zero, A convention, stock, \
              tools with Z min, operations, checks, warnings); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a \
              check fails; simulate?: also run the written program through cam.simulate's stock model (a gouge or a rapid in material \
-             fails) → operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, \
+             fails) → operations: [{name, kind, tool, moves, cut_length, cut_minutes (rewinds' feeds included), rewinds, max_tilt_deg, \
+             a_deg?, gouge, holder_collisions, \
              warnings}], program_lines, program_head, readback: {max_tip_deviation, max_axis_deviation_deg, allowed_tip, allowed_axis_deg, \
              cut_minutes, pass}, cut_minutes, rapid_minutes?, machine_time?: {cut_minutes, written_cut_minutes, rapid_minutes, \
              spindle_minutes, total_minutes, slowed_blocks, rotary_over, feed_over, peak_rotary_deg_min?, peak_feed_mm_min?, \
@@ -410,9 +412,12 @@ fn tools_of(cmd: &str, job: &CamJob, base: Option<&Path>) -> Result<Vec<Tool>> {
     Ok(tools)
 }
 
-/// The part and the collision surface (part and fixtures) in work coordinates.
+/// The part, the fixtures and the collision surface (part and fixtures) in work coordinates.
 struct Surfaces {
     part: Surface,
+    /// The fixtures alone (`None` without any), which an operation that skips the gouge check
+    /// against the part is still checked against.
+    fixtures: Option<Surface>,
     all: Surface,
     notes: Vec<String>,
 }
@@ -477,11 +482,12 @@ fn surfaces_of(cmd: &str, s: &Session, job: &CamJob, origin: Vec3, tol: f64) -> 
     if part_surface.is_empty() {
         return Err(bad(cmd, "the part's bodies have no surface to machine"));
     }
-    let all = if fixtures.is_empty() {
-        part_surface.clone()
+    let (all, fixture_surface) = if fixtures.is_empty() {
+        (part_surface.clone(), None)
     } else {
         let mut both = part_mesh;
         let fix = merged_mesh(cmd, &st, &fixtures, origin, chord, &mut notes)?;
+        let fixture_surface = Surface::from_mesh(&fix).map_err(|e| cam_err(cmd, "the fixtures", e))?;
         let Ok(start) = u32::try_from(both.positions.len()) else { return Err(bad(cmd, "the part has too many triangles")) };
         both.positions.extend(fix.positions);
         both.normals.extend(fix.normals);
@@ -489,9 +495,9 @@ fn surfaces_of(cmd: &str, s: &Session, job: &CamJob, origin: Vec3, tol: f64) -> 
             let [Some(a), Some(b), Some(c)] = t.map(|i| i.checked_add(start)) else { return Err(bad(cmd, "the part has too many triangles")) };
             both.triangles.push([a, b, c]);
         }
-        Surface::from_mesh(&both).map_err(|e| cam_err(cmd, "the fixtures", e))?
+        (Surface::from_mesh(&both).map_err(|e| cam_err(cmd, "the fixtures", e))?, (!fixture_surface.is_empty()).then_some(fixture_surface))
     };
-    Ok(Surfaces { part: part_surface, all, notes })
+    Ok(Surfaces { part: part_surface, fixtures: fixture_surface, all, notes })
 }
 
 /// A number as the notes and messages show it.
@@ -807,6 +813,54 @@ fn common3(op: &Op3Spec) -> Common<'_> {
     }
 }
 
+fn name3_mut(op: &mut Op3Spec) -> &mut String {
+    match op {
+        Op3Spec::Adaptive(o) => &mut o.name,
+        Op3Spec::AdaptiveRoughing(o) => &mut o.name,
+        Op3Spec::Contour(o) => &mut o.name,
+        Op3Spec::Pocket(o) => &mut o.name,
+        Op3Spec::Parallel(o) => &mut o.name,
+        Op3Spec::Roughing(o) => &mut o.name,
+        Op3Spec::Waterline(o) => &mut o.name,
+        Op3Spec::Drill(o) => &mut o.name,
+        Op3Spec::Chamfer(o) => &mut o.name,
+        Op3Spec::Scallop(o) => &mut o.name,
+        Op3Spec::SteepShallow(o) => &mut o.name,
+        Op3Spec::Pencil(o) => &mut o.name,
+        Op3Spec::RestFinish(o) => &mut o.name,
+    }
+}
+
+/// The name of an operation that is not `indexed` (an `indexed_pattern` names its operations
+/// after its inner one).
+fn spec_name(spec: &OperationSpec) -> Option<&str> {
+    Some(match spec {
+        OperationSpec::Adaptive(o) => &o.name,
+        OperationSpec::AdaptiveRoughing(o) => &o.name,
+        OperationSpec::Contour(o) => &o.name,
+        OperationSpec::Pocket(o) => &o.name,
+        OperationSpec::Parallel(o) => &o.name,
+        OperationSpec::Roughing(o) => &o.name,
+        OperationSpec::Waterline(o) => &o.name,
+        OperationSpec::Drill(o) => &o.name,
+        OperationSpec::Scallop(o) => &o.name,
+        OperationSpec::SteepShallow(o) => &o.name,
+        OperationSpec::Pencil(o) => &o.name,
+        OperationSpec::RestFinish(o) => &o.name,
+        OperationSpec::RotaryFinish(o) => &o.name,
+        OperationSpec::RotaryRoughing(o) => &o.name,
+        OperationSpec::Wrap(o) => &o.name,
+        OperationSpec::Bore(o) => &o.name,
+        OperationSpec::ThreadMill(o) => &o.name,
+        OperationSpec::Face(o) => &o.name,
+        OperationSpec::Chamfer(o) => &o.name,
+        OperationSpec::WrapPocket(o) => &o.name,
+        OperationSpec::WrapContour(o) => &o.name,
+        OperationSpec::IndexedPattern(o) => common3(&o.operation).name,
+        OperationSpec::Indexed(_) => return None,
+    })
+}
+
 /// One operation planned: what the program holds, its poses in work coordinates (for the
 /// checks and the preview), and its report.
 struct Planned {
@@ -894,6 +948,9 @@ fn wrap_points(ctx: &Ctx<'_>, o: &crate::schema::cam::WrapOp) -> Result<Vec<Vec3
 }
 
 fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
+    if spec_name(spec).is_some_and(|n| n.trim().is_empty()) {
+        return Err(bad(ctx.cmd, "every operation needs a `name` (an `indexed` one may carry it on itself or on its inner `operation`)"));
+    }
     let machine = ctx.machine;
     let rotaries = machine.rotaries.len();
     let indexed = |op3: &Op3Spec, rotary: Vec<f64>, a_deg: Option<f64>| -> Result<Planned> {
@@ -944,7 +1001,14 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             max_tilt_deg: stats.max_tilt.to_degrees(),
             ..OperationReport::default()
         };
-        let op = Operation5 { name: c.name.into(), tool: r.tool.clone(), spindle_rpm: r.rpm, coolant: c.coolant, path: path.clone() };
+        let op = Operation5 {
+            name: c.name.into(),
+            tool: r.tool.clone(),
+            spindle_rpm: r.rpm,
+            coolant: c.coolant,
+            path: path.clone(),
+            plunge_feed: Some(r.feeds.plunge),
+        };
         Planned {
             op: MachineOperation::Continuous(op),
             poses: path,
@@ -970,12 +1034,21 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
         OperationSpec::Pencil(o) => indexed(&Op3Spec::Pencil(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::RestFinish(o) => indexed(&Op3Spec::RestFinish(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Indexed(o) => {
-            let name = common3(&o.operation).name;
+            // The inner operation's name, else the wrapper's.
+            let mut inner = (*o.operation).clone();
+            let inner_name = name3_mut(&mut inner);
+            if inner_name.trim().is_empty() {
+                match o.name.as_deref().filter(|n| !n.trim().is_empty()) {
+                    Some(n) => n.clone_into(inner_name),
+                    None => return Err(bad(ctx.cmd, "an `indexed` operation needs a `name`, on itself or on its inner `operation`")),
+                }
+            }
+            let name = common3(&inner).name;
             if rotaries != 1 {
                 return Err(ctx.bad(name, "an indexed operation's `a_deg` needs a machine with one rotary axis (`machine: \"4axis_a\"`)"));
             }
             let a = ctx.degrees(name, o.a_deg, "`a_deg`")?;
-            indexed(&o.operation, vec![a], Some(o.a_deg))
+            indexed(&inner, vec![a], Some(o.a_deg))
         }
         OperationSpec::RotaryFinish(o) => {
             let c = o.common();
@@ -1059,8 +1132,10 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
             }
             solidcraft_io::vfs::check(path).map_err(|e| EngineError::Other(e.to_string()))?;
         }
-        if output.is_some() && output == params.preview {
-            return Err(bad(cmd, "`output` and `preview` must be different files"));
+        if let (Some(o), Some(p)) = (&output, &params.preview)
+            && same_file(o, p)
+        {
+            return Err(bad(cmd, format!("`output` and `preview` must be different files (`{o}` and `{p}` are the same file)")));
         }
         sheet::distinct(cmd, output.as_deref(), params.preview.as_deref(), params.setup_sheet.as_deref())?;
     }
@@ -1123,7 +1198,13 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     }
 
     let program = MachineProgram { name: name.clone(), operations: planned.iter().map(|p| p.op.clone()).collect(), work_offset: job.work_offset };
-    let text = emit_program(&program, &post, &machine).map_err(|e| cam_err(cmd, "writing the program", e))?;
+    let (text, written) = emit_program_report(&program, &post, &machine).map_err(|e| cam_err(cmd, "writing the program", e))?;
+    // The rewinds' feeds are time at feed of their operations too, so the operations' minutes add
+    // up to the program's as read back.
+    for (p, w) in planned.iter_mut().zip(&written) {
+        p.report.cut_minutes += w.rewind_minutes;
+        p.report.rewinds = w.rewinds;
+    }
     let rb = readback_program(&text, &program, &post, &machine).map_err(|e| cam_err(cmd, "reading the program back", e))?;
     let machine_time = match &machine_rates {
         Some(r) => Some(rates::time_report(cmd, &text, &machine, &post, r)?),
@@ -1152,8 +1233,20 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
                 failures.push(format!("gouge: operation `{op}` cuts up to {} mm into the part or a fixture along {} moves", num(worst), hits.len()));
             }
         } else {
+            // Not against the part, but a fixture is never cut.
             gouge.skipped.push(op.clone());
-            p.report.warnings.push("not checked for gouges (`gouge_check: false`)".into());
+            p.report.warnings.push("not checked for gouges into the part (`gouge_check: false`); checked against the fixtures".into());
+            if let Some(fixtures) = &surfaces.fixtures {
+                let hits =
+                    tool_gouges(fixtures, &p.tool, &p.poses, tol, step).map_err(|e| cam_err(cmd, &format!("operation `{op}`: fixture check"), e))?;
+                let worst = hits.iter().map(|h| h.distance).fold(0.0, f64::max);
+                p.report.gouge = worst;
+                gouge.worst = gouge.worst.max(worst);
+                gouge.hits += hits.len();
+                if !hits.is_empty() {
+                    failures.push(format!("gouge: operation `{op}` cuts up to {} mm into a fixture along {} moves", num(worst), hits.len()));
+                }
+            }
         }
         if !p.tool.envelopes().is_empty() {
             let hits = holder_collisions(&surfaces.all, &p.tool, &p.poses, 0.0, step)
@@ -1217,6 +1310,13 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
 
+    // Said in a dry run too, before anything is written.
+    if let Some(path) = &output
+        && let Some(ext) = Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase())
+        && ext != post.base.extension.to_ascii_lowercase()
+    {
+        notes.push(format!("post `{post_name}` writes .{} files; this one is .{ext}", post.base.extension));
+    }
     let setup = sheet::build(&sheet::Inputs {
         name: &name,
         machine: &machine,
@@ -1240,11 +1340,6 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let mut outputs = Outputs::default();
     if !dry_run {
         if let Some(path) = &output {
-            if let Some(ext) = Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase())
-                && ext != post.base.extension.to_ascii_lowercase()
-            {
-                notes.push(format!("post `{post_name}` writes .{} files; this one is .{ext}", post.base.extension));
-            }
             solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
             outputs.gcode = Some(path.clone());
         }
@@ -1293,6 +1388,48 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         param_warnings: Vec::new(),
     };
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+/// `path` as one file is named whatever its spelling: absolute, its folder resolved (links,
+/// `.` and `..`) or the whole path if the file is there, `/` between parts, and on Windows
+/// without the dots and spaces it drops from the end of a name and in lower case, as its file
+/// names are not case-sensitive.
+fn file_key(path: &str) -> String {
+    let p = Path::new(path.trim());
+    let abs = if p.is_relative() { std::env::current_dir().map(|d| d.join(p)).unwrap_or_else(|_| p.to_path_buf()) } else { p.to_path_buf() };
+    let lexical = |q: &Path| {
+        let mut out = PathBuf::new();
+        for c in q.components() {
+            match c {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    };
+    let abs = lexical(&abs);
+    let key = match (abs.parent(), abs.file_name()) {
+        (Some(dir), Some(name)) => {
+            // Windows drops the dots and spaces at the end of a name (`a.tap.` opens `a.tap`).
+            let name = name.to_string_lossy();
+            let name = if cfg!(windows) { name.trim_end_matches(['.', ' ']) } else { &name };
+            // A file that is there already is named by itself (a link to it, a short name).
+            let joined = dir.join(name);
+            std::fs::canonicalize(&joined).unwrap_or_else(|_| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()).join(name))
+        }
+        _ => abs,
+    };
+    let text = key.to_string_lossy().replace('\\', "/");
+    let text = text.strip_prefix("//?/").map(str::to_string).unwrap_or(text);
+    if cfg!(windows) { text.to_lowercase() } else { text }
+}
+
+/// Whether two paths name the same file ([`file_key`]).
+fn same_file(a: &str, b: &str) -> bool {
+    file_key(a) == file_key(b)
 }
 
 /// `text` safe to put inside HTML.

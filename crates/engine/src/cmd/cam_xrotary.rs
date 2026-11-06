@@ -44,7 +44,7 @@ pub(super) fn plan_into(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5, plann
             for a in angles {
                 let mut op = (*o.operation).clone();
                 rename(&mut op, format!("{name} A{}", num(a)));
-                planned.push(plan(ctx, &OperationSpec::Indexed(IndexedOp { a_deg: a, operation: Box::new(op) }), arc_tol)?);
+                planned.push(plan(ctx, &OperationSpec::Indexed(IndexedOp { name: None, a_deg: a, operation: Box::new(op) }), arc_tol)?);
             }
         }
         _ => {
@@ -138,7 +138,14 @@ fn continuous(c: Common<'_>, r: Resolved, kind: &str, path: Toolpath5) -> Planne
         max_tilt_deg: stats.max_tilt.to_degrees(),
         ..OperationReport::default()
     };
-    let op = Operation5 { name: c.name.into(), tool: r.tool.clone(), spindle_rpm: r.rpm, coolant: c.coolant, path: path.clone() };
+    let op = Operation5 {
+        name: c.name.into(),
+        tool: r.tool.clone(),
+        spindle_rpm: r.rpm,
+        coolant: c.coolant,
+        path: path.clone(),
+        plunge_feed: Some(r.feeds.plunge),
+    };
     Planned {
         op: MachineOperation::Continuous(op),
         poses: path,

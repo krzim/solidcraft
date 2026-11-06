@@ -281,7 +281,7 @@ fn a_rotary_finish_on_a_cylinder_leaves_less_than_the_tolerance() {
     let path = rotary_finish(&part, &tool, &p).unwrap();
     let program = Program5 {
         name: "barrel".into(),
-        operations: vec![Operation5 { name: "finish".into(), tool: tool.clone(), spindle_rpm: 12000.0, coolant: false, path }],
+        operations: vec![Operation5 { name: "finish".into(), tool: tool.clone(), spindle_rpm: 12000.0, coolant: false, path, plunge_feed: None }],
         work_offset: None,
     };
     let machine = Machine::four_axis_a();
@@ -422,6 +422,7 @@ fn a_fifty_millimetre_part_at_a_twentieth_of_a_millimetre() {
             spindle_rpm: 18000.0,
             coolant: false,
             path: Toolpath5::from_3axis(&path, 0.001).unwrap(),
+            plunge_feed: None,
         }],
         work_offset: None,
     };
