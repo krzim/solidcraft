@@ -28,6 +28,8 @@ browser.move                      the browser tree: order, groups and folding
 browser.order                     the browser tree: order, groups and folding
 browser.rename_group              the browser tree: order, groups and folding
 browser.ungroup                   the browser tree: order, groups and folding
+cam.features                      CAM: reads the B-rep, builds no geometry (crates/engine/src/cmd/cam_tests.rs)
+cam.suggest                       CAM: proposes a job, builds no geometry (crates/engine/src/cmd/cam_tests.rs)
 canvas.calibrate                  reference images, and sketches traced from them (sketch only)
 canvas.decal                      reference images, and sketches traced from them (sketch only)
 canvas.delete                     reference images, and sketches traced from them (sketch only)

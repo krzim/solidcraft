@@ -631,6 +631,8 @@ struct Ctx<'a> {
     post: &'a Post5,
     /// Profiles, defaults, tool picks and structured refusals (`cam_agent.rs`).
     agent: &'a agent::Agent,
+    /// The part's machinable features, found when an operation names one (`cam_features.rs`).
+    features: &'a features::Lazy,
 }
 
 impl Ctx<'_> {
@@ -802,17 +804,37 @@ fn plan3_raw(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> R
         Op3Spec::AdaptiveRoughing(o) => adaptive::plan_roughing(ctx, o, surface).map(unmerged),
         Op3Spec::Contour(o) => {
             let c = o.common();
-            let regions = ctx.regions(c.name, o.sketch.as_ref(), o.profiles.as_deref(), o.polygon.as_deref(), frame)?;
-            let side = match o.side.unwrap_or(SideSpec::Outside) {
+            let (leave, tol) = (o.stock_to_leave.unwrap_or(0.0), ctx.tolerance(c.name, o.tolerance)?);
+            let side_of = |s: Option<SideSpec>| match s.unwrap_or(SideSpec::Outside) {
                 SideSpec::Outside => Side::Outside,
                 SideSpec::Inside => Side::Inside,
                 SideSpec::On => Side::On,
             };
-            let (leave, tol) = (o.stock_to_leave.unwrap_or(0.0), ctx.tolerance(c.name, o.tolerance)?);
-            let fit = |t: &Tool| agent::fits(&regions, t, leave, tol);
-            let region = if side == Side::Outside { agent::Region::Part } else { agent::Region::Floor(&regions) };
-            let h = agent::heights(ctx, c.name, o.heights.as_ref(), region, frame, tol)?;
-            let r = agent::resolve_for(ctx, &c, if side == Side::Inside { Some(&fit) } else { None }, Some(h.top - h.bottom))?;
+            // On a feature: its outline and heights (the side follows its kind). Else the
+            // sketch or polygon, with the heights and tool worked out from the part.
+            let (regions, h, r, side) = if o.feature.is_some() {
+                let r = ctx.resolve(&c)?;
+                let two = features::op_cut(
+                    ctx,
+                    c.name,
+                    o.sketch.as_ref(),
+                    o.profiles.as_deref(),
+                    o.polygon.as_deref(),
+                    o.feature.as_deref(),
+                    o.heights.as_ref(),
+                    frame,
+                    None,
+                )?;
+                (two.regions, two.heights, r, side_of(o.side.or(two.side)))
+            } else {
+                let regions = ctx.regions(c.name, o.sketch.as_ref(), o.profiles.as_deref(), o.polygon.as_deref(), frame)?;
+                let side = side_of(o.side);
+                let fit = |t: &Tool| agent::fits(&regions, t, leave, tol);
+                let region = if side == Side::Outside { agent::Region::Part } else { agent::Region::Floor(&regions) };
+                let h = agent::heights(ctx, c.name, o.heights.as_ref(), region, frame, tol)?;
+                let r = agent::resolve_for(ctx, &c, if side == Side::Inside { Some(&fit) } else { None }, Some(h.top - h.bottom))?;
+                (regions, h, r, side)
+            };
             let cut = Cut { heights: h, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
             let params = ContourParams {
                 side,
@@ -829,11 +851,28 @@ fn plan3_raw(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> R
         }
         Op3Spec::Pocket(o) => {
             let c = o.common();
-            let regions = ctx.regions(c.name, o.sketch.as_ref(), o.profiles.as_deref(), o.polygon.as_deref(), frame)?;
             let (leave, tol) = (o.stock_to_leave.unwrap_or(0.0), ctx.tolerance(c.name, o.tolerance)?);
-            let fit = |t: &Tool| agent::fits(&regions, t, leave, tol);
-            let h = agent::heights(ctx, c.name, o.heights.as_ref(), agent::Region::Floor(&regions), frame, tol)?;
-            let r = agent::resolve_for(ctx, &c, Some(&fit), Some(h.top - h.bottom))?;
+            let (regions, h, r) = if o.feature.is_some() {
+                let r = ctx.resolve(&c)?;
+                let two = features::op_cut(
+                    ctx,
+                    c.name,
+                    o.sketch.as_ref(),
+                    o.profiles.as_deref(),
+                    o.polygon.as_deref(),
+                    o.feature.as_deref(),
+                    o.heights.as_ref(),
+                    frame,
+                    Some(r.tool.radius()),
+                )?;
+                (two.regions, two.heights, r)
+            } else {
+                let regions = ctx.regions(c.name, o.sketch.as_ref(), o.profiles.as_deref(), o.polygon.as_deref(), frame)?;
+                let fit = |t: &Tool| agent::fits(&regions, t, leave, tol);
+                let h = agent::heights(ctx, c.name, o.heights.as_ref(), agent::Region::Floor(&regions), frame, tol)?;
+                let r = agent::resolve_for(ctx, &c, Some(&fit), Some(h.top - h.bottom))?;
+                (regions, h, r)
+            };
             let cut = Cut { heights: h, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
             let params = PocketParams {
                 stepover: or_tool(o.stepover, r.tool.stepover, r.tool.diameter * 0.4),
@@ -1157,8 +1196,14 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
     match spec {
         OperationSpec::Adaptive(o) => indexed(&Op3Spec::Adaptive(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::AdaptiveRoughing(o) => indexed(&Op3Spec::AdaptiveRoughing(o.clone()), vec![0.0; rotaries], None),
-        OperationSpec::Contour(o) => indexed(&Op3Spec::Contour(o.clone()), vec![0.0; rotaries], None),
-        OperationSpec::Pocket(o) => indexed(&Op3Spec::Pocket(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::Contour(o) => match features::op_index(ctx, &o.name, o.feature.as_deref())? {
+            Some((rotary, a)) => indexed(&Op3Spec::Contour(o.clone()), rotary, Some(a)),
+            None => indexed(&Op3Spec::Contour(o.clone()), vec![0.0; rotaries], None),
+        },
+        OperationSpec::Pocket(o) => match features::op_index(ctx, &o.name, o.feature.as_deref())? {
+            Some((rotary, a)) => indexed(&Op3Spec::Pocket(o.clone()), rotary, Some(a)),
+            None => indexed(&Op3Spec::Pocket(o.clone()), vec![0.0; rotaries], None),
+        },
         OperationSpec::Parallel(o) => indexed(&Op3Spec::Parallel(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Roughing(o) => indexed(&Op3Spec::Roughing(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Waterline(o) => indexed(&Op3Spec::Waterline(o.clone()), vec![0.0; rotaries], None),
@@ -1247,7 +1292,7 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
 }
 
 /// `cam.job`.
-fn job(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.job";
     let params: CamJobParams = parse(cmd, p, "")?;
     let dry_run = params.dry_run.unwrap_or(false);
@@ -1311,6 +1356,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
     }
 
+    let found = features::Lazy::new(job.bodies.clone(), job.fixtures.clone().unwrap_or_default(), origin, tol, &machine);
     let chord = tol * CHORD_SHARE;
     // How deep a cut into the tessellated part is allowed: the tolerance less what the
     // tessellation itself may be off by.
@@ -1329,6 +1375,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         chord,
         post: &post,
         agent: &agent,
+        features: &found,
     };
     let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
     // Arcs are followed far closer than the post's tolerance for the checks, so their chords
@@ -2001,6 +2048,8 @@ mod cam_stock;
 mod chamfer;
 #[path = "cam_drill.rs"]
 mod drill;
+#[path = "cam_features.rs"]
+pub(super) mod features;
 #[path = "cam_finish3d.rs"]
 mod finish3d;
 #[path = "cam_helical.rs"]
@@ -2013,6 +2062,8 @@ mod rates;
 mod sheet;
 #[path = "cam_sim.rs"]
 mod sim;
+#[path = "cam_suggest.rs"]
+pub(super) mod suggest;
 #[path = "cam_xrotary.rs"]
 mod xrotary;
 

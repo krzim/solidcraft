@@ -3273,7 +3273,11 @@ fn every_example_in_the_cam_jobs_doc_is_accepted() {
             // One operation of a job.
             serde_json::from_value::<crate::schema::cam::OperationSpec>(v).unwrap_or_else(|e| panic!("{e}: {block}"));
         } else {
-            serde_json::from_value::<crate::schema::cam::CamJobParams>(v).unwrap_or_else(|e| panic!("{e}: {block}"));
+            // `cam.job`'s parameters, else `cam.features`' or `cam.suggest`'s.
+            let job = serde_json::from_value::<crate::schema::cam::CamJobParams>(v.clone()).map(|_| ());
+            let features = || serde_json::from_value::<crate::schema::cam_features::CamFeaturesParams>(v.clone()).map(|_| ());
+            let suggest = || serde_json::from_value::<crate::schema::cam_features::CamSuggestParams>(v.clone()).map(|_| ());
+            job.or_else(|_| features()).or_else(|_| suggest()).unwrap_or_else(|e| panic!("{e}: {block}"));
         }
     }
     assert!(jobs >= 1);
@@ -3818,4 +3822,448 @@ fn omitted_heights_start_at_the_stocks_top() {
     let h = ["clearance", "retract", "top", "bottom"].map(|k| d[k].as_f64().unwrap());
     assert!(h.iter().zip([32.0, 24.0, 22.0, 15.0]).all(|(a, b)| (a - b).abs() < 1e-6), "{h:?} {r}");
     assert!(d["why"].as_str().unwrap().contains("stock's top"), "{r}");
+}
+
+// Machinable features (`cam.features`) and job suggestions (`cam.suggest`).
+
+/// A plate 80 × 60 × 10, its top at Z 0, with a 40 × 24 pocket 5 deep whose corners are
+/// rounded to 4 mm and a round island of radius 4 standing in it up to the top, two through
+/// holes of diameter 6 at y = -22 and two blind holes of diameter 4, 6 deep, at y = 22.
+fn feature_plate() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 80, "width": 60, "height": 10, "corner": [-40, -30, -10], "body_name": "Plate"}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 24, "height": 6, "corner": [-20, -12, -5], "operation": "cut"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[20, 12, -2.5], [-20, 12, -2.5], [-20, -12, -2.5], [20, -12, -2.5]], "radius": 4}));
+    run(&mut s, "solid.cylinder", json!({"radius": 4, "height": 5, "base": [0, 0, -5], "operation": "join"}));
+    for x in [-32.0, 32.0] {
+        run(&mut s, "solid.cylinder", json!({"radius": 3, "height": 12, "base": [x, -22, -11], "operation": "cut"}));
+        run(&mut s, "solid.cylinder", json!({"radius": 2, "height": 7, "base": [x, 22, -6], "operation": "cut"}));
+    }
+    s
+}
+
+/// A bar 60 × 20 × 20 along X about the X axis with a 12 × 8 pocket 4 deep in each of its
+/// +Z, +Y, -Z and -Y faces, at different places along X.
+fn pocketed_bar() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 20, "height": 20, "corner": [-30, -10, -10], "body_name": "Bar"}));
+    for (corner, size) in [
+        ([-26.0, -4.0, 6.0], [12.0, 8.0, 5.0]),
+        ([-12.0, 6.0, -4.0], [12.0, 5.0, 8.0]),
+        ([2.0, -4.0, -11.0], [12.0, 8.0, 5.0]),
+        ([16.0, -11.0, -4.0], [12.0, 5.0, 8.0]),
+    ] {
+        run(&mut s, "solid.box", json!({"length": size[0], "width": size[1], "height": size[2], "corner": corner, "operation": "cut"}));
+    }
+    s
+}
+
+fn feature_tools() -> Value {
+    json!([flat(6, 6.0), flat(4, 4.0), flat(2, 2.0), ball(12, 4.0)])
+}
+
+fn near(v: &Value, want: f64) -> bool {
+    v.as_f64().is_some_and(|x| (x - want).abs() < 1e-6)
+}
+
+fn ids(list: &Value) -> Vec<String> {
+    list.as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn features_of_a_plate_are_read_exactly_from_its_faces() {
+    let mut s = feature_plate();
+    let f = run(&mut s, "cam.features", json!({}));
+    // Holes, by position: the two through holes of 6 mm first (y = -22), then the blind 4 mm ones.
+    let holes = f["holes"].as_array().unwrap();
+    assert_eq!(holes.len(), 4, "{f}");
+    let want = [(-32.0, -22.0, 6.0, true), (32.0, -22.0, 6.0, true), (-32.0, 22.0, 4.0, false), (32.0, 22.0, 4.0, false)];
+    for (h, (x, y, d, through)) in holes.iter().zip(want) {
+        assert!(near(&h["center"][0], x) && near(&h["center"][1], y), "{h}");
+        assert!(near(&h["diameter"], d) && near(&h["top_z"], 0.0), "{h}");
+        assert_eq!(h["through"], through, "{h}");
+        if through {
+            assert!(near(&h["bottom_z"], -10.0) && near(&h["depth"], 10.0) && h["floor"] == "through", "{h}");
+        } else {
+            assert!(near(&h["bottom_z"], -6.0) && near(&h["depth"], 6.0) && h["floor"] == "flat", "{h}");
+        }
+        assert!(h.get("counterbore").is_none() && h.get("a_deg").is_none(), "{h}");
+    }
+    assert_eq!(ids(&f["holes"]), ["hole:0", "hole:1", "hole:2", "hole:3"]);
+    let groups = f["hole_groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{f}");
+    assert!(near(&groups[0]["diameter"], 6.0) && groups[0]["count"] == 2 && groups[0]["ids"] == json!(["hole:0", "hole:1"]), "{f}");
+    assert!(near(&groups[1]["diameter"], 4.0) && groups[1]["count"] == 2 && groups[1]["through"] == false, "{f}");
+    // The pocket: its floor, depth, rounded corners and island.
+    let pockets = f["pockets"].as_array().unwrap();
+    assert_eq!(pockets.len(), 1, "{f}");
+    let p = &pockets[0];
+    assert_eq!(p["id"], "pocket:0");
+    assert!(near(&p["floor_z"], -5.0) && near(&p["top_z"], 0.0) && near(&p["depth"], 5.0), "{p}");
+    assert!(near(&p["min_corner_radius"], 4.0) && p["sharp_corners"] == 0 && p["walls_vertical"] == true, "{p}");
+    assert_eq!(p["bounds"], json!([[-20.0, -12.0], [20.0, 12.0]]), "{p}");
+    let islands = p["islands"].as_array().unwrap();
+    assert_eq!(islands.len(), 1, "{p}");
+    assert!(near(&islands[0]["top_z"], 0.0), "{p}");
+    let island_area = std::f64::consts::PI * 16.0;
+    assert!((islands[0]["area"].as_f64().unwrap() - island_area).abs() < 0.05, "{p}");
+    // The rounded rectangle less the island.
+    let want = 40.0 * 24.0 - (4.0 - std::f64::consts::PI) * 16.0 - island_area;
+    assert!((p["area"].as_f64().unwrap() - want).abs() < 0.1, "{p}");
+    // The faces facing up, and the one outer profile (the island's top is not one).
+    let faces = f["faces"].as_array().unwrap();
+    let role = |r: &str| faces.iter().filter(|x| x["role"] == r).count();
+    assert_eq!((role("top"), role("island_top"), role("pocket_floor"), role("hole_floor")), (1, 1, 1, 2), "{f}");
+    let floor = faces.iter().find(|x| x["role"] == "pocket_floor").unwrap();
+    assert_eq!(floor["pocket"], "pocket:0");
+    assert_eq!(p["face_id"], floor["id"]);
+    let profiles = f["profiles"].as_array().unwrap();
+    assert_eq!(profiles.len(), 1, "{f}");
+    assert!(near(&profiles[0]["top_z"], 0.0) && near(&profiles[0]["bottom_z"], -10.0), "{f}");
+    assert_eq!(profiles[0]["bounds"], json!([[-40.0, -30.0], [40.0, 30.0]]), "{f}");
+    assert!(profiles[0].get("min_concave_radius").is_none(), "a rectangle has no notches: {f}");
+    assert!(f["fillets"].as_array().unwrap().is_empty() && f["surfaces"].as_array().unwrap().is_empty(), "{f}");
+    let setup = &f["setups"][0];
+    assert!(near(&setup["top_z"], 0.0) && near(&setup["bottom_z"], -10.0) && near(&setup["a_deg"], 0.0), "{f}");
+    // The same part gives the same ids and numbers, run again or built again.
+    assert_eq!(f, run(&mut s, "cam.features", json!({})));
+    assert_eq!(f, run(&mut feature_plate(), "cam.features", json!({})));
+}
+
+#[test]
+fn features_of_a_bar_on_a_4th_axis_carry_the_a_angle_that_brings_them_up() {
+    let mut s = pocketed_bar();
+    let f = run(&mut s, "cam.features", json!({"axis": "a"}));
+    let pockets = f["pockets"].as_array().unwrap();
+    assert_eq!(pockets.len(), 4, "{f}");
+    // Each pocket's floor is 6 from the axis in its own setup, 4 below the face round it.
+    let mut by_x: Vec<(f64, f64)> = Vec::new();
+    for p in pockets {
+        assert!(near(&p["floor_z"], 6.0) && near(&p["top_z"], 10.0) && near(&p["depth"], 4.0), "{p}");
+        assert!(near(&p["min_corner_radius"], 0.0) && p["sharp_corners"] == 4, "{p}");
+        let x = (p["bounds"][0][0].as_f64().unwrap() + p["bounds"][1][0].as_f64().unwrap()) * 0.5;
+        by_x.push((x, p["a_deg"].as_f64().unwrap()));
+    }
+    by_x.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let angles: Vec<f64> = by_x.iter().map(|(_, a)| *a).collect();
+    assert!(angles[0].abs() < 1e-6, "+Z: {by_x:?}");
+    assert!((angles[1] - 90.0).abs() < 1e-6, "+Y: {by_x:?}");
+    assert!((angles[2].abs() - 180.0).abs() < 1e-6, "-Z: {by_x:?}");
+    assert!((angles[3] + 90.0).abs() < 1e-6, "-Y: {by_x:?}");
+    // The A = 0 setup is first; every setup lists its pocket.
+    let setups = f["setups"].as_array().unwrap();
+    assert!(near(&setups[0]["a_deg"], 0.0), "{f}");
+    for p in pockets {
+        let a = p["a_deg"].as_f64().unwrap();
+        let su = setups.iter().find(|su| near(&su["a_deg"], a)).unwrap();
+        assert!(su["features"].as_array().unwrap().contains(&p["id"]), "{su}");
+        assert!(near(&su["top_z"], 10.0) && (su["swing_radius"].as_f64().unwrap() - 200f64.sqrt()).abs() < 1e-6, "{su}");
+    }
+    // A 3-axis look sees the +Z pocket only, with the id it has on the 4th axis.
+    let z = run(&mut s, "cam.features", json!({}));
+    assert_eq!(ids(&z["pockets"]), ["pocket:0"]);
+    assert_eq!(z["pockets"][0]["bounds"], pockets[0]["bounds"]);
+    assert_eq!(f, run(&mut s, "cam.features", json!({"axis": "a"})));
+}
+
+#[test]
+fn a_pocket_names_its_feature_and_takes_its_heights_from_it() {
+    let mut s = feature_plate();
+    let job =
+        |ops: Value| json!({"job": {"machine": "3axis", "post": "linuxcnc_4axis", "tools": feature_tools(), "operations": ops}, "dry_run": true});
+    // What an agent writes: the feature and a tool, nothing else.
+    let ops = json!([
+        {"name": "pocket", "type": "pocket", "feature": "pocket:0", "tool": 6, "stepover": 2},
+        {"name": "walls", "type": "contour", "feature": "pocket:0", "tool": 6},
+        {"name": "hole", "type": "pocket", "feature": "hole:0", "tool": 4}
+    ]);
+    let r = run(&mut s, "cam.job", job(ops));
+    assert_clean(&r);
+    assert!(r["operations"].as_array().unwrap().iter().all(|o| o["moves"].as_u64().is_some_and(|m| m > 4)), "{r}");
+    // A pocket cut from a polygon works out the heights it leaves out from the part (the
+    // machine profiles' heights); this triangle is too small for the 6 mm tool, and the fix
+    // says which fits.
+    let poly = json!([{"name": "p", "type": "pocket", "tool": 6, "polygon": [[-5, -5], [5, -5], [5, 5]], "heights": {"top": 0}}]);
+    let e = s.execute("cam.job", &job(poly)).unwrap_err();
+    assert!(e.to_string().contains("does not fit") && e.to_string().contains("max_diameter"), "{e}");
+    // A feature that is not there says which there are.
+    let e = s.execute("cam.job", &job(json!([{"name": "p", "type": "pocket", "feature": "pocket:4", "tool": 6}]))).unwrap_err();
+    assert!(e.to_string().contains("this part has only `pocket:0`"), "{e}");
+    let e = s.execute("cam.job", &job(json!([{"name": "p", "type": "pocket", "feature": "fillet:0", "tool": 6}]))).unwrap_err();
+    assert!(e.to_string().contains("ids are kind:number"), "{e}");
+    let e = s.execute("cam.job", &job(json!([{"name": "p", "type": "pocket", "feature": "face:0", "tool": 6}]))).unwrap_err();
+    assert!(e.to_string().contains("give `heights.top`"), "the top face has no depth: {e}");
+    let both = json!([{"name": "p", "type": "pocket", "feature": "pocket:0", "polygon": [[0, 0], [1, 0], [0, 1]], "tool": 6}]);
+    let e = s.execute("cam.job", &job(both)).unwrap_err();
+    assert!(e.to_string().contains("one of them"), "{e}");
+    // On the bar, a pocket on the +Y side is indexed to A = 90° by itself; inside an `indexed`
+    // operation at another angle it is refused with the angle to use.
+    let mut bar = pocketed_bar();
+    let f = run(&mut bar, "cam.features", json!({"axis": "a"}));
+    let side = f["pockets"].as_array().unwrap().iter().find(|p| near(&p["a_deg"], 90.0)).unwrap()["id"].as_str().unwrap().to_string();
+    let job4 =
+        |ops: Value| json!({"job": {"machine": "4axis_a", "post": "linuxcnc_4axis", "tools": feature_tools(), "operations": ops}, "dry_run": true});
+    let r = run(&mut bar, "cam.job", job4(json!([{"name": "side", "type": "pocket", "feature": side, "tool": 4}])));
+    assert_clean(&r);
+    assert_eq!(r["operations"][0]["kind"], "indexed pocket", "{r}");
+    assert!(near(&r["operations"][0]["a_deg"], 90.0), "{r}");
+    let wrong = json!([{"type": "indexed", "a_deg": 0, "operation": {"name": "side", "type": "pocket", "feature": side, "tool": 4}}]);
+    let e = bar.execute("cam.job", &job4(wrong)).unwrap_err();
+    assert!(e.to_string().contains("`a_deg: 90`"), "{e}");
+}
+
+#[test]
+fn a_suggested_job_passes_its_checks_on_a_plate_and_a_bar() {
+    // The plate: faced, pocket roughed and finished, holes milled, profile cut, all checked.
+    let mut s = feature_plate();
+    let sug = run(&mut s, "cam.suggest", json!({"tools": feature_tools()}));
+    let ops = sug["operations"].as_array().unwrap();
+    let names: Vec<&str> = ops.iter().map(|o| o["name"].as_str().unwrap()).collect();
+    assert_eq!(names.first(), Some(&"face top"), "{sug}");
+    assert_eq!(names.last(), Some(&"profile profile:0"), "the profile is cut last: {sug}");
+    assert!(names.contains(&"rough pocket:0") && names.contains(&"finish pocket:0 walls"), "{sug}");
+    assert_eq!(names.iter().filter(|n| n.starts_with("mill hole:")).count(), 4, "{sug}");
+    assert!(ops.iter().all(|o| o["type"] == "pocket" || o["type"] == "contour"), "{sug}");
+    // Tools by size: the 6 mm tool fits the 4 mm corners, the holes take 4 and 2 mm tools.
+    let tool_of = |name: &str| ops.iter().find(|o| o["name"] == name).unwrap()["tool"].as_u64().unwrap();
+    assert_eq!((tool_of("rough pocket:0"), tool_of("finish pocket:0 walls"), tool_of("profile profile:0")), (6, 6, 6), "{sug}");
+    assert_eq!((tool_of("mill hole:0"), tool_of("mill hole:2")), (4, 2), "{sug}");
+    assert!(sug["assumptions"].as_array().unwrap().len() >= 4 && !sug["check"].as_array().unwrap().is_empty(), "{sug}");
+    let job = sug["job"].clone();
+    assert!(job["tools"].as_array().unwrap().iter().all(|t| t["number"] != 12), "the ball is not used: {job}");
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    assert_eq!(r["operations"].as_array().unwrap().len(), names.len(), "{r}");
+    // With `check`, the dry run comes back with the suggestion.
+    let checked = run(&mut s, "cam.suggest", json!({"tools": feature_tools(), "check": true}));
+    assert_eq!(checked["dry_run"]["passed"], true, "{checked}");
+    assert_eq!(checked["job"], sug["job"], "the same part gives the same job");
+
+    // The bar on a 4th axis: each pocket indexed to its side, roughed and finished.
+    let mut bar4 = pocketed_bar();
+    let sug = run(&mut bar4, "cam.suggest", json!({"tools": feature_tools(), "axis": "a"}));
+    let job = sug["job"].clone();
+    assert_eq!(job["machine"], "4axis_a", "{job}");
+    let indexed = job["operations"].as_array().unwrap().iter().filter(|o| o["a_deg"].is_number()).count();
+    assert_eq!(indexed, 6, "rough and finish on the three sides other than A = 0: {job}");
+    let r = run(&mut bar4, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    let sides: std::collections::BTreeSet<i64> =
+        r["operations"].as_array().unwrap().iter().map(|o| o["a_deg"].as_f64().unwrap_or(0.0).round() as i64).collect();
+    assert_eq!(sides.len(), 4, "{r}");
+    // A round bar's diameter is turned with a rotary finish.
+    let mut round = bar();
+    let f = run(&mut round, "cam.features", json!({"axis": "a"}));
+    assert_eq!(f["turned"].as_array().unwrap().len(), 1, "{f}");
+    let t = &f["turned"][0];
+    assert!(near(&t["diameter"], 20.0) && near(&t["x_min"], -20.0) && near(&t["x_max"], 20.0), "{f}");
+    let sug = run(&mut round, "cam.suggest", json!({"tools": feature_tools(), "axis": "a", "check": true}));
+    assert_eq!(sug["dry_run"]["passed"], true, "{sug}");
+    assert!(sug["operations"].as_array().unwrap().iter().any(|o| o["type"] == "rotary_finish"), "{sug}");
+}
+
+#[test]
+fn feature_and_suggest_refusals_say_what_to_change() {
+    let mut s = feature_plate();
+    let dir = Dir::new("suggest");
+    let cases = [
+        (json!({"axis": "b"}), "axis"),
+        (json!({"tolerance": 0}), "tolerance"),
+        (json!({"origin": [1e308, 0, 0]}), "origin"),
+        (json!({"bodies": ["Plat"]}), "did you mean `Plate`"),
+        (json!({"bodies": []}), "no body to machine"),
+        (json!({"bodies": ["Plate", "Plate"]}), "twice"),
+    ];
+    for (p, word) in cases {
+        let e = s.execute("cam.features", &p).unwrap_err();
+        assert!(e.to_string().contains(word), "{p}: {e}");
+    }
+    let lib = dir.file("lib.json");
+    std::fs::write(&lib, json!([ball(12, 4.0), {"number": 9, "kind": "laser", "diameter": 1, "flute_length": 1}]).to_string()).unwrap();
+    let profile = dir.file("mill.profile.json");
+    std::fs::write(&profile, json!({"tool_library_path": "lib.json", "machine": "3axis", "spindel": 1}).to_string()).unwrap();
+    let three = dir.file("three.profile.json");
+    std::fs::write(&three, json!({"tools": feature_tools(), "machine": "3axis"}).to_string()).unwrap();
+    let cases = [
+        (json!({}), "one way"),
+        (json!({"tools": feature_tools(), "tool_library_path": lib}), "one way"),
+        (json!({"tool_library_path": lib}), "no flat end mill"),
+        (json!({"profile_path": profile}), "unknown key `spindel`"),
+        (json!({"tools": feature_tools(), "stock_top": 50}), "stock_top"),
+        (json!({"profile_path": three, "axis": "a"}), "rotary axis about X"),
+        (json!({"tools": [{"number": 1, "kind": "flat_endmill", "diameter": 4, "flute_length": 10}]}), "no `spindle_rpm`"),
+    ];
+    for (p, word) in cases {
+        match s.execute("cam.suggest", &p) {
+            Err(EngineError::Internal(_, msg)) => panic!("{p}: panicked: {msg}"),
+            Err(e) => assert!(e.to_string().contains(word), "{p}: {e}"),
+            Ok(v) => panic!("{p}: accepted: {v}"),
+        }
+    }
+    // A profile file names its tools beside it; a tool it cannot use is listed, not fatal.
+    std::fs::write(&lib, json!([flat(6, 6.0), flat(2, 2.0), {"number": 9, "kind": "laser", "diameter": 1, "flute_length": 1}]).to_string()).unwrap();
+    std::fs::write(&profile, json!({"tool_library_path": "lib.json", "machine": "3axis", "post": "grblhal_4axis"}).to_string()).unwrap();
+    let sug = run(&mut s, "cam.suggest", json!({"profile_path": profile, "stock_top": 0}));
+    assert_eq!(sug["job"]["post"], "grblhal_4axis", "{sug}");
+    assert!(sug["skipped"].as_array().unwrap().iter().any(|x| x.as_str().unwrap().starts_with("tool 9 not used")), "{sug}");
+    assert!(!sug["operations"].as_array().unwrap().iter().any(|o| o["name"] == "face top"), "nothing to face: {sug}");
+    // A hole no tool fits is skipped with the reason.
+    let sug = run(&mut s, "cam.suggest", json!({"tools": [flat(6, 6.0)]}));
+    assert!(sug["skipped"].as_array().unwrap().iter().any(|x| x.as_str().unwrap().starts_with("hole:0 (diameter 6 mm)")), "{sug}");
+}
+
+// Review of the features and suggestions: defaults that misled an agent or slipped past a check.
+
+/// A block 60 × 40 × 10, its top at Z 0, with a 30 × 20 pocket 5 deep and a round island of
+/// radius 4 standing in it up to the top, rounded 1 mm where it meets the floor.
+fn filleted_island() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10, "corner": [-30, -20, -10], "body_name": "Block"}));
+    run(&mut s, "solid.box", json!({"length": 30, "width": 20, "height": 6, "corner": [-15, -10, -5], "operation": "cut"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 4, "height": 5, "base": [0, 0, -5], "operation": "join"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[4, 0, -5]], "radius": 1}));
+    s
+}
+
+/// A block 60 × 40 × 10, its top at Z 0, with a round pocket of radius 10, 5 deep, rounded
+/// 1.5 mm where its wall meets its floor.
+fn filleted_pocket() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10, "corner": [-30, -20, -10], "body_name": "Block"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 6, "base": [0, 0, -5], "operation": "cut"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[10, 0, -5]], "radius": 1.5}));
+    s
+}
+
+/// The highest Z a program moves to.
+fn max_z(text: &str) -> f64 {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('('))
+        .flat_map(|l| l.split_whitespace())
+        .filter_map(|w| w.strip_prefix('Z'))
+        .filter_map(|v| v.parse::<f64>().ok())
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+#[test]
+fn a_wall_rounded_at_its_foot_still_rises_to_its_top() {
+    // The island's wall starts on a round, not on the floor: its top is still the island's.
+    let mut s = filleted_island();
+    let f = run(&mut s, "cam.features", json!({}));
+    let p = &f["pockets"][0];
+    assert!(near(&p["top_z"], 0.0) && near(&p["floor_z"], -5.0), "{p}");
+    let islands = p["islands"].as_array().unwrap();
+    assert_eq!(islands.len(), 1, "{p}");
+    assert!(near(&islands[0]["top_z"], 0.0), "the island stands up to the top, not to its round: {p}");
+    // So the suggested job does not cut the island down to the top of its round.
+    let sug = run(&mut s, "cam.suggest", json!({"tools": feature_tools()}));
+    assert!(!sug["operations"].as_array().unwrap().iter().any(|o| o["name"].as_str().unwrap().contains("band")), "{sug}");
+    let r = run(&mut s, "cam.job", json!({"job": sug["job"], "dry_run": true}));
+    assert_clean(&r);
+    // A pocket rounded where its wall meets its floor is as deep as its rim, and its walls are
+    // not upright: the 2D pocket on the floor's outline does not reach them, and the reply says so.
+    let mut s = filleted_pocket();
+    let f = run(&mut s, "cam.features", json!({}));
+    let p = f["pockets"].as_array().unwrap().iter().find(|p| near(&p["floor_z"], -5.0)).cloned().unwrap_or_else(|| panic!("{f}"));
+    assert!(near(&p["top_z"], 0.0) && near(&p["depth"], 5.0), "{p}");
+    assert_eq!(p["walls_vertical"], false, "{p}");
+    // Its round wall is a hole whose floor is the round: blind, not a hole coming out at the
+    // round's top because the axis below it is air.
+    let holes = f["holes"].as_array().unwrap();
+    assert_eq!(holes.len(), 1, "{f}");
+    assert!(holes[0]["through"] == false && holes[0]["floor"] == "round" && near(&holes[0]["bottom_z"], -3.5), "{f}");
+    let sug = run(&mut s, "cam.suggest", json!({"tools": feature_tools()}));
+    let id = p["id"].as_str().unwrap();
+    let said = sug["check"].as_array().unwrap().iter().any(|c| c.as_str().unwrap().contains(id) && c.as_str().unwrap().contains("not upright"));
+    assert!(said, "{sug}");
+}
+
+#[test]
+fn heights_left_to_a_feature_follow_the_ones_given() {
+    let mut s = feature_plate();
+    let f = run(&mut s, "cam.features", json!({}));
+    let top = f["faces"].as_array().unwrap().iter().find(|x| x["role"] == "top").unwrap()["id"].as_str().unwrap().to_string();
+    let job =
+        |ops: Value| json!({"job": {"machine": "3axis", "post": "linuxcnc_4axis", "tools": feature_tools(), "operations": ops}, "dry_run": true});
+    // Stock 5 mm above the top, as the refusal for the top face asks: the retract and clearance
+    // left out go above it, not 3 and 10 mm above the part.
+    let r = run(&mut s, "cam.job", job(json!([{"name": "face", "type": "pocket", "feature": top, "tool": 6, "heights": {"top": 5}}])));
+    assert_clean(&r);
+    let r = run(&mut s, "cam.job", job(json!([{"name": "deep", "type": "pocket", "feature": "pocket:0", "tool": 6, "heights": {"retract": 20}}])));
+    assert_clean(&r);
+    // Heights given out of order name the values and which were given.
+    let wrong = json!([{"name": "p", "type": "pocket", "feature": "pocket:0", "tool": 6, "heights": {"clearance": 5, "retract": 8}}]);
+    let e = s.execute("cam.job", &job(wrong)).unwrap_err().to_string();
+    assert!(e.contains("clearance 5 (given)") && e.contains("retract 8 (given)"), "{e}");
+}
+
+#[test]
+fn facing_the_top_face_reaches_its_edges() {
+    let mut s = feature_plate();
+    let dir = Dir::new("face-top");
+    let f = run(&mut s, "cam.features", json!({}));
+    let top = f["faces"].as_array().unwrap().iter().find(|x| x["role"] == "top").unwrap()["id"].as_str().unwrap().to_string();
+    let out = dir.file("face.ngc");
+    let job = json!({"machine": "3axis", "post": "linuxcnc_4axis", "tools": feature_tools(),
+        "operations": [{"name": "face", "type": "pocket", "feature": top, "tool": 6, "heights": {"top": 1}}]});
+    let r = run(&mut s, "cam.job", json!({"job": job, "output": out}));
+    assert_clean(&r);
+    let c = run(&mut s, "cam.check", json!({"path": out}));
+    // The 6 mm tool's centre goes out to the plate's edges (80 × 60), so its edge passes them.
+    let b = &c["bounds"];
+    assert!(b[0][0].as_f64().unwrap() <= -40.0 && b[1][0].as_f64().unwrap() >= 40.0, "{c}");
+    assert!(b[0][1].as_f64().unwrap() <= -30.0 && b[1][1].as_f64().unwrap() >= 30.0, "{c}");
+}
+
+#[test]
+fn default_heights_clear_the_fixtures() {
+    // A clamp 25 mm tall beside the plate: travel between cuts goes over it.
+    let mut s = feature_plate();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 35, "corner": [45, -10, -10], "body_name": "Clamp"}));
+    let dir = Dir::new("fixture");
+    let out = dir.file("pocket.ngc");
+    let job = json!({"machine": "3axis", "post": "linuxcnc_4axis", "tools": feature_tools(), "fixtures": ["Clamp"],
+        "operations": [{"name": "pocket", "type": "pocket", "feature": "pocket:0", "tool": 6}]});
+    let r = run(&mut s, "cam.job", json!({"job": job, "output": out}));
+    assert_clean(&r);
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(max_z(&text) >= 30.0 - 1e-6, "the clearance must be above the clamp's top (25): {}", max_z(&text));
+}
+
+#[test]
+fn a_feature_id_from_another_axis_says_which_axis_the_job_uses() {
+    let mut s = pocketed_bar();
+    let job = json!({"job": {"machine": "3axis", "post": "linuxcnc_4axis", "tools": feature_tools(),
+        "operations": [{"name": "p", "type": "pocket", "feature": "pocket:2", "tool": 4}]}, "dry_run": true});
+    let e = s.execute("cam.job", &job).unwrap_err().to_string();
+    assert!(e.contains("along Z") && e.contains("4axis_a"), "{e}");
+}
+
+#[test]
+fn a_profile_names_its_machine_file_beside_it() {
+    let mut s = feature_plate();
+    let dir = Dir::new("profile-machine");
+    let machine = json!({"name": "Mill with A", "rotaries": [{"letter": "A", "direction": [1, 0, 0], "center": [0, 0, 0], "carrier": "table",
+        "limits": [-std::f64::consts::TAU, std::f64::consts::TAU]}], "work_origin": [0, 0, 0]});
+    std::fs::write(dir.file("mill.machine.json"), machine.to_string()).unwrap();
+    let profile = dir.file("mill.profile.json");
+    let with_file = json!({"tools": feature_tools(), "machine_path": "mill.machine.json", "post": "linuxcnc_4axis"});
+    std::fs::write(&profile, with_file.to_string()).unwrap();
+    let sug = run(&mut s, "cam.suggest", json!({"profile_path": profile, "check": true}));
+    assert_eq!(sug["job"]["machine"]["name"], "Mill with A", "{sug}");
+    assert_eq!(sug["dry_run"]["passed"], true, "{sug}");
+    let both = json!({"tools": feature_tools(), "machine_path": "mill.machine.json", "machine": "3axis"});
+    std::fs::write(&profile, both.to_string()).unwrap();
+    let e = s.execute("cam.suggest", &json!({"profile_path": profile})).unwrap_err().to_string();
+    assert!(e.contains("`machine` or `machine_path`"), "{e}");
+}
+
+#[test]
+fn a_hole_left_out_says_what_tool_to_add_not_an_operation_that_is_not_there() {
+    let mut s = feature_plate();
+    let drill = json!({"number": 60, "kind": "drill", "diameter": 6, "flute_length": 30, "spindle_rpm": 3000, "feed": 300});
+    let sug = run(&mut s, "cam.suggest", json!({"tools": [flat(6, 6.0), drill]}));
+    let why = sug["skipped"].as_array().unwrap().iter().filter_map(Value::as_str).find(|x| x.starts_with("hole:0 ")).unwrap_or_default().to_string();
+    assert!(why.contains("(4.8 mm)") && why.contains("\"feature\": \"hole:0\""), "{sug}");
+    assert!(why.contains("no drilling operation") && !why.contains("drill it with"), "{why}");
 }
