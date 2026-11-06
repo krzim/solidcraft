@@ -120,10 +120,13 @@ is; the reply's notes say so.
 
 ### Tools
 
-`number`, `kind` (`flat_endmill`, `ball_endmill`, `bull_nose`, `drill`), `diameter`,
-`flute_length`, and optional `description`, `flutes`, `spindle_rpm`, `feed`, `plunge_feed`,
-`stepdown`, `stepover`, `corner_radius` (bull nose), `shank_diameter`, `stickout`, `holder:
-[{diameter, length}]`, `point_angle_deg` (a drill's point, default 118). An operation without `spindle_rpm` or `feeds` takes the tool's; its
+`number`, `kind` (`flat_endmill`, `ball_endmill`, `bull_nose`, `drill`, `thread_mill`),
+`diameter`, `flute_length`, and optional `description`, `flutes`, `spindle_rpm`, `feed`,
+`plunge_feed`, `stepdown`, `stepover`, `corner_radius` (bull nose), `shank_diameter`,
+`stickout`, `holder: [{diameter, length}]`, `point_angle_deg` (a drill's point, default 118),
+and for a thread mill `thread_pitch` and `tooth_height` (see
+[Helical bores and thread milling](#helical-bores-and-thread-milling)). An operation without
+`spindle_rpm` or `feeds` takes the tool's; its
 stepdown and stepover default to the tool's too.
 
 ### Operations
@@ -143,6 +146,8 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `indexed` | `a_deg` and `operation`: any of the six above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
 | `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}` or `{type: "helix", pitch}`; `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
 | `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
+| `bore` | `sketch` (its circles) + `diameter_range?: [min, max]` or `holes: [{center: [x, y], diameter}]`; `heights` (`top` the hole's top, `bottom` its floor); `pitch` or `ramp_angle_deg` (2, the pitch at most `stepdown`: the tool's, else 10% of its diameter); `stepover` (between rings; the tool's, else 40% of its diameter); `climb` (true); `finish_passes` (0); `stock_to_leave` (0.1 with finishing passes, else 0) |
+| `thread_mill` | `sketch` (its circles' centres) + `diameter_range?` or `centers: [[x, y], …]`; `heights` (the thread from `top` down to `bottom`); `pitch`; `thread_diameter` (the major, nominal diameter); `internal` (true); `right_hand` (true); `climb` (true); `thread_depth` (ISO metric: 0.5413 × pitch inside, 0.6134 × pitch outside); `radial_passes` (1); `spring_pass` (false) |
 | `wrap` | `radius` (of the cylinder the path is drawn on); `points: [[x, y, z], …]` (x along the axis, y the arc length round it, z the depth: 0 on the cylinder, negative into it) or `sketch` + `curve` (a curve id; its sketch x and y are taken as x and arc length) with `depth` (0); `clearance` (5) and `retract` (1) above the cylinder; `max_angle_step_deg` (2) |
 
 The 3-axis operations (`contour` to `drill`) run with every rotary at zero; on `3axis` and
@@ -219,3 +224,59 @@ is refused when the part or a fixture within the tool's radius and a tenth more 
 (the rim of a hole of the tool's size) is above the R height by more than the tolerance: a hole in
 a boss drilled with the heights of the plate under it, say. Drill holes whose tops are at
 different heights in separate operations, each with its own `top` and `retract`.
+## Helical bores and thread milling
+
+`bore` and `thread_mill` follow a helix round each hole's axis (+Z of work coordinates, every
+rotary at zero) and are written with helical arcs (`G2`/`G3` with Z, half a turn each) where the
+post has `helical_arcs`. Their holes are a sketch's circles (exact centres and diameters, on a
+plane facing +Z; construction circles are left out), optionally only those whose diameter is in
+`diameter_range`, or a list. Both are read back and gouge-checked like every operation, so the
+model should show the holes (and, for a thread, at least its minor diameter).
+
+```json
+{"name": "bores", "type": "bore", "tool": 1, "sketch": "Holes", "diameter_range": [8, 20],
+ "heights": {"clearance": 20, "retract": 5, "top": 0, "bottom": -12}, "ramp_angle_deg": 2, "finish_passes": 1}
+```
+
+A **bore** goes to each hole's centre, feeds down to `top`, and runs a half-circle lead-in
+inside the hole onto its helix, so the tool reaches the wall along it and never head-on. The
+helix goes down `pitch` per turn (or slopes at `ramp_angle_deg` at the tool centre, its pitch
+then at most `stepdown`), climb milling counter-clockwise by default, and never goes down faster
+than the plunge feed: a steep helix close round the axis, nearly a plunge, is slowed to keep its
+Z at the plunge feed. A full flat circle cleans
+the floor, a half-circle lead-out goes back to the centre, and the tool rises inside the hole.
+A hole more than two tool diameters across is opened in several helical rings, the first within
+the tool's radius of the centre (so no core is left) and each further one at most `stepover`
+out. With `finish_passes`, roughing leaves `stock_to_leave` on the wall and the finishing passes
+go round at the full diameter (after the first they are spring passes). A hole that is not at
+least 0.1 mm wider than the tool is refused, the hole named (`hole 2 at (10, 0), ⌀5 mm`); one
+narrower than 1.2 tool diameters is cut with a warning, as it leaves little room for chips.
+
+A **thread mill** is a tool of `kind: "thread_mill"`: `diameter` across the tips of its teeth,
+`thread_pitch` for a multi-form tool (rows of teeth that far apart over its `flute_length`;
+left out, a single-point tool that cuts any pitch) and optionally `tooth_height` (how far its
+teeth stand out of its core). Z is the tool's tip; a single-point tool's tooth is taken there.
+A **thread_mill** operation cuts `thread_diameter` (the major diameter) at exactly `pitch` per
+turn: inside a hole (`internal`, the default) the tool reaches the major diameter, round a boss
+the minor one. The depth is split into `radial_passes` from the minor (inside) or major (outside)
+diameter, then `spring_pass` repeats the last. Climb milling goes counter-clockwise inside a hole
+and clockwise round a boss, so a right-hand thread is cut from the bottom up inside and from the
+top down outside; `right_hand: false` or `climb: false` turns that round. Inside, each pass
+starts at the hole's centre with a half-circle lead-in and ends with a lead-out back to it.
+These leads turn the tool a quarter turn about the axis, so they rise (or fall) a quarter pitch
+with the helix and the teeth stay on the thread: the tip runs from `bottom` to `top`, the full
+depth from a quarter pitch above the one to a quarter pitch below the other, and an internal
+thread must be at least half a pitch long. Outside, the lead-in comes from just clear of the
+thread and the leads stay level (they turn the tool only a few degrees about the axis). A
+multi-form tool makes one turn per span of its teeth from the bottom up; its last turn starts as
+low as still reaches the top, a whole number of pitches above the others, so its teeth cut at
+most a pitch of thread beyond the top (a tool whose teeth are longer than the thread is warned
+of). A thread mill that does not fit the minor diameter is refused, and so is a multi-form tool
+of another pitch.
+
+The gouge check cannot see a thread the model does not show, so for a thread_mill operation it
+takes the thread mill as a flat end mill at the roots of its teeth, the thread's depth inside its
+tip radius, under the thread mill's own shank and holder: that core must stay clear of the part,
+while the teeth beyond it cut the thread. The program still names the thread mill. Thread mills
+are refused by every other milling operation, and anywhere else a thread mill is checked whole,
+its teeth and all.

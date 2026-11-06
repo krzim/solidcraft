@@ -232,6 +232,10 @@ pub struct Common<'a> {
     pub gouge_check: bool,
 }
 
+#[path = "cam_helical.rs"]
+mod helical;
+pub use helical::{BoreOp, HoleSpec, ThreadMillOp};
+
 operation! {
     /// A 2D contour round closed profiles, in depth passes.
     ContourOp {
@@ -538,6 +542,8 @@ pub enum OperationSpec {
     RotaryFinish(RotaryFinishOp),
     RotaryRoughing(RotaryRoughingOp),
     Wrap(WrapOp),
+    Bore(BoreOp),
+    ThreadMill(ThreadMillOp),
 }
 
 /// What `cam.job` returns.

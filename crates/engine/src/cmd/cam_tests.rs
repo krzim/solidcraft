@@ -702,4 +702,251 @@ fn drilling_refuses_an_r_height_below_the_part_round_a_hole() {
     let e = b.execute("cam.job", &side(12.0)).unwrap_err();
     assert!(e.to_string().contains("Z 15") && e.to_string().contains("retract"), "{e}");
     assert_clean(&run(&mut b, "cam.job", side(18.0)));
+/// A plate 40 × 30 × 10, its top at Z 0, with a ⌀10 hole 6 deep at (-10, 0) and a ⌀5 hole
+/// through at (10, 0) (an M6 tap drill), and a sketch `Holes` of both circles on its top.
+fn holed_plate() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "corner": [-20, -15, -10], "body_name": "Plate"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 5, "height": 7, "base": [-10, 0, -6], "operation": "cut", "targets": ["Plate"]}));
+    run(&mut s, "solid.cylinder", json!({"radius": 2.5, "height": 12, "base": [10, 0, -11], "operation": "cut", "targets": ["Plate"]}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Holes"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [-10, 0], "radius": 5}));
+    run(&mut s, "sketch.circle.center", json!({"center": [10, 0], "radius": 2.5}));
+    run(&mut s, "sketch.finish", json!({}));
+    s
+}
+
+fn thread_mill_tool(number: u32, diameter: f64) -> Value {
+    json!({"number": number, "kind": "thread_mill", "diameter": diameter, "flute_length": 12, "spindle_rpm": 12000, "feed": 300, "plunge_feed": 100})
+}
+
+fn bore_job(op: Value) -> Value {
+    let mut op = op;
+    for (k, v) in [("name", json!("bore")), ("type", json!("bore")), ("tool", json!(1))] {
+        op[k] = v;
+    }
+    op["heights"] = json!({"clearance": 20, "retract": 5, "top": 0, "bottom": -6});
+    json!({"machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 6.0)], "operations": [op]})
+}
+
+fn m6_job() -> Value {
+    json!({
+        "machine": "4axis_a",
+        "post": "mach3_4axis",
+        "tools": [thread_mill_tool(2, 4.5)],
+        "operations": [{
+            "name": "M6 thread", "type": "thread_mill", "tool": 2, "centers": [[10, 0]],
+            "heights": {"clearance": 20, "retract": 5, "top": 0, "bottom": -8},
+            "pitch": 1.0, "thread_diameter": 6.0
+        }]
+    })
+}
+
+/// The Z of every helical arc of `text` (a G2/G3 block with Z), with its motion code: the
+/// motion is modal, so a block without G2/G3 continues the last one.
+fn helix_z(text: &str) -> Vec<(f64, u8)> {
+    let mut out = Vec::new();
+    let mut motion = 0u8;
+    for line in text.lines().filter(|l| !l.starts_with('(')) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        for w in &words {
+            match *w {
+                "G0" | "G00" => motion = 0,
+                "G1" | "G01" => motion = 1,
+                "G2" | "G02" => motion = 2,
+                "G3" | "G03" => motion = 3,
+                _ => {}
+            }
+        }
+        let z = words.iter().find_map(|w| w.strip_prefix('Z')).and_then(|v| v.parse::<f64>().ok());
+        if let (Some(z), true, true) = (z, words.iter().any(|w| w.starts_with('I')), motion >= 2) {
+            out.push((z, motion));
+        }
+    }
+    out
+}
+
+#[test]
+fn a_bore_reads_back_with_its_helical_arcs_and_clears_the_hole_it_is_checked_against() {
+    let mut s = holed_plate();
+    let dir = Dir::new("bore");
+    let out = dir.file("bore.tap");
+    let job = bore_job(json!({"holes": [{"center": [-10, 0], "diameter": 10}], "pitch": 0.5}));
+    let r = run(&mut s, "cam.job", json!({"job": job, "output": out}));
+    assert_clean(&r);
+    let op = &r["operations"][0];
+    assert_eq!(op["kind"], "bore", "{r}");
+    assert!(op["warnings"].as_array().is_some_and(Vec::is_empty), "{r}");
+    let text = std::fs::read_to_string(&out).unwrap();
+    // Down a quarter of a millimetre each half turn, exactly, counter-clockwise (climb), to the floor.
+    let z = helix_z(&text);
+    assert_eq!(z.len(), 24, "{text}");
+    assert!(z.iter().all(|(_, g)| *g == 3), "{z:?}");
+    for (k, (zk, _)) in z.iter().enumerate() {
+        assert!((zk - (-0.25 * (k + 1) as f64)).abs() < 1e-9, "{z:?}");
+    }
+    let c = run(&mut s, "cam.check", json!({"path": out}));
+    assert!(c["errors"].as_array().is_some_and(Vec::is_empty) && c["arcs"].as_u64().is_some_and(|n| n >= 28), "{c}");
+    assert!((c["bounds"][0][2].as_f64().unwrap() + 6.0).abs() < 1e-9, "{c}");
+    // A bore wider than the hole in the model cuts into the part: the gouge check says so.
+    let wide = bore_job(json!({"holes": [{"center": [-10, 0], "diameter": 12}], "pitch": 0.5}));
+    let r = run(&mut s, "cam.job", json!({"job": wide, "dry_run": true}));
+    assert_eq!(r["passed"], false, "{r}");
+    assert!(r["gouge"]["worst"].as_f64().is_some_and(|w| w > 0.5), "{r}");
+}
+
+#[test]
+fn a_bore_takes_the_sketch_circles_in_its_diameter_range() {
+    let mut s = holed_plate();
+    let job = bore_job(json!({"sketch": "Holes", "diameter_range": [8, 12], "ramp_angle_deg": 2, "finish_passes": 1}));
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    assert!(r["operations"][0]["moves"].as_u64().is_some_and(|m| m > 30), "{r}");
+    let none = bore_job(json!({"sketch": "Holes", "diameter_range": [20, 30]}));
+    let e = s.execute("cam.job", &json!({"job": none, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("no circles"), "{e}");
+    // The ⌀5 circle is smaller than the ⌀6 tool: refused, the hole named.
+    let all = bore_job(json!({"sketch": "Holes"}));
+    let e = s.execute("cam.job", &json!({"job": all, "dry_run": true})).unwrap_err();
+    assert!(matches!(e, EngineError::BadParams { .. }) && e.to_string().contains("hole 2 at (10, 0)"), "{e}");
+}
+
+#[test]
+fn an_undersize_hole_is_refused_and_a_tight_one_warned_of() {
+    let mut s = holed_plate();
+    let small = bore_job(json!({"holes": [{"center": [10, 0], "diameter": 5}], "pitch": 0.5}));
+    let e = s.execute("cam.job", &json!({"job": small, "dry_run": true})).unwrap_err();
+    let msg = e.to_string();
+    assert!(msg.contains("hole 1 at (10, 0)") && msg.contains("too small") && msg.contains("`bore`"), "{msg}");
+    let tight = bore_job(json!({"holes": [{"center": [-10, 0], "diameter": 7}], "pitch": 0.5}));
+    let r = run(&mut s, "cam.job", json!({"job": tight, "dry_run": true}));
+    assert_clean(&r);
+    let warnings = r["operations"][0]["warnings"].to_string();
+    assert!(warnings.contains("chips"), "{r}");
+}
+
+#[test]
+fn an_m6x1_internal_thread_is_written_one_pitch_a_turn_and_passes_the_checks() {
+    let mut s = holed_plate();
+    let dir = Dir::new("thread");
+    let out = dir.file("m6.tap");
+    let r = run(&mut s, "cam.job", json!({"job": m6_job(), "output": out}));
+    assert_clean(&r);
+    assert_eq!(r["operations"][0]["kind"], "thread_mill", "{r}");
+    let text = std::fs::read_to_string(&out).unwrap();
+    let z = helix_z(&text);
+    // Up from -8 to 0, counter-clockwise: the lead-in and lead-out each rise a quarter pitch
+    // (a quarter turn about the axis) and every half turn of the helix exactly half a pitch.
+    assert_eq!(z.len(), 17, "{text}");
+    assert!(z.iter().all(|(_, g)| *g == 3), "{z:?}");
+    let mut last = -8.0;
+    for (k, (zk, _)) in z.iter().enumerate() {
+        let rise = if k == 0 || k == z.len() - 1 { 0.25 } else { 0.5 };
+        assert!((zk - last - rise).abs() < 1e-9, "{z:?}");
+        last = *zk;
+    }
+    assert!((last - 0.0).abs() < 1e-9, "{z:?}");
+    let turns: Vec<f64> = z[..16].chunks(2).filter_map(|t| t.first().map(|(zk, _)| *zk)).collect();
+    assert!(turns.windows(2).all(|w| (w[1] - w[0] - 1.0).abs() < 1e-9), "one pitch per turn: {turns:?}");
+    // The program names the thread mill itself; only the checks take its core.
+    assert!(text.contains("T2 D4.5 thread mill"), "{text}");
+    // A thread mill too big for the minor diameter, or an end mill, is refused.
+    let mut big = m6_job();
+    big["tools"][0]["diameter"] = json!(5.2);
+    let e = s.execute("cam.job", &json!({"job": big, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("minor diameter"), "{e}");
+    let mut end_mill = m6_job();
+    end_mill["tools"] = json!([flat(2, 4.0)]);
+    let e = s.execute("cam.job", &json!({"job": end_mill, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("thread mill"), "{e}");
+    // A thread mill in a pocket is refused: only its core would be checked.
+    let mut pocket = m6_job();
+    pocket["operations"][0] = json!({"name": "p", "type": "pocket", "tool": 2, "polygon": [[0, -5], [5, -5], [5, 5], [0, 5]], "heights": {"clearance": 20, "retract": 5, "top": 0, "bottom": -1}});
+    assert!(s.execute("cam.job", &json!({"job": pocket, "dry_run": true})).unwrap_err().to_string().contains("thread mill"));
+}
+
+#[test]
+fn hostile_bores_and_threads_are_refused_without_panics() {
+    let mut s = holed_plate();
+    let bore = |f: &dyn Fn(&mut Value)| {
+        let mut j = bore_job(json!({"holes": [{"center": [-10, 0], "diameter": 10}], "pitch": 0.5}));
+        f(&mut j["operations"][0]);
+        json!({"job": j, "dry_run": true})
+    };
+    let thread = |f: &dyn Fn(&mut Value)| {
+        let mut j = m6_job();
+        f(&mut j);
+        json!({"job": j, "dry_run": true})
+    };
+    let unset = |o: &mut Value, k: &str| {
+        if let Some(m) = o.as_object_mut() {
+            m.remove(k);
+        }
+    };
+    let cases = vec![
+        bore(&|o| o["holes"] = json!([])),
+        bore(&|o| o["holes"] = json!([{"center": [1e308, 0], "diameter": 10}])),
+        bore(&|o| o["holes"] = json!([{"center": [0, 0], "diameter": -10}])),
+        bore(&|o| o["holes"] = json!([{"center": [0, 0], "diameter": 1e308}])),
+        bore(&|o| o["holes"] = json!([{"center": [0, 0]}])),
+        bore(&|o| o["holes"] = json!([{"center": [0, 0], "diameter": 10, "depth": 3}])),
+        bore(&|o| o["pich"] = json!(1)),
+        bore(&|o| o["pitch"] = json!(-1)),
+        bore(&|o| o["pitch"] = json!(0)),
+        bore(&|o| o["pitch"] = json!(1e308)),
+        bore(&|o| o["pitch"] = json!(1e-9)),
+        bore(&|o| o["ramp_angle_deg"] = json!(2)),
+        bore(&|o| o["stepdown"] = json!(1)),
+        bore(&|o| o["sketch"] = json!("Holes")),
+        bore(&|o| o["diameter_range"] = json!([1, 2])),
+        bore(&|o| {
+            unset(o, "pitch");
+            o["ramp_angle_deg"] = json!(90);
+        }),
+        bore(&|o| {
+            unset(o, "holes");
+            o["sketch"] = json!("Holes");
+            o["diameter_range"] = json!([12, 8]);
+        }),
+        bore(&|o| {
+            unset(o, "holes");
+            o["sketch"] = json!("Nope");
+        }),
+        bore(&|o| o["stepover"] = json!(0)),
+        bore(&|o| o["stepover"] = json!(100)),
+        bore(&|o| o["stock_to_leave"] = json!(-1)),
+        bore(&|o| o["stock_to_leave"] = json!(4)),
+        bore(&|o| o["finish_passes"] = json!(1000)),
+        bore(&|o| o["finish_passes"] = json!(-1)),
+        bore(&|o| o["heights"]["bottom"] = json!(-1e9)),
+        bore(&|o| o["heights"]["bottom"] = json!(0)),
+        bore(&|o| o["tool"] = json!(9)),
+        thread(&|j| j["operations"][0]["pitch"] = json!(0)),
+        thread(&|j| j["operations"][0]["pitch"] = json!(1e308)),
+        thread(&|j| j["operations"][0]["thread_diameter"] = json!(-6)),
+        thread(&|j| j["operations"][0]["thread_diameter"] = json!(1e308)),
+        thread(&|j| j["operations"][0]["thread_depth"] = json!(0)),
+        thread(&|j| j["operations"][0]["thread_depth"] = json!(5)),
+        thread(&|j| j["operations"][0]["radial_passes"] = json!(0)),
+        thread(&|j| j["operations"][0]["radial_passes"] = json!(1000)),
+        thread(&|j| j["operations"][0]["centers"] = json!([])),
+        thread(&|j| j["operations"][0]["centers"] = json!([[1e308, 0]])),
+        thread(&|j| j["operations"][0]["center"] = json!([0, 0])),
+        thread(&|j| j["operations"][0]["internal"] = json!("yes")),
+        thread(&|j| j["operations"][0]["heights"]["bottom"] = json!(-1e5)),
+        thread(&|j| j["tools"][0]["tooth_height"] = json!(3)),
+        thread(&|j| j["tools"][0]["tooth_height"] = json!(0.2)),
+        thread(&|j| j["tools"][0]["thread_pitch"] = json!(1.5)),
+        thread(&|j| j["tools"][0]["thread_pitch"] = json!(-1)),
+        thread(&|j| j["tools"][0]["thread_pich"] = json!(1)),
+        thread(&|j| j["tools"][0]["kind"] = json!("drill")),
+        thread(&|j| j["operations"][0]["thread_diameter"] = json!(4)),
+    ];
+    for p in &cases {
+        match s.execute("cam.job", p) {
+            Err(EngineError::Internal(_, msg)) => panic!("{p}: panicked: {msg}"),
+            Err(_) => {}
+            Ok(v) => panic!("{p}: accepted: {v}"),
+        }
+    }
 }
