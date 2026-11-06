@@ -12,7 +12,9 @@
 //!   gouge test of [`crate::collision`]), nor the tool's shank and holder touch them;
 //! - with a stock, the cutter must not be in the stock (as given: what earlier cuts removed is
 //!   not tracked, so a rapid below the stock's top over it fails), except on a retract straight
-//!   up the tool's axis, which only passes through room the tool already fills;
+//!   up the tool's axis, which only passes through room the tool already fills. The caller
+//!   may say what is left of it as each operation starts ([`check_rapids_staged`]: a box
+//!   faced all over is lower after the facing);
 //! - a block that turns the rotary of a 4th axis (a table about X) must keep the cutter
 //!   outside the radius the stock sweeps (without a stock, the part's largest radius and the
 //!   tolerance), all through the turn, wherever the stock is level with it along X.
@@ -242,6 +244,26 @@ pub fn check_rapids(
     tol: f64,
     step: f64,
 ) -> Result<RapidCheck> {
+    check_rapids_staged(text, program, post, machine, obstacles, part, stock, &[], tol, step)
+}
+
+/// [`check_rapids`], with what is left of the stock as each operation starts: `stages[k]` is
+/// the stock the rapids of operation `k` are held against (one per operation, or none at all
+/// for `stock` throughout). A block of no known operation, and every 4th-axis turn, is held
+/// against `stock`, the stock as the job starts.
+#[allow(clippy::too_many_arguments)]
+pub fn check_rapids_staged(
+    text: &str,
+    program: &MachineProgram,
+    post: &Post5,
+    machine: &Machine,
+    obstacles: &Surface,
+    part: &Surface,
+    stock: Option<&Stock>,
+    stages: &[Option<Stock>],
+    tol: f64,
+    step: f64,
+) -> Result<RapidCheck> {
     post.validate()?;
     machine.validate()?;
     if !(tol >= 0.0) || !(tol <= 1.0) {
@@ -251,6 +273,12 @@ pub fn check_rapids(
         return invalid("the rapid check's sample step must be from 0.01 to 100 mm");
     }
     if let Some(s) = stock {
+        s.validate()?;
+    }
+    if !stages.is_empty() && stages.len() != program.operations.len() {
+        return invalid("the stock's stages must be one per operation");
+    }
+    for s in stages.iter().flatten() {
         s.validate()?;
     }
     if program.operations.is_empty() {
@@ -306,7 +334,12 @@ pub fn check_rapids(
             for k in ops {
                 let (Some(tool), Some(cutter)) = (tools.get(k), cutters.get(k)) else { continue };
                 let poses = samples(machine, from, &to, reach(tool) + lever, step, &mut out.samples)?;
-                check_block(&mut out, &poses, (line, owner.as_ref().map(|_| k)), tool, cutter, obstacles, stock, tol, step)?;
+                // What is left of the stock as the block's operation starts, where that is known.
+                let left = match (&owner, stages.get(k)) {
+                    (Some(_), Some(s)) => s.as_ref(),
+                    _ => stock,
+                };
+                check_block(&mut out, &poses, (line, owner.as_ref().map(|_| k)), tool, cutter, obstacles, left, tol, step)?;
                 let turns = from.is_some_and(|f| f.rotary.iter().zip(&to.rotary).any(|(a, b)| (a - b).abs() > 1e-9));
                 if let (true, Some(z)) = (turns, zone) {
                     let deepest = poses
@@ -450,10 +483,22 @@ pub fn check_travel(text: &str, machine: &Machine) -> Result<Option<Travel>> {
                 {
                     let start = Vec2::new(from.x, from.y) - *center;
                     let sweep = crate::path::arc_sweep(from, *linear, *center, *ccw);
-                    for k in 1..64 {
-                        let t = k as f64 / 64.0;
+                    let at = |t: f64| {
                         let q = *center + Vec2::from_angle(start.angle() + sweep * t) * start.len();
-                        pts.push(Vec3::new(q.x, q.y, from.z + (linear.z - from.z) * t));
+                        Vec3::new(q.x, q.y, from.z + (linear.z - from.z) * t)
+                    };
+                    for k in 1..64 {
+                        pts.push(at(k as f64 / 64.0));
+                    }
+                    // Where the arc reaches farthest along X and Y (it may between the samples):
+                    // wherever it passes a quarter turn.
+                    if sweep.abs() > 1e-12 {
+                        for k in -6..=6 {
+                            let t = (f64::from(k) * std::f64::consts::FRAC_PI_2 - start.angle()) / sweep;
+                            if t > 0.0 && t < 1.0 {
+                                pts.push(at(t));
+                            }
+                        }
                     }
                 }
                 pts.push(axes(*linear, rotary, *tcp));

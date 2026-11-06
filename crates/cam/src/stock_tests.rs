@@ -23,6 +23,7 @@ fn params(tool: &Tool, angle: f64, zigzag: bool) -> FaceParams {
         angle,
         overhang: default_face_overhang(tool),
         zigzag,
+        stock: None,
     }
 }
 
@@ -224,4 +225,73 @@ fn hostile_stock_and_facing_are_refused() {
     assert!(face(&Tool::new(1, ToolKind::BallEndmill, 6.0, 5.0), &ok).is_err(), "a ball leaves scallops");
     assert!(face(&Tool::new(1, ToolKind::Drill, 6.0, 5.0), &ok).is_err());
     assert!(face(&Tool::new(1, ToolKind::FlatEndmill, -6.0, 5.0), &ok).is_err());
+}
+
+/// A tilted cutter whose axis passes right through a thin plate far from its tip, between where
+/// a sampled axis would look, is in it; so is one whose axis crosses a bar's axis far along X.
+#[test]
+fn a_tilted_cutter_far_through_thin_stock_is_found() {
+    let plate = Stock::Box { min: Vec3::new(0.0, 0.0, 0.0), max: Vec3::new(100.0, 100.0, 1.0) };
+    let axis = Vec3::new(0.0, 1.0, 1.0).normalized().unwrap();
+    // Up the axis from (50, -450, -500): through the plate at about (50, 50, 0..1).
+    let through = Pose::new(Vec3::new(50.0, -450.0, -500.0), axis);
+    close(plate.intrusion(&through, 3.0, 0.01).unwrap(), 3.0, 1e-6);
+    // The same axis 10 mm to the side of the plate: clear; 2 mm: in by 1.
+    let beside = Pose::new(Vec3::new(110.0, -450.0, -500.0), axis);
+    assert_eq!(plate.intrusion(&beside, 3.0, 0.0), None);
+    let near = Pose::new(Vec3::new(102.0, -450.0, -500.0), axis);
+    close(plate.intrusion(&near, 3.0, 0.0).unwrap(), 1.0, 1e-6);
+    // Through a thin bar's axis 400 mm along X from the tip.
+    let bar = Stock::Cylinder { radius: 5.0, x_min: -50.0, x_max: 50.0 };
+    let tilted = Pose::new(Vec3::new(-400.0, 0.0, -1600.0 / 3.0), Vec3::new(0.6, 0.0, 0.8));
+    close(bar.intrusion(&tilted, 3.0, 0.0).unwrap(), 5.0, 1e-6);
+    let clear = Pose::new(Vec3::new(-400.0, 9.0, -1600.0 / 3.0), Vec3::new(0.6, 0.0, 0.8));
+    assert_eq!(bar.intrusion(&clear, 3.0, 0.0), None);
+}
+
+/// Facing with the job's stock: an area that stops short of the stock along the passes would
+/// take the tool down into it, and a bottom below the stock's would cut what holds it; both are
+/// refused. An area reaching past the stock, or one narrower across the passes, is fine.
+#[test]
+fn facing_into_the_stock_or_below_it_is_refused() {
+    let tool = face_mill(10.0);
+    let stock = Stock::Box { min: Vec3::new(-25.0, -25.0, -20.0), max: Vec3::new(25.0, 25.0, 0.0) };
+    let mut p = params(&tool, 0.0, true);
+    p.stock = Some(stock);
+    assert!(face(&tool, &p).is_ok(), "the whole stock, entered beside it");
+    // An area 10 mm inside the stock along X: every descent is in it.
+    for zigzag in [true, false] {
+        let mut inside = p;
+        inside.zigzag = zigzag;
+        inside.area = [Vec2::new(-15.0, -25.0), Vec2::new(15.0, 25.0)];
+        let e = face(&tool, &inside).unwrap_err().to_string();
+        assert!(e.contains("down into the stock"), "{e}");
+    }
+    // A strip across the passes, reaching past the stock along them: fine.
+    let mut strip = p;
+    strip.area = [Vec2::new(-25.0, -5.0), Vec2::new(25.0, 5.0)];
+    assert!(face(&tool, &strip).is_ok());
+    // The same strip at 90°: the passes run along Y, the descents land on the stock.
+    strip.angle = 90f64.to_radians();
+    assert!(face(&tool, &strip).is_err());
+    // A bottom below the stock's.
+    let mut deep = p;
+    deep.heights.bottom = -21.0;
+    deep.stepdown = 5.0;
+    assert!(face(&tool, &deep).unwrap_err().to_string().contains("below the stock's bottom"));
+    deep.heights.bottom = -20.0;
+    assert!(face(&tool, &deep).is_ok());
+    // A round bar faced along X: down beside its ends, clear; an area short of its ends is not.
+    let bar = Stock::Cylinder { radius: 12.0, x_min: -30.0, x_max: 30.0 };
+    let mut round = p;
+    round.stock = Some(bar);
+    round.area = bar.footprint();
+    round.heights = Heights { clearance: 30.0, retract: 14.0, top: 12.0, bottom: 10.0 };
+    assert!(face(&tool, &round).is_ok());
+    round.area = [Vec2::new(-20.0, -12.0), Vec2::new(20.0, 12.0)];
+    assert!(face(&tool, &round).is_err());
+    // A hostile stock is refused, not followed.
+    let mut bad = p;
+    bad.stock = Some(Stock::Box { min: Vec3::new(f64::NAN, 0.0, 0.0), max: Vec3::new(1.0, 1.0, 1.0) });
+    assert!(face(&tool, &bad).is_err());
 }

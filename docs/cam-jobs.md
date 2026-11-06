@@ -196,6 +196,10 @@ beside the stock, each level starting where the last ended; without it the tool 
 retract height between passes and every pass runs the same way. The stepover is held to the
 flat of the tool's end (its diameter less the corners, for a bull nose), so the floor has no
 ridges. A top below the stock's top is warned of: its first level takes more than a stepdown.
+With a stock, a `face` is refused where a descent or a link between passes would run in the
+stock (a `rect` that stops short of the stock's edges along the passes would take the tool
+straight down into it: give one that reaches past them, or turn the passes), and where its
+`bottom` is below the stock's (whatever holds the stock is there).
 
 ### The rapid check
 
@@ -210,8 +214,10 @@ the final retract. At every sample, in work coordinates:
   tool's shank and holder (with holder data) must not touch them;
 - with a stock, the cutter must not be in the stock. Nothing tracks what earlier operations
   removed, so the stock as given is the bound: a rapid below the stock's top over the stock
-  fails, even where an earlier operation has cut it away. A retract straight up the tool's axis
-  out of the cut is the exception: it only passes through room the tool already fills. Keep
+  fails, even where an earlier operation has cut it away, except after a `face` (with its
+  default `overhang`) over the whole top of a box stock: the operations after it are held
+  against the stock with its top at the face's `bottom`. A retract straight up the tool's
+  axis out of the cut is exempt too: it only passes through room the tool already fills. Keep
   every retract and clearance height above the stock's top (on a 4th axis, outside its radius);
 - a block that turns the A axis (a table about X) must keep the cutter outside the radius the
   stock sweeps (a box's farthest corner; without a stock, the part's largest radius and the

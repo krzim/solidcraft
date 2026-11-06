@@ -7,14 +7,14 @@ use solidcore_record::{Vec2, Vec3};
 use solidcraft_cam::gcode5::{MachineOperation, MachineProgram, Post5};
 use solidcraft_cam::indexed::{IndexedOperation, frame_for_index};
 use solidcraft_cam::kinematics::Machine;
-use solidcraft_cam::rapids::{RAPID_STEP, check_rapids, check_travel};
+use solidcraft_cam::rapids::{RAPID_STEP, check_rapids_staged, check_travel};
 use solidcraft_cam::stock::{FaceParams, Stock, default_face_overhang, default_face_stepover, face};
 use solidcraft_cam::{Frame, Heights, Toolpath};
 
 use super::{Ctx, Planned, Surfaces, cam_err, finite_point, num, v3};
 use crate::Result;
 use crate::params::bad;
-use crate::schema::cam::{CamJob, OperationReport};
+use crate::schema::cam::{CamJob, OperationReport, OperationSpec};
 use crate::schema::cam_stock::{FaceOp, RapidHitReport, RapidsReport, StockReport, StockSpec, TravelReport};
 
 /// Hits the reply lists in full.
@@ -109,6 +109,7 @@ pub(super) fn plan_face(ctx: &Ctx<'_>, o: &FaceOp, arc_tol: f64) -> Result<Plann
         angle: ctx.degrees(c.name, o.angle_deg.unwrap_or(0.0), "`angle_deg`")?,
         overhang: o.overhang.unwrap_or_else(|| default_face_overhang(tool)),
         zigzag: o.zigzag.unwrap_or(true),
+        stock: stock.copied(),
     };
     let path: Toolpath = face(tool, &params).map_err(|e| ctx.bad(c.name, e))?;
     let rotary = vec![0.0; ctx.machine.rotaries.len()];
@@ -134,6 +135,27 @@ pub(super) fn plan_face(ctx: &Ctx<'_>, o: &FaceOp, arc_tol: f64) -> Result<Plann
     Ok(Planned { op: MachineOperation::Indexed(io), poses, tool: r.tool, gouge_check: c.gouge_check, report, axes: "3-axis".into() })
 }
 
+/// What is left of the job's stock as each of its operations starts: a `face` over the whole
+/// top of a box stock lowers it to the face's bottom for the operations after it. Only with the
+/// default overhang, which puts the outermost passes' centres outside the edges, so the flat of
+/// the tool's end reaches them (a smaller one may leave a bull nose's corner along an edge).
+fn stock_stages(job: &CamJob, stock: Option<&Stock>) -> Vec<Option<Stock>> {
+    let mut left = stock.copied();
+    job.operations
+        .iter()
+        .map(|spec| {
+            let now = left;
+            if let (OperationSpec::Face(o), Some(s)) = (spec, left)
+                && o.overhang.is_none()
+            {
+                let area = o.rect.map_or_else(|| s.footprint(), |[lo, hi]| [Vec2::new(lo[0], lo[1]), Vec2::new(hi[0], hi[1])]);
+                left = Some(s.faced(area, o.bottom));
+            }
+            now
+        })
+        .collect()
+}
+
 fn at(p: Vec3) -> String {
     format!("[{}, {}, {}]", num(p.x), num(p.y), num(p.z))
 }
@@ -143,6 +165,7 @@ fn at(p: Vec3) -> String {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_motion(
     cmd: &str,
+    job: &CamJob,
     text: &str,
     program: &MachineProgram,
     post: &Post5,
@@ -152,7 +175,9 @@ pub(super) fn check_motion(
     tol: f64,
     failures: &mut Vec<String>,
 ) -> Result<(RapidsReport, Option<TravelReport>)> {
-    let check = check_rapids(text, program, post, machine, &surfaces.all, &surfaces.part, stock, tol, RAPID_STEP)
+    let stages = stock_stages(job, stock);
+    let stages = if stages.len() == program.operations.len() { stages } else { Vec::new() };
+    let check = check_rapids_staged(text, program, post, machine, &surfaces.all, &surfaces.part, stock, &stages, tol, RAPID_STEP)
         .map_err(|e| cam_err(cmd, "checking the rapids", e))?;
     let op_name = |k: Option<usize>| {
         k.and_then(|k| program.operations.get(k)).map(|o| match o {

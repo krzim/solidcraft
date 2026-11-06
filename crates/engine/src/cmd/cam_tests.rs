@@ -649,3 +649,69 @@ fn hostile_stock_and_face_jobs_are_refused_without_panics() {
     let r = run(&mut s, "cam.job", face(json!({"top": 9, "bottom": 7.5})));
     assert_eq!(r["passed"], true, "{r}");
 }
+
+/// A `rect` inside the stock along the passes would take the face mill down into the stock
+/// (at the plunge feed, a full-width plunge), and a bottom below the stock's would cut what
+/// holds it: both refused, naming the operation. A strip reaching past the stock along the
+/// passes is faced.
+#[test]
+fn facing_down_into_the_stock_or_below_it_is_refused() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 50, "width": 50, "height": 10, "corner": [-25, -25, -11], "body_name": "Block"}));
+    let job = |op: Value| {
+        let mut face = json!({"name": "face", "type": "face", "tool": 1, "bottom": -1, "stepdown": 0.5});
+        if let (Some(o), Value::Object(e)) = (face.as_object_mut(), op) {
+            o.extend(e);
+        }
+        json!({"job": {
+            "machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 10.0)],
+            "stock": {"box": {"min": [-25, -25, -11], "max": [25, 25, 0]}}, "operations": [face]
+        }, "dry_run": true})
+    };
+    let r = run(&mut s, "cam.job", job(json!({})));
+    assert_clean(&r);
+    for bad in
+        [json!({"rect": [[-15, -25], [15, 25]]}), json!({"rect": [[-25, -5], [25, 5]], "angle_deg": 90}), json!({"bottom": -12, "stepdown": 3})]
+    {
+        let e = s.execute("cam.job", &job(bad.clone())).unwrap_err();
+        assert!(matches!(e, EngineError::BadParams { .. }) && e.to_string().contains("face"), "{bad}: {e}");
+        assert!(e.to_string().contains("into the stock") || e.to_string().contains("below the stock's bottom"), "{bad}: {e}");
+    }
+    let r = run(&mut s, "cam.job", job(json!({"rect": [[-25, -5], [25, 5]]})));
+    assert_clean(&r);
+}
+
+/// Faced all over from Z 0 down to the block's top at -1, the stock is lower for the pocket
+/// after it: the pocket's retract height of -0.5, below the stock's first top, is above what is
+/// left. Without the face, or with a face over half the top, its rapids run through the stock.
+#[test]
+fn rapids_after_a_face_are_held_against_the_faced_stock() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 50, "width": 50, "height": 10, "corner": [-25, -25, -11], "body_name": "Block"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 1, "corner": [-5, -5, -2], "operation": "cut"}));
+    let face = json!({"name": "face", "type": "face", "tool": 1, "bottom": -1, "stepdown": 0.5});
+    let pocket = json!({"name": "pocket", "type": "pocket", "tool": 2, "polygon": [[-5, -5], [5, -5], [5, 5], [-5, 5]],
+                        "heights": {"clearance": 5, "retract": -0.5, "top": -1, "bottom": -2}, "stepover": 2});
+    let job = |ops: Value| {
+        json!({"job": {
+            "machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 10.0), flat(2, 4.0)],
+            "stock": {"box": {"min": [-25, -25, -11], "max": [25, 25, 0]}}, "operations": ops
+        }, "dry_run": true})
+    };
+    let r = run(&mut s, "cam.job", job(json!([face, pocket])));
+    assert_clean(&r);
+    assert_eq!(r["rapids"]["pass"], true, "{r}");
+    let r = run(&mut s, "cam.job", job(json!([pocket])));
+    assert_eq!(r["rapids"]["pass"], false, "{r}");
+    assert!(r["rapids"]["first"].as_array().unwrap().iter().all(|h| h["kind"] == "stock" && h["operation"] == "pocket"), "{r}");
+    let mut half = face.clone();
+    half["rect"] = json!([[-25, -25], [0, 25]]);
+    half["angle_deg"] = json!(90);
+    let r = run(&mut s, "cam.job", job(json!([half, pocket])));
+    assert_eq!(r["rapids"]["pass"], false, "{r}");
+    // An overhang of its own may leave a strip along the edges: the stock is kept.
+    let mut own = face.clone();
+    own["overhang"] = json!(1);
+    let r = run(&mut s, "cam.job", job(json!([own, pocket])));
+    assert_eq!(r["rapids"]["pass"], false, "{r}");
+}

@@ -1055,7 +1055,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     }
     gouge.pass = gouge.hits == 0;
     // Every rapid of the program as written, and every position against the machine's travel.
-    let (rapids, travel) = cam_stock::check_motion(cmd, &text, &program, &post, &machine, &surfaces, stock.as_ref(), tol, &mut failures)?;
+    let (rapids, travel) = cam_stock::check_motion(cmd, &job, &text, &program, &post, &machine, &surfaces, stock.as_ref(), tol, &mut failures)?;
     let readback = ReadbackReport {
         max_tip_deviation: rb.max_tip_deviation,
         max_axis_deviation_deg: rb.max_axis_deviation.to_degrees(),

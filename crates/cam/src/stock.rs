@@ -36,8 +36,8 @@ pub const FACE_MARGIN: f64 = 0.5;
 /// Most passes of one facing level, and most levels.
 const MAX_PASSES: usize = 100_000;
 const MAX_LEVELS: usize = 10_000;
-/// Points a tilted cutter's axis is sampled at against a stock it is not square to.
-const AXIS_SAMPLES: usize = 64;
+/// Golden-section steps that find the least of a convex function (to about 1e-17 of the range).
+const CONVEX_STEPS: usize = 80;
 
 /// The raw material, in work coordinates (mm).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -102,6 +102,57 @@ impl Stock {
             Stock::Box { max, .. } => max.z,
             Stock::Cylinder { radius, .. } => radius,
         }
+    }
+
+    /// What is left of the stock after [`face`] has faced `area` (work XY) down to `bottom`: a
+    /// box whose whole top the area covers is lower; anything else (a part of the top faced, a
+    /// bar's flat) is kept as it was, on the safe side.
+    pub fn faced(&self, area: [Vec2; 2], bottom: f64) -> Stock {
+        let [lo, hi] = area;
+        match *self {
+            Stock::Box { min, max }
+                if lo.x <= min.x + 1e-9
+                    && lo.y <= min.y + 1e-9
+                    && hi.x >= max.x - 1e-9
+                    && hi.y >= max.y - 1e-9
+                    && bottom > min.z
+                    && bottom < max.z =>
+            {
+                Stock::Box { min, max: Vec3::new(max.x, max.y, bottom) }
+            }
+            other => other,
+        }
+    }
+
+    /// The lowest Z of the stock at A = 0.
+    pub fn bottom(&self) -> f64 {
+        match *self {
+            Stock::Box { min, .. } => min.z,
+            Stock::Cylinder { radius, .. } => -radius,
+        }
+    }
+
+    /// What a vertical cutter with its tip at height `z` (endless above it) would meet of the
+    /// stock, seen from above: the low and high corners of the stock's widest section at or
+    /// above `z`, shrunk by `tol`; `None` where the stock is all below `z`.
+    pub fn section_above(&self, z: f64, tol: f64) -> Option<[Vec2; 2]> {
+        let (lo, hi) = match *self {
+            Stock::Box { min, max } => {
+                if !(z < max.z - tol) {
+                    return None;
+                }
+                (Vec2::new(min.x + tol, min.y + tol), Vec2::new(max.x - tol, max.y - tol))
+            }
+            Stock::Cylinder { radius, x_min, x_max } => {
+                let r = radius - tol;
+                if !(z < r) {
+                    return None;
+                }
+                let half = if z <= 0.0 { r } else { (r * r - z * z).max(0.0).sqrt() };
+                (Vec2::new(x_min + tol, -half), Vec2::new(x_max - tol, half))
+            }
+        };
+        (lo.x < hi.x && lo.y < hi.y).then_some([lo, hi])
     }
 
     /// The low and high corners of the stock seen from above (work XY).
@@ -181,6 +232,65 @@ fn point_box(p: Vec3, lo: Vec3, hi: Vec3) -> f64 {
     Vec3::new(d(p.x, lo.x, hi.x), d(p.y, lo.y, hi.y), d(p.z, lo.z, hi.z)).len()
 }
 
+/// The least of `f`, convex on `[a, b]` (flat stretches included), found by golden sections.
+fn convex_min(f: impl Fn(f64) -> f64, a: f64, b: f64) -> f64 {
+    const G: f64 = 0.618_033_988_749_894_8;
+    let (mut lo, mut hi) = (a, b);
+    let mut best = f(a).min(f(b));
+    let (mut c, mut d) = (hi - G * (hi - lo), lo + G * (hi - lo));
+    let (mut fc, mut fd) = (f(c), f(d));
+    for _ in 0..CONVEX_STEPS {
+        best = best.min(fc).min(fd);
+        if fc <= fd {
+            (hi, d, fd) = (d, c, fc);
+            c = hi - G * (hi - lo);
+            fc = f(c);
+        } else {
+            (lo, c, fc) = (c, d, fd);
+            d = lo + G * (hi - lo);
+            fd = f(d);
+        }
+    }
+    best.min(fc).min(fd)
+}
+
+/// The distance from `p` to the rectangle `lo`–`hi` (0 inside).
+fn point_rect(p: Vec2, lo: Vec2, hi: Vec2) -> f64 {
+    let d = |v: f64, a: f64, b: f64| (a - v).max(0.0).max(v - b);
+    d(p.x, lo.x, hi.x).hypot(d(p.y, lo.y, hi.y))
+}
+
+/// The distance from `p` to the segment `a`–`b`.
+fn point_segment(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let d = b - a;
+    let t = if d.len2() > 0.0 { ((p - a).dot(d) / d.len2()).clamp(0.0, 1.0) } else { 0.0 };
+    p.dist(a + d * t)
+}
+
+/// The distance between the segment `a`–`b` and the rectangle `lo`–`hi` (0 where they meet):
+/// exact, the rectangle being convex.
+pub(crate) fn segment_rect(a: Vec2, b: Vec2, lo: Vec2, hi: Vec2) -> f64 {
+    let corners = [lo, Vec2::new(hi.x, lo.y), hi, Vec2::new(lo.x, hi.y)];
+    let ends = point_rect(a, lo, hi).min(point_rect(b, lo, hi));
+    if ends <= 0.0 {
+        return 0.0;
+    }
+    // Both ends outside: the segment meets the rectangle where it crosses one of its sides.
+    let side = |p: Vec2, q: Vec2, r: Vec2| (q - p).cross(r - p);
+    let crosses = |c: Vec2, e: Vec2| {
+        let (d1, d2) = (side(a, b, c), side(a, b, e));
+        let (d3, d4) = (side(c, e, a), side(c, e, b));
+        // Along a side (or a point): the corners' distances below cover it.
+        !(d1 == 0.0 && d2 == 0.0) && d1 * d2 <= 0.0 && d3 * d4 <= 0.0
+    };
+    let [c0, c1, c2, c3] = corners;
+    let sides = [(c0, c1), (c1, c2), (c2, c3), (c3, c0)];
+    if sides.iter().any(|&(c, e)| crosses(c, e)) {
+        return 0.0;
+    }
+    corners.iter().map(|&c| point_segment(c, a, b)).fold(ends, f64::min)
+}
+
 /// [`Stock::intrusion`] of the box `lo`–`hi` (already shrunk by the tolerance).
 fn box_intrusion(lo: Vec3, hi: Vec3, pose: &Pose, radius: f64) -> Option<f64> {
     if !(lo.x < hi.x && lo.y < hi.y && lo.z < hi.z) {
@@ -202,14 +312,12 @@ fn box_intrusion(lo: Vec3, hi: Vec3, pose: &Pose, radius: f64) -> Option<f64> {
         let gap = side(i).hypot(side(j));
         return (gap < radius).then(|| along.min(radius - gap));
     }
-    // A tilted cutter: its axis sampled, each point grown by the radius (a little larger than
-    // the cutter around its tip, so on the safe side).
+    // A tilted cutter: the nearest its axis comes to the box, grown by the radius (a little
+    // larger than the cutter around its tip, so on the safe side). The distance to a convex box
+    // along a line is convex, so its least is found exactly; past `reach` the axis is farther
+    // from the box than the radius.
     let reach = point_box(p, lo, hi) + (hi - lo).len() + radius;
-    let mut nearest = f64::INFINITY;
-    for k in 0..=AXIS_SAMPLES {
-        let q = p + a * (reach * k as f64 / AXIS_SAMPLES as f64);
-        nearest = nearest.min(point_box(q, lo, hi));
-    }
+    let nearest = convex_min(|t| point_box(p + a * t, lo, hi), 0.0, reach);
     (nearest < radius).then_some(radius - nearest)
 }
 
@@ -240,16 +348,16 @@ pub(crate) fn axis_intrusion(pose: &Pose, radius: f64, center: Vec2, big: f64, x
         }
         (q.len() - radius).max(0.0)
     } else {
-        // Neither: the axis sampled, each point grown by the radius.
-        let reach = q.len() + big + (x_hi - x_lo) + radius;
-        let mut best = f64::INFINITY;
-        for k in 0..=AXIS_SAMPLES {
-            let s = p + a * (reach * k as f64 / AXIS_SAMPLES as f64);
-            if s.x + radius > x_lo && s.x - radius < x_hi {
-                best = best.min(((s.y - center.x).hypot(s.z - center.y) - radius).max(0.0));
-            }
+        // Neither: the nearest the axis comes to the line while level with the region along X
+        // (grown by the radius), each point grown by the radius. Both the distance to a line and
+        // the stretch of the axis level with the region are convex, so the least is exact
+        // however far along the axis that stretch is.
+        let (t1, t2) = ((x_lo - radius - p.x) / a.x, (x_hi + radius - p.x) / a.x);
+        let (lo, hi) = (t1.min(t2).max(0.0), t1.max(t2));
+        if !(lo < hi) || !hi.is_finite() {
+            return None;
         }
-        best
+        convex_min(|t| ((p.y + a.y * t - center.x).hypot(p.z + a.z * t - center.y) - radius).max(0.0), lo, hi)
     };
     (nearest < big).then_some(big - nearest)
 }
@@ -273,6 +381,11 @@ pub struct FaceParams {
     /// Every other pass runs back, linked at depth outside the area; otherwise every pass runs
     /// the same way and the tool rises to the retract height between them.
     pub zigzag: bool,
+    /// The job's stock, when it has one: the facing is refused where a descent or a link
+    /// between passes would run in it (an area that does not reach past the stock along the
+    /// passes), or where the bottom is below the stock's (what holds the stock is there).
+    #[serde(default)]
+    pub stock: Option<Stock>,
 }
 
 /// The diameter of the flat of `tool`'s end: what leaves a flat floor.
@@ -376,7 +489,19 @@ pub fn face(tool: &Tool, p: &FaceParams) -> Result<Toolpath> {
     };
     let world = |u: f64, v: f64, z: f64| Vec3::new(u * c - v * s, u * s + v * c, z);
 
+    if let Some(stock) = p.stock {
+        stock.validate()?;
+        if h.bottom < stock.bottom() - 1e-6 {
+            return invalid(format!(
+                "the bottom ({}) is below the stock's bottom ({}): the tool would cut into what holds the stock",
+                h.bottom,
+                stock.bottom()
+            ));
+        }
+    }
     let mut path = Path { moves: Vec::new() };
+    // The descents and the links between passes, which must be clear of the stock.
+    let mut entries: Vec<(Vec3, Vec3)> = Vec::new();
     let mut at_start_side = true;
     for (li, z) in levels(h.top, h.bottom, p.stepdown)?.into_iter().enumerate() {
         // Each level runs the passes the other way round from the last, so a zigzag carries on
@@ -393,6 +518,9 @@ pub fn face(tool: &Tool, p: &FaceParams) -> Result<Toolpath> {
             if carry_on {
                 // Along the line outside the area, or down beside it to the next level.
                 let feed = if k == 0 { p.feeds.plunge } else { p.feeds.cut };
+                if let Some(q) = pos {
+                    entries.push((q, a));
+                }
                 path.push(Move::Feed { to: a, feed })?;
             } else {
                 match pos {
@@ -407,6 +535,9 @@ pub fn face(tool: &Tool, p: &FaceParams) -> Result<Toolpath> {
                 if path.pos().is_some_and(|q| q.z > h.retract) {
                     path.push(Move::Rapid { to: world(ua, v, h.retract) })?;
                 }
+                if let Some(q) = path.pos() {
+                    entries.push((q, a));
+                }
                 path.push(Move::Feed { to: a, feed: p.feeds.plunge })?;
             }
             path.push(Move::Feed { to: b, feed: p.feeds.cut })?;
@@ -415,6 +546,18 @@ pub fn face(tool: &Tool, p: &FaceParams) -> Result<Toolpath> {
     }
     if let Some(q) = path.pos() {
         path.push(Move::Rapid { to: Vec3::new(q.x, q.y, h.clearance) })?;
+    }
+    if let Some(stock) = p.stock {
+        for (q, a) in entries {
+            let Some([slo, shi]) = stock.section_above(q.z.min(a.z), 0.0) else { continue };
+            if segment_rect(Vec2::new(q.x, q.y), Vec2::new(a.x, a.y), slo, shi) < r - 1e-6 {
+                return invalid(format!(
+                    "the tool would go down into the stock at [{:.3}, {:.3}, {:.3}]: give an area that reaches past the \
+                     stock along the passes, or face the whole stock",
+                    a.x, a.y, a.z
+                ));
+            }
+        }
     }
     let out = Toolpath { moves: path.moves };
     verify(&out, &h)?;

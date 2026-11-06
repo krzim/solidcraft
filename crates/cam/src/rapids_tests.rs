@@ -2,13 +2,13 @@
 //! stock and a holder's reach, a 4th-axis turn at a low height beside a square bar, the tool of
 //! every block found per operation, and hostile input.
 
-use solidcore_record::Vec3;
+use solidcore_record::{Vec2, Vec3};
 
 use crate::foundation_tests::block;
 use crate::gcode5::{MachineOperation, MachineProgram, Post5, emit_program};
 use crate::indexed::IndexedOperation;
 use crate::kinematics::Machine;
-use crate::rapids::{RAPID_STEP, RapidCheck, RapidHitKind, check_rapids, check_travel};
+use crate::rapids::{RAPID_STEP, RapidCheck, RapidHitKind, check_rapids, check_rapids_staged, check_travel};
 use crate::rotary::rotary_pose;
 use crate::stock::Stock;
 use crate::*;
@@ -252,4 +252,65 @@ fn hostile_rapid_checks_are_refused_without_panics() {
     assert!(check_travel(&text, &limits).is_err());
     limits.linear_limits = Some((Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)));
     assert!(check_travel("G0 X1 Y2 Z3\nG91 G0 X5\n", &limits).is_err());
+}
+
+/// A rapid 0.5 over the part, below the top of a stock 1 mm above it: through the stock, unless
+/// the operation before faced the whole top down to the part's. A stock faced only in part, or
+/// a block of no known operation, is held against the stock as given.
+#[test]
+fn a_rapid_over_a_faced_stock_is_held_against_what_is_left() {
+    let post = Post5::mach3_4axis();
+    let machine = Machine::three_axis();
+    let stock = Stock::Box { min: Vec3::new(-15.0, -15.0, -12.0), max: Vec3::new(15.0, 15.0, 1.0) };
+    let ops = program(vec![
+        rapids_op("face", flat(1, 6.0), &[Vec3::new(-30.0, 0.0, 10.0), Vec3::new(-30.0, 0.0, 3.0)]),
+        rapids_op("skim", flat(1, 6.0), &[Vec3::new(-30.0, 0.0, 10.0), Vec3::new(-30.0, 0.0, 0.5), Vec3::new(0.0, 0.0, 0.5)]),
+    ]);
+    let text = emit_program(&ops, &post, &machine).unwrap();
+    let run = |stages: &[Option<Stock>]| {
+        check_rapids_staged(&text, &ops, &post, &machine, &part_and_clamp(), &part(), Some(&stock), stages, 0.01, RAPID_STEP)
+    };
+    let faced = stock.faced(stock.footprint(), 0.0);
+    assert_eq!(faced, Stock::Box { min: Vec3::new(-15.0, -15.0, -12.0), max: Vec3::new(15.0, 15.0, 0.0) });
+    assert!(run(&[Some(stock), Some(faced)]).unwrap().pass());
+    let r = run(&[]).unwrap();
+    assert!(r.hits.iter().any(|h| h.kind == RapidHitKind::Stock && h.operation == Some(1)), "{r:?}");
+    // Half the top faced: the stock is kept as it was.
+    let half = stock.faced([Vec2::new(-15.0, -15.0), Vec2::new(0.0, 15.0)], 0.0);
+    assert_eq!(half, stock);
+    assert!(!run(&[Some(stock), Some(half)]).unwrap().pass());
+    // A bar's flat, a bottom out of the box or not a number: kept.
+    let bar = Stock::Cylinder { radius: 5.0, x_min: 0.0, x_max: 1.0 };
+    assert_eq!(bar.faced(bar.footprint(), 4.0), bar);
+    for z in [-13.0, 2.0, f64::NAN] {
+        assert_eq!(stock.faced(stock.footprint(), z), stock, "{z}");
+    }
+    // One stage per operation, each a valid stock.
+    assert!(run(&[Some(stock)]).is_err());
+    let bad = Stock::Box { min: Vec3::new(1.0, 0.0, 0.0), max: Vec3::new(0.0, 1.0, 1.0) };
+    assert!(run(&[Some(stock), Some(bad)]).is_err());
+    // A program that is not the one written: every block against the stock as given.
+    let other = "G0 X-30 Y0 Z10\nG0 X-30 Y0 Z0.5\nG0 X0 Y0 Z0.5\n";
+    let r =
+        check_rapids_staged(other, &ops, &post, &machine, &part_and_clamp(), &part(), Some(&stock), &[Some(stock), Some(faced)], 0.01, 0.5).unwrap();
+    assert!(!r.tools_known && r.hits.iter().any(|h| h.kind == RapidHitKind::Stock), "{r:?}");
+}
+
+/// A quarter arc of radius 100 from 90.7° to 0.7° (clockwise) peaks at Y 100 just after it
+/// starts, between where 64 even samples look: beyond a travel ending at Y 99.995, found; within
+/// one ending at Y 100.001, clear. Counter-clockwise the other way round, the same.
+#[test]
+fn an_arc_past_the_travel_between_samples_is_found() {
+    let (a, b) = (90.7f64.to_radians(), 0.7f64.to_radians());
+    let (s, e) = (Vec3::new(100.0 * a.cos(), 100.0 * a.sin(), 0.0), Vec3::new(100.0 * b.cos(), 100.0 * b.sin(), 0.0));
+    let cw = format!("G90 G17\nG0 X{:.6} Y{:.6} Z0\nG2 X{:.6} Y{:.6} I{:.6} J{:.6} F300\n", s.x, s.y, e.x, e.y, -s.x, -s.y);
+    let ccw = format!("G90 G17\nG0 X{:.6} Y{:.6} Z0\nG3 X{:.6} Y{:.6} I{:.6} J{:.6} F300\n", e.x, e.y, s.x, s.y, -e.x, -e.y);
+    let mut m = Machine::three_axis();
+    for text in [&cw, &ccw] {
+        m.linear_limits = Some((Vec3::new(-200.0, -200.0, -50.0), Vec3::new(200.0, 99.995, 50.0)));
+        let v = check_travel(text, &m).unwrap().unwrap().violation.unwrap_or_else(|| panic!("{text}"));
+        assert!(v.axis == 'Y' && v.line == 3 && (v.value - 100.0).abs() < 1e-6, "{v:?}");
+        m.linear_limits = Some((Vec3::new(-200.0, -200.0, -50.0), Vec3::new(200.0, 100.001, 50.0)));
+        assert_eq!(check_travel(text, &m).unwrap().unwrap().violation, None, "{text}");
+    }
 }
