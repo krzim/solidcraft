@@ -17,11 +17,14 @@
 //! thread is climb milled from the bottom up and an external one from the top down. Z is the
 //! tool's tip: a single-point thread mill's tooth is taken at its tip, and a multi-form tool's
 //! rows of teeth stand a pitch apart above it, over its flute length, so each turn of it cuts
-//! as many pitches of thread as it has rows.
+//! as many pitches of thread as it has rows. An internal thread's leads (half circles through
+//! the axis) turn the tool a quarter turn about the axis, so they rise a quarter pitch with the
+//! helix: wherever the teeth touch the wall they are on the thread, never notching its flanks.
+//! No arc goes down faster than the plunge feed.
 //!
-//! The model does not show a thread, so the gouge check takes a thread mill as a flat cylinder
-//! at the roots of its teeth ([`thread_check_tool`]): the thread's depth inside its radius. That
-//! core must clear the part; the teeth beyond it cut the thread.
+//! The model does not show a thread, so the gouge check of thread milling takes the thread mill
+//! as a flat end mill at the roots of its teeth ([`thread_check_tool`]): the thread's depth
+//! inside its radius. That core must clear the part; the teeth beyond it cut the thread.
 
 use std::f64::consts::{PI, TAU};
 
@@ -153,6 +156,8 @@ fn on(c: Vec2, rho: f64, angle: f64) -> Vec2 {
 struct Builder {
     moves: Vec<Move>,
     pos: Option<Vec3>,
+    /// The plunge feed: no arc goes down faster than this.
+    plunge: f64,
 }
 
 impl Builder {
@@ -191,14 +196,30 @@ impl Builder {
         }
     }
 
-    /// A half circle from where the tool is to `to` (same Z), turning `ccw`.
-    fn half_circle(&mut self, to: Vec2, ccw: bool, feed: f64) -> Result<()> {
+    /// An arc to `to` round `center`, `sweep` radians long, at `feed`, slowed if need be so that
+    /// it goes down no faster than the plunge feed: a steep helix close round the axis is
+    /// nearly a plunge.
+    fn arc(&mut self, to: Vec3, center: Vec2, ccw: bool, sweep: f64, feed: f64) -> Result<()> {
+        let p = self.at()?;
+        let drop = p.z - to.z;
+        let feed = if drop > 1e-12 {
+            let length = (sweep.abs() * Vec2::new(p.x, p.y).dist(center)).hypot(drop);
+            feed.min(self.plunge * length / drop)
+        } else {
+            feed
+        };
+        self.push(Move::Arc { to, center, ccw, feed })
+    }
+
+    /// A half circle from where the tool is to `to` at height `z` (a helical one when that is
+    /// not the tool's height), turning `ccw`.
+    fn half_circle(&mut self, to: Vec2, z: f64, ccw: bool, feed: f64) -> Result<()> {
         let p = self.at()?;
         let from = Vec2::new(p.x, p.y);
         if from.dist(to) <= 1e-9 {
-            return Ok(());
+            return self.vertical(z, self.plunge);
         }
-        self.push(Move::Arc { to: to.extend(p.z), center: (from + to) * 0.5, ccw, feed })
+        self.arc(to.extend(z), (from + to) * 0.5, ccw, PI, feed)
     }
 
     /// A helix round `c` at radius `rho` from the tool's position (at `angle` on that circle) to
@@ -224,10 +245,10 @@ impl Builder {
         let arcs = (halves - MIN_SWEEP / PI).ceil().max(1.0) as usize;
         for k in 1..arcs {
             let a = angle + turn * k as f64;
-            self.push(Move::Arc { to: on(c, rho, a).extend(z_from + rise * k as f64), center: c, ccw, feed })?;
+            self.arc(on(c, rho, a).extend(z_from + rise * k as f64), c, ccw, PI, feed)?;
         }
         let end = angle + turn * halves;
-        self.push(Move::Arc { to: on(c, rho, end).extend(z_to), center: c, ccw, feed })?;
+        self.arc(on(c, rho, end).extend(z_to), c, ccw, PI * (halves - (arcs - 1) as f64), feed)?;
         Ok(end)
     }
 
@@ -235,8 +256,8 @@ impl Builder {
     fn circle(&mut self, c: Vec2, rho: f64, angle: f64, ccw: bool, feed: f64) -> Result<()> {
         let z = self.at()?.z;
         let turn = if ccw { PI } else { -PI };
-        self.push(Move::Arc { to: on(c, rho, angle + turn).extend(z), center: c, ccw, feed })?;
-        self.push(Move::Arc { to: on(c, rho, angle + 2.0 * turn).extend(z), center: c, ccw, feed })
+        self.arc(on(c, rho, angle + turn).extend(z), c, ccw, PI, feed)?;
+        self.arc(on(c, rho, angle + 2.0 * turn).extend(z), c, ccw, PI, feed)
     }
 }
 
@@ -351,7 +372,7 @@ pub fn bore(holes: &[Hole], tool: &Tool, p: &BoreParams) -> Result<HelicalPath> 
         }
         plans.push((hole.center, bore_radii(rough, full, r, p.stepover, p.finish_passes)?));
     }
-    let mut b = Builder { moves: Vec::new(), pos: None };
+    let mut b = Builder { moves: Vec::new(), pos: None, plunge: p.feeds.plunge };
     let ccw = p.climb;
     for (k, (c, radii)) in plans.iter().enumerate() {
         let c = *c;
@@ -364,10 +385,10 @@ pub fn bore(holes: &[Hole], tool: &Tool, p: &BoreParams) -> Result<HelicalPath> 
             if j > 0 {
                 b.vertical(h.top, p.feeds.plunge)?;
             }
-            b.half_circle(on(c, rho, 0.0), ccw, p.feeds.cut)?;
+            b.half_circle(on(c, rho, 0.0), h.top, ccw, p.feeds.cut)?;
             let end = b.helix(c, rho, 0.0, h.bottom, pitch_at(&p.descent, rho), ccw, p.feeds.cut)?;
             b.circle(c, rho, end, ccw, p.feeds.cut)?;
-            b.half_circle(c, ccw, p.feeds.cut)?;
+            b.half_circle(c, h.bottom, ccw, p.feeds.cut)?;
         }
         b.rapid(c.extend(h.retract))?;
     }
@@ -378,32 +399,52 @@ pub fn bore(holes: &[Hole], tool: &Tool, p: &BoreParams) -> Result<HelicalPath> 
     Ok(HelicalPath { path, warnings })
 }
 
-/// The tool as the gouge check takes it for a thread cut by `p`: a thread mill whose teeth are
-/// as deep as the thread, so that its cutter ([`Tool::cutter`]) is the flat core inside them.
+/// The tool as the gouge check takes it for a thread cut by `p`: the flat core inside the
+/// thread mill's teeth, as deep as the thread (a flat end mill of that diameter), under the
+/// thread mill's own shank and holder. Only thread milling checks with it: anywhere else a
+/// thread mill is checked whole ([`Tool::cutter`]), its teeth and all.
 pub fn thread_check_tool(tool: &Tool, p: &ThreadParams) -> Result<Tool> {
     let depth = p.thread_depth();
     if !(depth > 0.0) || !(depth < tool.radius()) {
         return invalid("the thread must be less deep than the thread mill's radius");
     }
-    Ok(Tool { tooth_height: Some(depth), ..tool.clone() })
+    Ok(Tool {
+        kind: ToolKind::FlatEndmill,
+        diameter: tool.diameter - 2.0 * depth,
+        corner_radius: None,
+        shank_diameter: Some(tool.shank_diameter.unwrap_or(tool.diameter)),
+        thread_pitch: None,
+        tooth_height: None,
+        description: format!("the core of the ⌀{} mm thread mill inside its teeth", mm(tool.diameter)),
+        ..tool.clone()
+    })
 }
 
-/// The tip heights each turn of the thread mill runs between, lowest first: the thread's whole
-/// length for a single-point tool, one turn per span of teeth for a multi-form one.
-fn thread_segments(tool: &Tool, p: &ThreadParams) -> Result<Vec<(f64, f64)>> {
-    let (bottom, top) = (p.heights.bottom, p.heights.top);
-    let len = top - bottom;
+/// The tip heights the helix of each turn of the thread mill runs between, lowest first, and
+/// how far the teeth cut beyond the thread's top: the thread's length less `lead` (the rise
+/// of a lead) at each end for a single-point tool; for a multi-form one a turn per span of its
+/// teeth from the bottom, the last as low as still reaches the top, all a whole number of
+/// pitches apart so that they cut one helix.
+fn thread_segments(tool: &Tool, p: &ThreadParams, lead: f64) -> Result<(Vec<(f64, f64)>, f64)> {
+    let (lo, hi) = (p.heights.bottom + lead, p.heights.top - lead);
+    if !(hi >= lo - 1e-9) {
+        return invalid(format!("the thread must be at least {} mm long, for the leads in and out", mm(2.0 * lead)));
+    }
+    let len = (hi - lo).max(0.0);
     if !(len / p.pitch <= MAX_TURNS) {
         return Err(CamError::TooLarge(format!("a thread of more than {MAX_TURNS} turns")));
     }
-    let Some(tp) = tool.thread_pitch else { return Ok(vec![(bottom, top)]) };
+    let Some(tp) = tool.thread_pitch else { return Ok((vec![(lo, lo + len)], 0.0)) };
     if (tp - p.pitch).abs() > 1e-6 * p.pitch.max(1.0) {
         return invalid(format!("the thread mill's teeth are {} mm apart: it cuts only a {} mm pitch, not {} mm", mm(tp), mm(tp), mm(p.pitch)));
     }
     let rows = (tool.flute_length / p.pitch + 1e-9).floor().max(1.0);
     let span = rows * p.pitch;
     let n = (len / span - 1e-9).ceil().max(1.0) as usize;
-    Ok((0..n).map(|j| (bottom + span * j as f64, bottom + span * j as f64 + p.pitch)).collect())
+    // The last turn starts the fewest whole pitches up that its teeth still reach the top.
+    let last = lo + p.pitch * ((len - span) / p.pitch - 1e-9).ceil().max(0.0);
+    let start = |j: usize| if j + 1 == n { last } else { lo + span * j as f64 };
+    Ok(((0..n).map(|j| (start(j), start(j) + p.pitch)).collect(), (last + span - hi).max(0.0)))
 }
 
 /// Thread milling round each of `centers` with `tool` (a thread mill): see the module docs.
@@ -433,7 +474,14 @@ pub fn thread_mill(centers: &[Vec2], tool: &Tool, p: &ThreadParams) -> Result<He
         return invalid(format!("the thread mill's teeth are shorter than the thread is deep ({} mm)", mm(depth)));
     }
     thread_check_tool(tool, p)?;
-    let segments = thread_segments(tool, p)?;
+    // An internal thread's leads go round a quarter turn about the axis (a half circle through
+    // it), so they rise a quarter pitch with the helix and its teeth stay on the thread.
+    let lead_rise = if p.internal { p.pitch * 0.25 } else { 0.0 };
+    let (segments, beyond) = thread_segments(tool, p, lead_rise)?;
+    let mut warnings = Vec::new();
+    if beyond > p.pitch + 1e-9 {
+        warnings.push(format!("the thread mill's teeth are longer than the thread: they cut {} mm of thread beyond its top", mm(beyond)));
+    }
     for (i, c) in centers.iter().enumerate() {
         check_center(i, *c)?;
     }
@@ -455,35 +503,38 @@ pub fn thread_mill(centers: &[Vec2], tool: &Tool, p: &ThreadParams) -> Result<He
     }
     let ccw = p.internal == p.climb;
     let up = ccw == p.right_hand;
+    let rise = if up { lead_rise } else { -lead_rise };
     let ordered: Vec<(f64, f64)> = if up { segments } else { segments.into_iter().rev().map(|(lo, hi)| (hi, lo)).collect() };
     // An external thread's lead-in starts this far outside the pass's circle: clear of the
-    // thread by `LEAD_MARGIN`.
+    // thread by `LEAD_MARGIN`. Its leads stay level: they turn the tool only a few degrees
+    // about the axis while its teeth are in the thread.
     let lead = (r * 0.5).max((depth + LEAD_MARGIN) * 0.5);
     let approach = |c: Vec2, rho: f64, angle: f64| if p.internal { c } else { on(c, rho + 2.0 * lead, angle) };
     let lead_ccw = if p.internal { ccw } else { !ccw };
 
-    let mut b = Builder { moves: Vec::new(), pos: None };
+    let mut b = Builder { moves: Vec::new(), pos: None, plunge: p.feeds.plunge };
     for c in centers {
         let c = *c;
         for &rho in &radii {
             for &(z_start, z_end) in &ordered {
                 let s = approach(c, rho, 0.0);
+                let z_in = z_start - rise;
                 match b.pos {
                     None => {
                         b.rapid(s.extend(h.clearance))?;
                         b.rapid(s.extend(h.retract))?;
-                        b.feed(s.extend(z_start), p.feeds.plunge)?;
+                        b.feed(s.extend(z_in), p.feeds.plunge)?;
                     }
                     Some(at) if Vec2::new(at.x, at.y).dist(s) > 1e-9 => {
                         b.vertical(h.retract.max(at.z), p.feeds.plunge)?;
                         b.rapid(s.extend(h.retract))?;
-                        b.feed(s.extend(z_start), p.feeds.plunge)?;
+                        b.feed(s.extend(z_in), p.feeds.plunge)?;
                     }
-                    Some(_) => b.vertical(z_start, p.feeds.plunge)?,
+                    Some(_) => b.vertical(z_in, p.feeds.plunge)?,
                 }
-                b.half_circle(on(c, rho, 0.0), lead_ccw, p.feeds.cut)?;
+                b.half_circle(on(c, rho, 0.0), z_start, lead_ccw, p.feeds.cut)?;
                 let end = b.helix(c, rho, 0.0, z_end, p.pitch, ccw, p.feeds.cut)?;
-                b.half_circle(approach(c, rho, end), lead_ccw, p.feeds.cut)?;
+                b.half_circle(approach(c, rho, end), z_end + rise, lead_ccw, p.feeds.cut)?;
             }
         }
         b.vertical(h.retract.max(b.at()?.z), p.feeds.plunge)?;
@@ -492,5 +543,5 @@ pub fn thread_mill(centers: &[Vec2], tool: &Tool, p: &ThreadParams) -> Result<He
     b.rapid(Vec3::new(last.x, last.y, h.clearance))?;
     let path = Toolpath { moves: b.moves };
     verify(&path, &h)?;
-    Ok(HelicalPath { path, warnings: Vec::new() })
+    Ok(HelicalPath { path, warnings })
 }

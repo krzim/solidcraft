@@ -82,9 +82,8 @@ pub struct Tool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_pitch: Option<f64>,
     /// How far a thread mill's teeth stand out of its core (mm), tips to roots, below the tool
-    /// radius. The gouge check takes a thread mill as a flat cylinder at its roots, since the
-    /// thread its teeth cut is not in the model; left out, the depth of the thread being cut
-    /// (`crate::helical::thread_mill`), or none for other operations. Thread mills only.
+    /// radius: thread milling refuses a thread deeper than this. Left out, any depth up to
+    /// the radius. Thread mills only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tooth_height: Option<f64>,
 }
@@ -131,9 +130,10 @@ impl Tool {
         }
     }
 
-    /// The cutting end's shape. A thread mill is a flat cylinder at the roots of its teeth (its
-    /// radius less [`Tool::tooth_height`]): the form it cuts is a thread the model does not
-    /// show, so only its core must stay clear of the part.
+    /// The cutting end's shape. A thread mill is the flat cylinder its teeth sweep, at their
+    /// tips: whatever checks with it sees all of the tool. Thread milling alone checks with the
+    /// core inside the teeth (`crate::helical::thread_check_tool`), since the thread they cut
+    /// is not in the model.
     pub fn cutter(&self) -> Result<Cutter> {
         let r = self.radius();
         match self.kind {
@@ -141,7 +141,7 @@ impl Tool {
             ToolKind::BallEndmill => Cutter::ball(r),
             ToolKind::BullNose => Cutter::bull(r, self.corner_radius.unwrap_or(0.0)),
             ToolKind::Drill => invalid("a drill cannot mill: it cuts only at its point"),
-            ToolKind::ThreadMill => Cutter::flat(r - self.tooth_height.unwrap_or(0.0)),
+            ToolKind::ThreadMill => Cutter::flat(r),
         }
     }
 

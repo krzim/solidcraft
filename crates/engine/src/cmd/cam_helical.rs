@@ -168,6 +168,9 @@ pub(super) fn thread_mill_op(ctx: &Ctx<'_>, o: &ThreadMillOp, arc_tol: f64) -> R
         spring_pass: o.spring_pass.unwrap_or(false),
     };
     let out = thread_mill(&centers, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
-    let tool = thread_check_tool(&r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
-    planned(ctx, c, Resolved { tool, ..r }, "thread_mill", out.path, out.warnings, arc_tol)
+    let check = thread_check_tool(&r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
+    // The program keeps the thread mill; only the gouge and holder checks take its core.
+    let mut p = planned(ctx, c, r, "thread_mill", out.path, out.warnings, arc_tol)?;
+    p.tool = check;
+    Ok(p)
 }

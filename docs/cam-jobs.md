@@ -189,7 +189,9 @@ model should show the holes (and, for a thread, at least its minor diameter).
 A **bore** goes to each hole's centre, feeds down to `top`, and runs a half-circle lead-in
 inside the hole onto its helix, so the tool reaches the wall along it and never head-on. The
 helix goes down `pitch` per turn (or slopes at `ramp_angle_deg` at the tool centre, its pitch
-then at most `stepdown`), climb milling counter-clockwise by default; a full flat circle cleans
+then at most `stepdown`), climb milling counter-clockwise by default, and never goes down faster
+than the plunge feed: a steep helix close round the axis, nearly a plunge, is slowed to keep its
+Z at the plunge feed. A full flat circle cleans
 the floor, a half-circle lead-out goes back to the centre, and the tool rises inside the hole.
 A hole more than two tool diameters across is opened in several helical rings, the first within
 the tool's radius of the centre (so no core is left) and each further one at most `stepover`
@@ -208,12 +210,21 @@ the minor one. The depth is split into `radial_passes` from the minor (inside) o
 diameter, then `spring_pass` repeats the last. Climb milling goes counter-clockwise inside a hole
 and clockwise round a boss, so a right-hand thread is cut from the bottom up inside and from the
 top down outside; `right_hand: false` or `climb: false` turns that round. Inside, each pass
-starts at the hole's centre with a half-circle lead-in and ends with a lead-out back to it;
-outside, the lead-in comes from just clear of the thread. A multi-form tool makes one turn per
-span of its teeth. A thread mill that does not fit the minor diameter is refused, and so is a
-multi-form tool of another pitch.
+starts at the hole's centre with a half-circle lead-in and ends with a lead-out back to it.
+These leads turn the tool a quarter turn about the axis, so they rise (or fall) a quarter pitch
+with the helix and the teeth stay on the thread: the tip runs from `bottom` to `top`, the full
+depth from a quarter pitch above the one to a quarter pitch below the other, and an internal
+thread must be at least half a pitch long. Outside, the lead-in comes from just clear of the
+thread and the leads stay level (they turn the tool only a few degrees about the axis). A
+multi-form tool makes one turn per span of its teeth from the bottom up; its last turn starts as
+low as still reaches the top, a whole number of pitches above the others, so its teeth cut at
+most a pitch of thread beyond the top (a tool whose teeth are longer than the thread is warned
+of). A thread mill that does not fit the minor diameter is refused, and so is a multi-form tool
+of another pitch.
 
-The gouge check cannot see a thread the model does not show, so it takes a thread mill as a flat
-cylinder at the roots of its teeth, the thread's depth inside its tip radius: that core must stay
-clear of the part, while the teeth beyond it cut the thread. Thread mills are refused by every
-other operation, which would check only that core.
+The gouge check cannot see a thread the model does not show, so for a thread_mill operation it
+takes the thread mill as a flat end mill at the roots of its teeth, the thread's depth inside its
+tip radius, under the thread mill's own shank and holder: that core must stay clear of the part,
+while the teeth beyond it cut the thread. The program still names the thread mill. Thread mills
+are refused by every other milling operation, and anywhere else a thread mill is checked whole,
+its teeth and all.

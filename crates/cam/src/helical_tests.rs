@@ -196,11 +196,12 @@ fn an_m6_internal_thread_rises_exactly_one_pitch_a_turn_counter_clockwise() {
     verify(&out.path, &p.heights).unwrap();
     let c = Vec2::new(5.0, 5.0);
     let helix = round(&out.path, c);
-    assert_eq!(helix.len(), 16, "eight turns of half-turn arcs: {helix:?}");
+    // The leads rise a quarter pitch each, so the helix runs from -7.75 to -0.25.
+    assert_eq!(helix.len(), 15, "seven and a half turns of half-turn arcs: {helix:?}");
     for (k, (a, b, rho, ccw)) in helix.iter().enumerate() {
         assert!(*ccw, "a right-hand internal thread climb milled goes counter-clockwise");
         assert!((b.z - a.z - 0.5).abs() < 1e-12, "half a pitch up each half turn");
-        assert!((b.z - (-8.0 + 0.5 * (k + 1) as f64)).abs() < 1e-12);
+        assert!((b.z - (-7.75 + 0.5 * (k + 1) as f64)).abs() < 1e-12);
         assert!((rho - 0.75).abs() < 1e-9, "the tip at the major diameter: {rho}");
     }
     // The core inside the teeth reaches the minor diameter, no farther.
@@ -246,9 +247,15 @@ fn a_multi_form_thread_mill_turns_once_per_span_of_its_teeth() {
     let p = m6(true);
     let out = thread_mill(&[Vec2::ZERO], &tool, &p).unwrap();
     let helix = round(&out.path, Vec2::ZERO);
-    // 8 mm of thread, 4 rows of teeth: two turns, from -8 and from -4.
+    // 8 mm of thread (7.5 at full depth, inside the leads), 4 rows of teeth: two turns, from
+    // -7.75 and from -3.75.
     assert_eq!(helix.len(), 4, "{helix:?}");
-    assert!((helix[0].0.z + 8.0).abs() < 1e-12 && (helix[2].0.z + 4.0).abs() < 1e-12, "{helix:?}");
+    assert!((helix[0].0.z + 7.75).abs() < 1e-12 && (helix[2].0.z + 3.75).abs() < 1e-12, "{helix:?}");
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    // Teeth longer than the thread are warned of: they cut thread beyond its top.
+    let long = Tool { flute_length: 12.0, ..tool.clone() };
+    let warned = thread_mill(&[Vec2::ZERO], &long, &p).unwrap();
+    assert!(warned.warnings.len() == 1 && warned.warnings[0].contains("beyond its top"), "{:?}", warned.warnings);
     assert!(helix.iter().all(|(a, b, ..)| (b.z - a.z - 0.5).abs() < 1e-12));
     tool.thread_pitch = Some(1.25);
     assert!(thread_mill(&[Vec2::ZERO], &tool, &p).unwrap_err().to_string().contains("1.25"));
@@ -273,7 +280,7 @@ fn a_thread_mill_too_big_for_the_minor_diameter_or_a_wrong_tool_is_refused() {
 }
 
 #[test]
-fn a_thread_mill_is_a_tool_kind_whose_check_cutter_is_its_core() {
+fn a_thread_mill_is_a_tool_kind_with_its_pitch_and_tooth_height() {
     let mut t: Tool = serde_json::from_value(
         serde_json::json!({"number": 7, "kind": "thread_mill", "diameter": 4.5, "flute_length": 10, "thread_pitch": 1.0, "tooth_height": 0.6}),
     )
@@ -281,7 +288,7 @@ fn a_thread_mill_is_a_tool_kind_whose_check_cutter_is_its_core() {
     t.validate().unwrap();
     assert_eq!(t.kind, ToolKind::ThreadMill);
     assert_eq!(t.kind.label(), "thread mill");
-    assert!((t.cutter().unwrap().radius - 1.65).abs() < 1e-12);
+    assert!((t.cutter().unwrap().radius - 2.25).abs() < 1e-12, "checked whole, its teeth and all");
     assert_eq!(serde_json::to_value(&t).unwrap()["kind"], "thread_mill");
     t.tooth_height = Some(2.25);
     assert!(t.validate().is_err(), "teeth as deep as the radius leave no core");
@@ -367,9 +374,136 @@ fn hostile_bores_and_threads_are_refused_without_panics() {
         (vec![Vec2::ZERO], ThreadParams { radial_passes: 0, ..m6(true) }),
         (vec![Vec2::ZERO], ThreadParams { radial_passes: 1000, ..m6(true) }),
         (vec![Vec2::ZERO], ThreadParams { heights: heights(0.0, 0.0), ..m6(true) }),
+        (vec![Vec2::ZERO], ThreadParams { heights: heights(0.0, -0.4), ..m6(true) }),
         (vec![Vec2::ZERO], ThreadParams { feeds: Feeds { cut: nan, plunge: 1.0 }, ..m6(true) }),
     ];
     for (centers, p) in &threads {
         assert!(thread_mill(centers, &tm, p).is_err(), "{centers:?} {p:?}");
     }
+}
+
+/// Every arc of `path` with the point it starts from and its feed.
+fn arc_feeds(path: &Toolpath) -> Vec<(Vec3, Vec3, Vec2, f64)> {
+    let mut out = Vec::new();
+    let mut pos: Option<Vec3> = None;
+    for m in &path.moves {
+        if let (Move::Arc { to, center, feed, .. }, Some(from)) = (m, pos) {
+            out.push((from, *to, *center, *feed));
+        }
+        if let Some(t) = m.target() {
+            pos = Some(t);
+        }
+    }
+    out
+}
+
+/// The fastest any arc of `path` goes down (mm/min): its feed times the share of its length
+/// that is Z.
+fn fastest_descent(path: &Toolpath) -> f64 {
+    arc_feeds(path)
+        .iter()
+        .filter(|(a, b, ..)| b.z < a.z)
+        .map(|(a, b, c, feed)| {
+            let (u, v) = (Vec2::new(a.x, a.y) - *c, Vec2::new(b.x, b.y) - *c);
+            // Every arc here is at most a half turn, so the angle between its ends is its sweep.
+            let sweep = (u.x * v.y - u.y * v.x).atan2(u.x * v.x + u.y * v.y).abs();
+            let len = ((sweep * u.len()).powi(2) + (a.z - b.z).powi(2)).sqrt();
+            feed * (a.z - b.z) / len
+        })
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn a_bores_helix_goes_down_no_faster_than_the_plunge_feed() {
+    let tool = flat(6.0);
+    // A steep helix close round the axis is nearly a plunge: at the cutting feed it would go
+    // down almost three times faster than the plunge feed allows.
+    let steep = bore(&[hole(0.0, 0.0, 6.2)], &tool, &bore_params(3.0)).unwrap();
+    let fastest = fastest_descent(&steep.path);
+    assert!(fastest <= feeds().plunge + 1e-6, "goes down at {fastest} mm/min");
+    // So does the steepest ramp angle, and a gentle helix keeps the cutting feed.
+    let ramp = BoreParams { descent: Descent::Ramp { angle: 45f64.to_radians(), max_pitch: 20.0 }, ..bore_params(1.0) };
+    let ramped = bore(&[hole(0.0, 0.0, 10.0)], &tool, &ramp).unwrap();
+    assert!(fastest_descent(&ramped.path) <= feeds().plunge + 1e-6);
+    let gentle = bore(&[hole(0.0, 0.0, 10.0)], &tool, &bore_params(0.5)).unwrap();
+    assert!(arc_feeds(&gentle.path).iter().all(|(.., f)| (*f - feeds().cut).abs() < 1e-9));
+}
+
+/// How far (in turns) the cutting points of `path` farther than `near` from `c` are off the
+/// thread's helix through `(angle 0, z0)`, rising counter-clockwise for a right-hand thread.
+fn off_helix(path: &Toolpath, c: Vec2, z0: f64, pitch: f64, right_hand: bool, near: f64) -> f64 {
+    let s = if right_hand { 1.0 } else { -1.0 };
+    path.points(1e-4)
+        .iter()
+        .filter(|(p, cut)| *cut && Vec2::new(p.x, p.y).dist(c) > near)
+        .map(|(p, _)| {
+            let d = Vec2::new(p.x, p.y) - c;
+            let turns = (p.z - z0) / pitch - s * d.y.atan2(d.x) / TAU;
+            (turns - turns.round()).abs()
+        })
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn an_internal_threads_leads_follow_its_helix() {
+    // The teeth meet the wall wherever the tool centre is farther from the axis than the
+    // minor diameter less the tool: in the leads as well as on the helix. There they must cut
+    // the same helix, or the leads in and out notch the thread's flanks.
+    let c = Vec2::new(5.0, 5.0);
+    let p = m6(true);
+    let tool = thread_tool(4.5);
+    let first = 3.0 - p.thread_depth() - 2.25;
+    for params in [p, ThreadParams { right_hand: false, ..p }, ThreadParams { climb: false, ..p }, ThreadParams { radial_passes: 3, ..p }] {
+        let out = thread_mill(&[c], &tool, &params).unwrap();
+        verify(&out.path, &params.heights).unwrap();
+        let z0 = round(&out.path, c)[0].0.z;
+        let off = off_helix(&out.path, c, z0, 1.0, params.right_hand, first);
+        assert!(off < 1e-6, "{off} turns off the helix: {params:?}");
+        assert!(out.path.stats().lowest_z.is_some_and(|z| z >= -8.0 - 1e-12));
+    }
+    // A multi-form tool's turns join on the same helix.
+    let mut multi = thread_tool(4.5);
+    multi.thread_pitch = Some(1.0);
+    multi.flute_length = 3.0;
+    let out = thread_mill(&[c], &multi, &p).unwrap();
+    let z0 = round(&out.path, c)[0].0.z;
+    assert!(off_helix(&out.path, c, z0, 1.0, true, first) < 1e-6);
+}
+
+#[test]
+fn a_multi_form_thread_mills_teeth_stop_within_a_pitch_of_the_top() {
+    // 5 mm of thread with 4 rows of teeth: the second turn must not start a whole span above
+    // the first, or its upper teeth cut 3 mm of thread above the top.
+    let mut tool = thread_tool(4.5);
+    tool.thread_pitch = Some(1.0);
+    tool.flute_length = 4.0;
+    let p = ThreadParams { heights: heights(0.0, -5.0), ..m6(true) };
+    let out = thread_mill(&[Vec2::ZERO], &tool, &p).unwrap();
+    let helix = round(&out.path, Vec2::ZERO);
+    let highest_tip = helix.iter().map(|(a, b, ..)| a.z.max(b.z)).fold(f64::NEG_INFINITY, f64::max);
+    // The top row of teeth stands three pitches above the tip.
+    assert!(highest_tip + 3.0 <= 1.0 + 1e-9, "the teeth reach {} mm", highest_tip + 3.0);
+    // And every pitch of the thread from the bottom up is still cut: the turns meet or overlap.
+    let mut starts: Vec<f64> = helix.iter().filter(|(a, ..)| a.x > 0.0 && a.y.abs() < 1e-9).map(|(a, ..)| a.z).collect();
+    starts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    assert!(starts.len() >= 2 && starts.windows(2).all(|w| w[1] - w[0] <= 4.0 + 1e-9 && w[1] > w[0]), "{starts:?}");
+}
+
+#[test]
+fn a_thread_mill_is_checked_whole_outside_thread_milling() {
+    // Only thread milling may take a thread mill as the core inside its teeth; anything else
+    // that checks with `cutter` (the 5-axis strategies, a wrapped path) must see its teeth.
+    let mut t = thread_tool(4.5);
+    t.tooth_height = Some(0.6);
+    t.validate().unwrap();
+    assert!((t.cutter().unwrap().radius - 2.25).abs() < 1e-12);
+    let p = m6(true);
+    let check = thread_check_tool(&t, &p).unwrap();
+    check.validate().unwrap();
+    assert!((check.cutter().unwrap().radius - (2.25 - p.thread_depth())).abs() < 1e-12);
+    assert_eq!(check.number, t.number);
+    // The shank and holder above the flutes are the thread mill's.
+    assert_eq!(check.envelopes(), t.envelopes());
+    let shanked = Tool { shank_diameter: Some(4.0), stickout: Some(20.0), ..t.clone() };
+    assert_eq!(thread_check_tool(&shanked, &p).unwrap().envelopes(), shanked.envelopes());
 }

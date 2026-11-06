@@ -526,16 +526,21 @@ fn an_m6x1_internal_thread_is_written_one_pitch_a_turn_and_passes_the_checks() {
     assert_eq!(r["operations"][0]["kind"], "thread_mill", "{r}");
     let text = std::fs::read_to_string(&out).unwrap();
     let z = helix_z(&text);
-    // Eight turns up from -8, counter-clockwise: each half turn exactly half a pitch.
-    assert_eq!(z.len(), 16, "{text}");
+    // Up from -8 to 0, counter-clockwise: the lead-in and lead-out each rise a quarter pitch
+    // (a quarter turn about the axis) and every half turn of the helix exactly half a pitch.
+    assert_eq!(z.len(), 17, "{text}");
     assert!(z.iter().all(|(_, g)| *g == 3), "{z:?}");
     let mut last = -8.0;
-    for (zk, _) in &z {
-        assert!((zk - last - 0.5).abs() < 1e-9, "{z:?}");
+    for (k, (zk, _)) in z.iter().enumerate() {
+        let rise = if k == 0 || k == z.len() - 1 { 0.25 } else { 0.5 };
+        assert!((zk - last - rise).abs() < 1e-9, "{z:?}");
         last = *zk;
     }
-    let turns: Vec<f64> = z.chunks(2).filter_map(|t| t.last().map(|(zk, _)| *zk)).collect();
+    assert!((last - 0.0).abs() < 1e-9, "{z:?}");
+    let turns: Vec<f64> = z[..16].chunks(2).filter_map(|t| t.first().map(|(zk, _)| *zk)).collect();
     assert!(turns.windows(2).all(|w| (w[1] - w[0] - 1.0).abs() < 1e-9), "one pitch per turn: {turns:?}");
+    // The program names the thread mill itself; only the checks take its core.
+    assert!(text.contains("T2 D4.5 thread mill"), "{text}");
     // A thread mill too big for the minor diameter, or an end mill, is refused.
     let mut big = m6_job();
     big["tools"][0]["diameter"] = json!(5.2);
