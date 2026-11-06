@@ -505,3 +505,129 @@ fn hostile_options_are_errors_never_panics() {
     assert!(cutting_points(&path, 0.0).iter().all(|p| v(p.x, p.y).len() >= 11.0 - 1e-6));
     assert!(verify(&path, &c.heights).is_ok());
 }
+
+/// The fastest any cut goes down (mm/min of Z): a feed's or an arc's rate times the share of
+/// its length that is descent.
+fn fastest_descent(path: &Toolpath) -> f64 {
+    let mut pos: Option<Vec3> = None;
+    let mut fastest = 0.0f64;
+    for m in &path.moves {
+        if let Some(p) = pos {
+            match *m {
+                Move::Feed { to, feed } if to.z < p.z - 1e-9 => fastest = fastest.max(feed * (p.z - to.z) / p.dist(to)),
+                Move::Arc { to, center, ccw, feed } if to.z < p.z - 1e-9 => {
+                    let run = v(p.x, p.y).dist(center) * arc_sweep(p, to, center, ccw);
+                    fastest = fastest.max(feed * (p.z - to.z) / run.hypot(p.z - to.z));
+                }
+                _ => {}
+            }
+        }
+        pos = m.target().or(pos);
+    }
+    fastest
+}
+
+#[test]
+fn no_cut_goes_down_faster_than_the_plunge_feed() {
+    // The feeds of a 3 mm cutter in aluminium on a small mill: 2880 across, 100 down. A tab's
+    // 30° ramp at the cutting feed would go down at 1440 mm/min, a 2° helix at 100.5.
+    let feeds = Feeds { cut: 2880.0, plunge: 100.0 };
+    let c = Cut { feeds, ..cut(0.0, -6.0, 2.0) };
+    let regions = [rect(0.0, 0.0, 40.0, 30.0)];
+    let angle = 2f64.to_radians();
+    let tabs = Some(Tabs { layout: TabLayout::Count(4), width: 4.0, height: 2.0, ramp_angle: PI / 6.0 });
+    let lead = Some(Lead { radius: 2.0, sweep: PI / 2.0, line: 2.0 });
+    for climb in [true, false] {
+        for (entry, lead, tabs) in [
+            (Entry::Plunge, None, tabs),
+            (Entry::Ramp { angle }, None, tabs),
+            (Entry::Ramp { angle }, lead, None),
+            (Entry::Helix { radius: 1.4, angle }, None, None),
+            (Entry::Helix { radius: 1.4, angle }, lead, tabs),
+        ] {
+            let opts = ContourOptions { entry: Some(entry), lead, tabs, finish_passes: 1, finish_stepover: 0.2, ..ContourOptions::default() };
+            let path = contour_with(&regions, &tool(3.0), &outside(climb), &opts, &c, &never).unwrap();
+            let fastest = fastest_descent(&path);
+            assert!(fastest <= feeds.plunge * (1.0 + 1e-9), "{entry:?} {lead:?} {tabs:?}: down at {fastest} mm/min");
+            // Only the descents are slowed: the passes themselves go at the cutting feed.
+            assert!(path.moves.iter().any(|m| matches!(m, Move::Feed { feed, .. } if *feed == feeds.cut)));
+        }
+        let params = PocketParams { climb, ..lanes(1.2) };
+        for entry in [Entry::Helix { radius: 1.4, angle }, Entry::Ramp { angle }] {
+            for linking in [Linking::Clearance, Linking::StayDown] {
+                let opts = PocketOptions { entry: Some(entry), linking };
+                let path = pocket_with(&regions, &tool(3.0), &params, &opts, &c, &always).unwrap();
+                let fastest = fastest_descent(&path);
+                assert!(fastest <= feeds.plunge * (1.0 + 1e-9), "{entry:?} {linking:?}: down at {fastest} mm/min");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_contour_on_the_profile_takes_no_lead_or_helix() {
+    // On the profile the tool cuts both sides of the line: a lead or a helix beside it would
+    // cut into the face the line is engraved in.
+    let regions = [rect(0.0, 0.0, 40.0, 30.0)];
+    let c = cut(0.0, -1.0, 1.0);
+    let on = ContourParams { side: Side::On, ..outside(true) };
+    let lead = ContourOptions { lead: Some(Lead { radius: 2.0, sweep: PI / 2.0, line: 0.0 }), ..ContourOptions::default() };
+    let e = contour_with(&regions, &tool(3.0), &on, &lead, &c, &never).unwrap_err();
+    assert!(e.to_string().contains("on the profile"), "{e}");
+    let helix = ContourOptions { entry: Some(Entry::Helix { radius: 1.0, angle: 0.05 }), ..ContourOptions::default() };
+    let e = contour_with(&regions, &tool(3.0), &on, &helix, &c, &never).unwrap_err();
+    assert!(e.to_string().contains("on the profile"), "{e}");
+    // A ramp or a plunge stays on the line.
+    for entry in [Entry::Ramp { angle: 0.05 }, Entry::Plunge] {
+        let opts = ContourOptions { entry: Some(entry), ..ContourOptions::default() };
+        let path = contour_with(&regions, &tool(3.0), &on, &opts, &c, &never).unwrap();
+        let shape = Shape::from_regions(&regions, 0.01).unwrap();
+        assert!(cutting_points(&path, 0.0).iter().all(|p| shape.dist(v(p.x, p.y)) < 1e-6), "{entry:?}");
+    }
+}
+
+#[test]
+fn finishing_passes_never_reach_where_the_depth_passes_did_not_fit() {
+    // A part with a notch 10 mm wide, 20 deep. A 6 mm tool's depth passes 7.5 out do not fit in
+    // it (they would need 15 mm); finishing passes 4.5 and 3 out do, and the first of them would
+    // cut the notch as a full slot at full depth.
+    let notched = [polygon(&[(0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (25.0, 30.0), (25.0, 10.0), (15.0, 10.0), (15.0, 30.0), (0.0, 30.0)])];
+    let c = cut(0.0, -6.0, 3.0);
+    let opts = ContourOptions { finish_passes: 3, finish_stepover: 1.5, ..ContourOptions::default() };
+    let e = contour_with(&notched, &tool(6.0), &outside(true), &opts, &c, &never).unwrap_err();
+    assert!(e.to_string().contains("full slot"), "{e}");
+    // Two parts 10 mm apart: the depth passes go round both, the finishing passes between them.
+    let pair = [rect(0.0, 0.0, 40.0, 30.0), rect(0.0, 40.0, 40.0, 70.0)];
+    let e = contour_with(&pair, &tool(6.0), &outside(true), &opts, &c, &never).unwrap_err();
+    assert!(e.to_string().contains("full slot"), "{e}");
+    // An opening whose neck the depth passes cannot pass but the finishing passes can.
+    let inside = ContourParams { side: Side::Inside, ..outside(true) };
+    let dumbbell = [polygon(&[
+        (0.0, 0.0),
+        (20.0, 0.0),
+        (20.0, 10.0),
+        (30.0, 10.0),
+        (30.0, 0.0),
+        (50.0, 0.0),
+        (50.0, 30.0),
+        (30.0, 30.0),
+        (30.0, 20.0),
+        (20.0, 20.0),
+        (20.0, 30.0),
+        (0.0, 30.0),
+    ])];
+    let e = contour_with(&dumbbell, &tool(6.0), &inside, &opts, &c, &never).unwrap_err();
+    assert!(e.to_string().contains("full slot"), "{e}");
+    // Where the depth passes fit too, or the finishing passes take less, the passes are planned,
+    // sharp corners included.
+    let light = ContourOptions { finish_passes: 1, finish_stepover: 0.3, ..ContourOptions::default() };
+    for (regions, params) in [(&notched[..], outside(true)), (&pair[..], outside(true)), (&dumbbell[..], inside)] {
+        assert!(contour_with(regions, &tool(6.0), &params, &light, &c, &never).is_ok());
+    }
+    let wide = [polygon(&[(0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (30.0, 30.0), (30.0, 10.0), (10.0, 10.0), (10.0, 30.0), (0.0, 30.0)])];
+    assert!(contour_with(&wide, &tool(6.0), &outside(true), &opts, &c, &never).is_ok());
+    let triangle = [polygon(&[(0.0, 0.0), (60.0, 0.0), (30.0, 40.0)])];
+    for params in [outside(true), inside] {
+        assert!(contour_with(&triangle, &tool(6.0), &params, &opts, &c, &never).is_ok());
+    }
+}

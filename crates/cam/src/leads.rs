@@ -31,7 +31,7 @@ use crate::ops::{
     Builder, ContourParams, Cut, MAX_COORD, MAX_RAMP_LAPS, PocketParams, Side, check_leave, check_ramp, corner_spur, link_is_clear, mills,
     pocket_rings, start_near,
 };
-use crate::path::{Move, Toolpath};
+use crate::path::{Move, Toolpath, arc_sweep};
 use crate::piece::{Piece, wrap};
 use crate::tool::Tool;
 use crate::{CamError, Result, invalid};
@@ -200,6 +200,47 @@ fn entry_of(entry: Option<Entry>, ramp: f64, tool_radius: f64) -> Result<Entry> 
 
 fn xy(p: solidcore_record::Vec3) -> Vec2 {
     Vec2::new(p.x, p.y)
+}
+
+/// Slows every cut that goes down so that the tool goes down no faster than the plunge feed.
+/// A ramp, a helix or the way down off a tab at the cutting feed would otherwise drive the tool
+/// down many times faster than that (a 30° ramp at 2880 mm/min goes down at 1440 mm/min, where
+/// a small tool may be rated for 100).
+fn limit_descent(moves: &mut [Move], plunge: f64) {
+    let cap = |feed: &mut f64, len: f64, dz: f64| {
+        let most = plunge * (len / dz).max(1.0);
+        if *feed > most {
+            *feed = most;
+        }
+    };
+    let mut pos: Option<solidcore_record::Vec3> = None;
+    for m in moves.iter_mut() {
+        let from = pos;
+        pos = m.target().or(pos);
+        let Some(p) = from else { continue };
+        match m {
+            Move::Feed { to, feed } if p.z - to.z > 1e-9 => cap(feed, p.dist(*to), p.z - to.z),
+            Move::Arc { to, center, ccw, feed } if p.z - to.z > 1e-9 => {
+                let run = xy(p).dist(*center) * arc_sweep(p, *to, *center, *ccw);
+                cap(feed, run.hypot(p.z - to.z), p.z - to.z);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether every point of `lp` is within `reach` of one of `others`; sampled about a quarter of
+/// a tool radius apart.
+fn runs_near(lp: &[Piece], others: &[Vec<Piece>], reach: f64, r: f64) -> bool {
+    lp.iter().all(|piece| {
+        let len = piece.length();
+        let step = (r * 0.25).max(len / MAX_SAMPLES as f64).max(1e-3);
+        let n = ((len / step).ceil() as usize).clamp(1, MAX_SAMPLES);
+        (0..=n).all(|i| {
+            let q = piece.point_at(i as f64 / n as f64);
+            others.iter().flatten().any(|o| o.dist(q) <= reach)
+        })
+    })
 }
 
 fn length(lp: &[Piece]) -> f64 {
@@ -728,6 +769,9 @@ pub fn contour_with(
     if let Some(l) = &opts.lead {
         l.validate()?;
     }
+    if params.side == Side::On && (opts.lead.is_some() || matches!(entry, Entry::Helix { .. })) {
+        return invalid("on the profile both sides of the line are the part: a lead or a helix would cut beside it; use a ramp or a plunge");
+    }
     if let Some(t) = &opts.tabs {
         if params.side != Side::Outside {
             return invalid("tabs hold a part cut out round its outside: they need the outside side");
@@ -760,6 +804,17 @@ pub fn contour_with(
         return invalid("the tool does not fit the profile");
     }
     let finishing = (0..n).map(|k| Ok((away + (n - 1 - k) as f64 * fs, offset(away + (n - 1 - k) as f64 * fs)?))).collect::<Result<Vec<_>>>()?;
+    // A finishing pass takes its stepover off the wall the pass before it left. Where it reaches
+    // into a notch or a gap that pass did not fit in, it would cut a full slot at full depth.
+    let mut before: (f64, &[Vec<Piece>]) = (rough_d, loops.as_slice());
+    for (d, set) in &finishing {
+        if !set.iter().all(|lp| runs_near(lp, before.1, before.0 - d + r + params.tolerance, r)) {
+            return invalid(
+                "a finishing pass would reach where the depth passes did not fit and cut a full slot at full depth: use fewer finishing passes or a smaller finishing stepover",
+            );
+        }
+        before = (*d, set.as_slice());
+    }
     // Each finishing loop belongs to the depth-pass loop nearest to it.
     let owner = |lp: &[Piece]| -> usize {
         let p = lp.first().map_or(Vec2::default(), Piece::start);
@@ -869,6 +924,7 @@ pub fn contour_with(
             b.retract()?;
         }
     }
+    limit_descent(&mut b.moves, cut.feeds.plunge);
     b.finish()
 }
 
@@ -1054,5 +1110,6 @@ pub fn pocket_with(
             b.retract()?;
         }
     }
+    limit_descent(&mut b.moves, cut.feeds.plunge);
     b.finish()
 }

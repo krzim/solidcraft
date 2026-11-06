@@ -643,3 +643,75 @@ fn hostile_leads_tabs_and_entries_are_refused_without_panics() {
         }
     }
 }
+
+/// The fastest any cut of a written 3-axis program goes down, mm/min of Z.
+fn fastest_descent(path: &str) -> f64 {
+    use solidcraft_cam::gcode5::JointWords;
+    use solidcraft_geom::prelude::*;
+    let mut at: Option<solidcore_record::Vec3> = None;
+    let mut fastest = 0.0f64;
+    for b in blocks(path) {
+        let (to, rate) = match b {
+            JointWords::Rapid { linear, .. } => (linear, None),
+            JointWords::Feed { linear, f, inverse_time, .. } => {
+                assert!(!inverse_time, "a 3-axis program writes feeds per minute");
+                (linear, at.map(|p| (p.dist(linear), f)))
+            }
+            JointWords::Arc { linear, center, ccw, f, .. } => {
+                let len = at.map(|p| {
+                    (solidcore_record::Vec2::new(p.x, p.y).dist(center) * solidcraft_cam::arc_sweep(p, linear, center, ccw)).hypot(p.z - linear.z)
+                });
+                (linear, len.map(|l| (l, f)))
+            }
+            JointWords::Dwell { .. } => continue,
+        };
+        if let (Some(p), Some((len, f))) = (at, rate)
+            && to.z < p.z - 1e-6
+        {
+            fastest = fastest.max(f * (p.z - to.z) / len);
+        }
+        at = Some(to);
+    }
+    fastest
+}
+
+#[test]
+fn written_programs_never_go_down_faster_than_the_plunge_feed() {
+    // A 3 mm cutter's aluminium feeds on a small mill: 2880 mm/min across, 100 down. The tabs'
+    // 30° ramps, the helix and the ramp entries are all slowed to go down at 100.
+    let tool = json!({"number": 1, "kind": "flat_endmill", "diameter": 3, "flute_length": 8, "spindle_rpm": 24000, "feed": 2880, "plunge_feed": 100});
+    let dir = Dir::new("descent");
+    let mut jobs = Vec::new();
+    let mut profile =
+        profile_job(json!({"lead": {"radius": 2, "line": 1}, "entry": {"type": "helix"}, "tabs": {"count": 4, "width": 4, "height": 1.5}}));
+    profile["tools"] = json!([tool]);
+    jobs.push((plate(), profile, "profile.tap"));
+    let mut ramped = profile_job(json!({"entry": {"type": "ramp"}, "tabs": {"count": 2, "width": 3, "height": 1}}));
+    ramped["tools"] = json!([tool]);
+    jobs.push((plate(), ramped, "ramped.tap"));
+    let pocket = json!({
+        "machine": "3axis", "post": "mach3_4axis", "tools": [tool],
+        "operations": [{"name": "pocket", "type": "pocket", "tool": 1, "polygon": [[-8, -6], [8, -6], [8, 6], [-8, 6]],
+                        "heights": {"clearance": 20, "retract": 3, "top": 0, "bottom": -4}, "stepdown": 2, "stepover": 1.2}]
+    });
+    jobs.push((top_pocket(), pocket, "pocket.tap"));
+    for (mut s, job, name) in jobs {
+        let out = dir.file(name);
+        let r = solidcraft_io::vfs::scoped(Some(solidcraft_io::vfs::PathScope::new([dir.0.clone()])), || {
+            run(&mut s, "cam.job", json!({"job": job, "output": out}))
+        });
+        assert_clean(&r);
+        // The written F has no decimals: a half unit of rounding.
+        let fastest = fastest_descent(&out);
+        assert!(fastest <= 100.0 * (1.0 + 0.5 / 2000.0) + 1e-9, "{name}: down at {fastest} mm/min");
+    }
+    // On the profile itself there is no side to lead in from or to turn a helix on.
+    let mut s = plate();
+    for extra in [json!({"side": "on", "lead": {"radius": 2}}), json!({"side": "on", "entry": {"type": "helix"}})] {
+        match s.execute("cam.job", &json!({"job": profile_job(extra.clone()), "dry_run": true})) {
+            Err(EngineError::Internal(_, msg)) => panic!("{extra}: panicked: {msg}"),
+            Err(e) => assert!(e.to_string().contains("on the profile"), "{extra}: {e}"),
+            Ok(v) => panic!("{extra}: accepted: {v}"),
+        }
+    }
+}
