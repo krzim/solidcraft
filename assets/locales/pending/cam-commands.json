@@ -1,0 +1,10 @@
+{
+  "en": { "cmd.cam.job": "CAM Job", "cmd.cam.posts": "CAM Posts", "cmd.cam.check": "Check G-code" },
+  "ar": { "cmd.cam.job": "مهمة تصنيع CAM", "cmd.cam.posts": "معالجات CAM اللاحقة", "cmd.cam.check": "فحص G-code" },
+  "de": { "cmd.cam.job": "CAM-Auftrag", "cmd.cam.posts": "CAM-Postprozessoren", "cmd.cam.check": "G-Code prüfen" },
+  "fr": { "cmd.cam.job": "Travail FAO", "cmd.cam.posts": "Post-processeurs FAO", "cmd.cam.check": "Vérifier le G-code" },
+  "he": { "cmd.cam.job": "משימת CAM", "cmd.cam.posts": "מעבדי פוסט של CAM", "cmd.cam.check": "בדיקת G-code" },
+  "ja": { "cmd.cam.job": "CAMジョブ", "cmd.cam.posts": "CAMポストプロセッサ", "cmd.cam.check": "Gコードを確認" },
+  "vi": { "cmd.cam.job": "Công việc CAM", "cmd.cam.posts": "Bộ hậu xử lý CAM", "cmd.cam.check": "Kiểm tra G-code" },
+  "zh": { "cmd.cam.job": "CAM 作业", "cmd.cam.posts": "CAM 后处理器", "cmd.cam.check": "检查 G 代码" }
+}
