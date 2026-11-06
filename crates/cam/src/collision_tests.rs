@@ -462,3 +462,20 @@ fn a_shank_as_wide_as_the_cutter_does_not_hit_the_hole_it_cuts() {
     assert!(!hits.is_empty() && hits.iter().all(|h| h.envelope == Some(0)) && hits.len() <= path.moves.len(), "{} hits", hits.len());
     assert!(holder_collisions_within(&s, &tool, &path, 0.0, f64::NAN, 0.5).is_err());
 }
+
+/// The deepest sample by the quick test is not always the deepest gouge: beside a tall wall
+/// the cutter would have to back out the wall's height along its axis, though it is only a
+/// hair into it. A flat end 0.03 mm into a plate at the start of a move and 0.012 mm into a
+/// wall at its end is 0.03 mm deep there (it used to be reported as 0.012, the wall's depth).
+#[test]
+fn the_deepest_gouge_of_a_move_is_measured_whatever_the_quick_test_says() {
+    let mut tris = block(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 0.03)).triangles().to_vec();
+    tris.extend_from_slice(block(Vec3::new(12.0 - 0.012, -5.0, -5.0), Vec3::new(20.0, 5.0, 5.0)).triangles());
+    let s = Surface::new(tris).unwrap();
+    // A flat end of radius 2, its tip at Z 0 from X 0 to 10.
+    let flat = Cutter::flat(2.0).unwrap();
+    let path = path3(&[(Vec3::new(0.0, 0.0, 10.0), false), (Vec3::new(0.0, 0.0, 0.0), true), (Vec3::new(10.0, 0.0, 0.0), true)]);
+    let hits = gouges(&s, &flat, &path, 0.01, 0.5).unwrap();
+    let along = hits.iter().find(|h| h.index == 2).map(|h| h.distance);
+    assert!(along.is_some_and(|d| (d - 0.03).abs() < 1e-6), "{hits:?}");
+}

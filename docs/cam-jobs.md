@@ -176,7 +176,12 @@ straight cuts at one feed whose points all lie within the merging tolerance of o
 that line, and, where the post writes arcs (`arcs`, and `helical_arcs` for one that changes Z),
 a run that lies within it of an arc in the XY plane (`G17`) becomes that arc. The merging
 tolerance is a fifth of the operation's part of the tolerance, and never more than the post's
-`arc_tolerance`; the read-back holds the program against the merged moves.
+`arc_tolerance`; the read-back holds the program against the merged moves. Between two of the
+points it replaces an arc bows out from the straight move joining them (by its sagitta there);
+it is taken only where that is no more than the tolerance the operation was planned within,
+the most its straight moves were allowed to cut across a curve, so an arc through points
+sampled that closely from a curve is taken as the curve, and one through the corners of a
+polygon (which lie on a circle too) is not.
 
 ### Feeds
 

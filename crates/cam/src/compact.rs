@@ -4,7 +4,12 @@
 //! all lie within a tolerance of one straight line becomes that line, and, where asked, a run
 //! whose points lie within it of one circular arc in the XY plane (Z level along it, or rising
 //! or falling evenly with the angle: a helix) becomes that arc. Every point a merged move
-//! replaces is within the tolerance of it, so the path moves by no more than that.
+//! replaces is within the tolerance of it. A line is then within the tolerance of the moves it
+//! replaces all along them; an arc also bows out from them between their points, by its
+//! sagitta over each, and is taken only where that is no more than [`Compaction::bow`]: as far
+//! as the path was allowed to cut across a curve when it was planned, so that an arc through
+//! points sampled that closely from a curve is taken as that curve, but one through the
+//! corners of a polygon (which lie on a circle too) is not.
 //!
 //! [`limit_descents`] works out again, from the coordinates and feeds as the program writes
 //! them (rounded to the post's digits), the feed of every cut that was slowed so the tool goes
@@ -38,6 +43,9 @@ pub struct Compaction {
     pub arcs: bool,
     /// Whether a fitted arc may change Z along it (a helix).
     pub helical: bool,
+    /// Farthest a fitted arc may bow out between two of the points it replaces from the
+    /// straight move joining them (mm): its sagitta there.
+    pub bow: f64,
 }
 
 fn same_feed(a: f64, b: f64) -> bool {
@@ -82,9 +90,10 @@ fn fits_line(pts: &[Vec3], last: usize, tol: f64) -> bool {
 }
 
 /// The arc from `pts[0]` to `pts[last]` through the points between, when they are within
-/// `tol` of it (seen from above and in Z, which changes evenly with the angle): its centre and
-/// direction (counter-clockwise when `true`).
-fn fits_arc(pts: &[Vec3], last: usize, tol: f64, helical: bool) -> Option<(Vec2, bool)> {
+/// `tol` of it (seen from above and in Z, which changes evenly with the angle) and it bows out
+/// from the straight moves between them by no more than `bow`: its centre and direction
+/// (counter-clockwise when `true`).
+fn fits_arc(pts: &[Vec3], last: usize, tol: f64, bow: f64, helical: bool) -> Option<(Vec2, bool)> {
     if last < MIN_ARC_MOVES {
         return None;
     }
@@ -103,7 +112,12 @@ fn fits_arc(pts: &[Vec3], last: usize, tol: f64, helical: bool) -> Option<(Vec2,
         return None;
     }
     let start = (flat(a) - c).angle();
+    // The share of the sweep the point before is at.
     let mut prev = 0.0;
+    // Between two points the arc bows out from the chord joining its points there by its
+    // sagitta, and the move between them is no farther from that chord than its ends are from
+    // the arc: so within the tolerance and the bow of the arc all along.
+    let bows = |from: f64, to: f64| r * (1.0 - (0.5 * sweep.abs() * (to - from)).cos()) <= bow;
     for p in pts.iter().take(last).skip(1) {
         // How far round the arc the point is, as a share of the sweep.
         let s = arc_sweep(a, *p, c, ccw);
@@ -111,14 +125,14 @@ fn fits_arc(pts: &[Vec3], last: usize, tol: f64, helical: bool) -> Option<(Vec2,
         if !(u >= prev - 1e-12) || u > 1.0 + 1e-12 {
             return None;
         }
-        prev = u;
         let on = c + Vec2::from_angle(start + sweep * u) * r;
         let z = a.z + (b.z - a.z) * u;
-        if on.dist(flat(*p)) > tol || (p.z - z).abs() > tol || (flat(*p).dist(c) - r).abs() > tol {
+        if !(on.dist(flat(*p)).hypot(p.z - z) <= tol) || !bows(prev, u) {
             return None;
         }
+        prev = u;
     }
-    Some((c, ccw))
+    bows(prev, 1.0).then_some((c, ccw))
 }
 
 /// The moves of `run` (straight cuts from `from`, each with its feed) merged within `how`.
@@ -139,7 +153,7 @@ fn merge_run(from: Vec3, run: &[(Vec3, f64)], how: &Compaction, out: &mut Vec<Mo
         if how.arcs {
             let mut k = MIN_ARC_MOVES;
             while k <= most {
-                match fits_arc(rest, k, how.tolerance, how.helical) {
+                match fits_arc(rest, k, how.tolerance, how.bow, how.helical) {
                     Some((c, ccw)) => arc = Some((k, c, ccw)),
                     None => break,
                 }
@@ -167,8 +181,8 @@ fn merge_run(from: Vec3, run: &[(Vec3, f64)], how: &Compaction, out: &mut Vec<Mo
 /// `path` with its runs of straight cuts at one feed merged into fewer moves (see the module
 /// documentation). Rapids, arcs and dwells are kept as they are.
 pub fn compact(path: &Toolpath, how: &Compaction) -> Result<Toolpath> {
-    if !(how.tolerance >= 0.0) || !(how.tolerance <= 10.0) {
-        return invalid("the compaction tolerance must be from 0 to 10 mm");
+    if !(how.tolerance >= 0.0) || !(how.tolerance <= 10.0) || !(how.bow >= 0.0) || !(how.bow <= 10.0) {
+        return invalid("the compaction tolerance and an arc's bow must be from 0 to 10 mm");
     }
     if path.moves.len() > MAX_MOVES {
         return Err(CamError::TooLarge(format!("the toolpath has more than {MAX_MOVES} moves")));

@@ -672,9 +672,11 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
     let (path, r, kind, merge) = plan3_raw(ctx, op, frame, surface)?;
     let name = common3(op).name;
     let mut path = match merge {
-        Some(tolerance) => {
+        Some((tolerance, planned)) => {
             let b = &ctx.post.base;
-            let how = Compaction { tolerance: tolerance.min(b.arc_tolerance.max(1e-6)), arcs: b.arcs, helical: b.helical_arcs };
+            // An arc may bow out from the moves it replaces as far as they were allowed to cut
+            // across a curve when they were planned.
+            let how = Compaction { tolerance: tolerance.min(b.arc_tolerance.max(1e-6)), arcs: b.arcs, helical: b.helical_arcs, bow: planned };
             compact(&path, &how).map_err(|e| ctx.bad(name, e))?
         }
         None => path,
@@ -686,13 +688,15 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
 }
 
 /// The share of a 3D operation's budget it plans within, and the share its moves may then move
-/// by when merged.
-fn split_budget(budget: f64) -> (f64, Option<f64>) {
-    (budget * (1.0 - COMPACT_SHARE), Some(budget * COMPACT_SHARE))
+/// by when merged (with the share it plans within again).
+fn split_budget(budget: f64) -> (f64, Option<(f64, f64)>) {
+    let planned = budget * (1.0 - COMPACT_SHARE);
+    (planned, Some((budget * COMPACT_SHARE, planned)))
 }
 
-/// A 3-axis operation as planned, and the tolerance its moves may be merged within (3D only).
-fn plan3_raw(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Result<(Toolpath, Resolved, &'static str, Option<f64>)> {
+/// A 3-axis operation as planned, and the tolerance its moves may be merged within and the one
+/// it was planned within (3D only).
+fn plan3_raw(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Result<(Toolpath, Resolved, &'static str, Option<(f64, f64)>)> {
     match op {
         Op3Spec::Contour(o) => {
             let c = o.common();

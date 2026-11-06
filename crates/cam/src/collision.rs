@@ -164,6 +164,8 @@ impl GougeTest {
 const DEPTH_HALVINGS: usize = 30;
 /// Golden-section steps that find the deepest point along a move near its deepest sample.
 const DEEPEST_STEPS: usize = 24;
+/// Most samples of one move measured once the deepest is buried deeper than the radius.
+const MAX_BURIED_MEASURES: usize = 64;
 /// Where along each stretch between two samples of a move the cutter is tested besides its
 /// ends: half way and near the thirds (see [`crate::surface_ops`]), so a bulge of the surface
 /// between two samples is met near its top.
@@ -346,9 +348,10 @@ impl Gouger<'_> {
             return Ok(Some((t, pose, depth)));
         }
         // Sampled at least every step, and between samples half way and near the thirds; the
-        // deepest sample by the quick test is then measured, and the deepest point near it found.
+        // samples the quick test finds in the surface are then measured, deepest by the quick
+        // test first, and the deepest point near the deepest of them found.
         let n = samples_along(from, to, self.cutter.radius, self.step)?;
-        let mut worst: Option<(f64, f64)> = None;
+        let mut found: Vec<(f64, f64)> = Vec::new();
         for k in 0..=n {
             let shares = std::iter::once(0.0).chain(if k < n { BETWEEN.to_vec() } else { Vec::new() });
             for s in shares {
@@ -356,16 +359,30 @@ impl Gouger<'_> {
                 if t <= 0.0 && !start {
                     continue;
                 }
-                if let Some(d) = self.test.depth(self.surface, &between(from, to, t))?
-                    && worst.is_none_or(|(_, w)| d > w)
-                {
-                    worst = Some((t, d));
+                if let Some(d) = self.test.depth(self.surface, &between(from, to, t))? {
+                    found.push((t, d));
                 }
             }
         }
-        let Some((t, _)) = worst else { return Ok(None) };
-        let depth = depth_at(self.surface, &self.cutter, &between(from, to, t))?;
-        Ok((depth > self.tol).then(|| (t, between(from, to, t), depth)))
+        found.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // The quick test is at least the depth where that is less than the radius (the cutter
+        // shrunk by the depth is inside the one the quick test uses, moved up the axis by the
+        // depth less the tolerance), so a sample it puts no deeper than the deepest measured is
+        // no deeper; past the radius it says nothing, so a few more are measured.
+        let mut worst: Option<(f64, f64)> = None;
+        for (measured, (t, quick)) in found.into_iter().enumerate() {
+            if let Some((_, w)) = worst
+                && quick <= w
+                && (w < self.cutter.radius * (1.0 - 1e-9) || measured >= MAX_BURIED_MEASURES)
+            {
+                break;
+            }
+            let depth = depth_at(self.surface, &self.cutter, &between(from, to, t))?;
+            if worst.is_none_or(|(_, w)| depth > w) {
+                worst = Some((t, depth));
+            }
+        }
+        Ok(worst.filter(|(_, depth)| *depth > self.tol).map(|(t, depth)| (t, between(from, to, t), depth)))
     }
 
     /// The deepest point along the move near the share `t` (within a sample's spacing `w`
