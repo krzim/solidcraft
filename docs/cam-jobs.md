@@ -163,16 +163,17 @@ the post says so.
 
 A post with tool centre point control (`tcp`, `G43.4`) may not set `base.tool_length_on_first_z`
 or write `G43`, another `G43.x` or `G49` in lines it writes while that control is on (spindle,
-operation start and end, coolant, `safe_rotate`): any of them would turn it off. The read-back
-takes them as turning it off too.
+operation start and end, coolant, the dwell, `safe_rotate`): any of them would turn it off. The
+read-back takes them as turning it off too.
 
 ### Rewinds
 
 A post's `rewind: {distance, retract_feed, plunge_feed}` lets a continuous cut carry on past the
 limits of a rotary that has room for a whole turn (`a_limits_deg` of 360° or more): where the cut
 reaches a limit the tool is fed 1 mm out of the cut at `retract_feed`, rises the rest of
-`distance` at rapid (less where the machine's Z travel ends, never below the operation's
-clearance; a job that cannot is refused, naming the operation and the Z it needs), takes the
+`distance` at rapid (at least to the operation's clearance, where its own links turn A; less
+where the machine's Z travel ends, never below that clearance; a job that cannot is refused,
+naming the operation and the Z it needs), takes the
 `safe_rotate` lines, turns A back by whole turns, comes back at rapid to 1 mm above the cut and
 feeds the rest of the way in at the operation's plunge feed (`plunge_feed` when it has none),
 then goes on. Each operation starts at the whole turn that needs the fewest rewinds, so one that

@@ -1189,6 +1189,12 @@ fn tool_centre_point_control_is_never_turned_off_by_a_length_offset() {
     assert!(with(&|p| p.base.operation_start = vec!["G43 H{tool}".into()]).validate().is_err());
     assert!(with(&|p| p.base.spindle_on = vec!["M3 S{rpm}".into(), "G43.1 Z0".into()]).validate().is_err());
     assert!(with(&|p| p.safe_rotate = vec!["G49".into(), "G53 G0 Z0".into()]).validate().is_err());
+    // The dwell is written while it is on too, and a line the reader cannot take apart (a
+    // macro variable, a space after the G) is still looked through for G43 and G49.
+    assert!(with(&|p| p.base.dwell = "G4 P{seconds} G49".into()).validate().is_err());
+    assert!(with(&|p| p.base.coolant_on = vec!["M8 G49 #1".into()]).validate().is_err());
+    assert!(with(&|p| p.base.operation_end = vec!["G 43 H#5".into()]).validate().is_err());
+    assert!(with(&|p| p.base.coolant_on = vec!["M8 #1".into()]).validate().is_ok());
     // A tool change comes before it is switched on, and may set a length offset.
     let change = with(&|p| p.base.tool_change = vec!["M5".into(), "T{tool} M6".into(), "G43 H{tool}".into()]);
     change.validate().unwrap();
@@ -1251,6 +1257,45 @@ fn feed_per_minute_comes_back_before_every_rapid() {
     let text = emit5(&program5(helix_of(5)), &dialect(), &limited_a()).unwrap();
     assert!(!rewinds_in(&text).is_empty());
     assert_no_rapid_in_inverse_time(&text);
+}
+
+#[test]
+fn a_rewind_turns_a_no_lower_than_the_operations_clearance() {
+    // A post that turns A wherever the tool is (no safe lines, no rise to the clearance) and
+    // draws the tool only 2 mm out of the cut: turned there, the tool would still be in the
+    // groove for the whole turn. The turn is made at the operation's clearance (its rapids at
+    // Z30) instead, where its own links turn A.
+    let post = Post5 {
+        safe_rotate: Vec::new(),
+        safe_rotate_first: false,
+        clearance_retract: false,
+        rewind: Some(Rewind { distance: 2.0, retract_feed: 500.0, plunge_feed: 250.0 }),
+        ..dialect()
+    };
+    let program = program5(helix_of(3));
+    let text = emit5(&program, &post, &limited_a()).unwrap();
+    assert!(!rewinds_in(&text).is_empty(), "{text}");
+    let mut z: Option<f64> = None;
+    let mut turns = 0;
+    for line in text.lines() {
+        if line.starts_with("G28") {
+            if line.contains("Z0") {
+                z = Some(f64::INFINITY);
+            }
+            continue;
+        }
+        if let Some(v) = line.split(' ').find_map(|w| w.strip_prefix('Z')) {
+            z = v.parse().ok();
+        }
+        if line.starts_with("G0 A") {
+            turns += 1;
+            assert!(z.is_some_and(|z| z >= 30.0 - 1e-9), "`{line}` at Z{z:?}\n{text}");
+        }
+    }
+    assert!(turns >= 2, "{text}");
+    // It comes back at rapid to 1 mm above the cut and feeds the rest of the way in.
+    assert!(rewinds_in(&text).iter().all(|r| r.contains(&"G0 Z21.") && r.contains(&"G1 Z20. F250.")), "{text}");
+    assert!(readback5(&text, &program, &post, &limited_a()).unwrap().within());
 }
 
 #[test]

@@ -138,7 +138,8 @@ pub struct Post5 {
 /// by whole turns (the same position of the part, as far from the limit as the limits allow),
 /// comes back at rapid to [`REWIND_EASE`] above the cut (down the room the tool left as it came
 /// out) and feeds the rest of the way in at the operation's plunge feed, then goes on. The draw
-/// out is shortened to the machine's Z travel, never below the operation's clearance. Only for
+/// out rises at least to the operation's clearance (where its own links turn the rotaries), and
+/// is shortened to the machine's Z travel, never below that clearance. Only for
 /// machine-coordinate output on machines whose rotaries all turn the table; elsewhere the
 /// limits stay as they are.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -192,11 +193,37 @@ fn turns_tcp_off(lines: &[String]) -> bool {
         milliseconds: "1".into(),
     };
     lines.iter().any(|line| {
-        fill(line, &sample)
-            .ok()
-            .and_then(|text| words(&text, 0).ok())
-            .is_some_and(|ws| ws.iter().any(|&(c, v)| c == 'G' && tcp_off_code((v * 10.0).round() as i64)))
+        let text = fill(line, &sample).unwrap_or_else(|_| line.clone());
+        match words(&text, 0) {
+            Ok(ws) => ws.iter().any(|&(c, v)| c == 'G' && tcp_off_code((v * 10.0).round() as i64)),
+            // A line the reader cannot take apart (a macro variable, a space after the letter)
+            // is still sent to the controller: look through it for the codes anyway.
+            Err(_) => g_codes_loosely(&text).into_iter().any(tcp_off_code),
+        }
     })
+}
+
+/// Every `G` code in `text` (its value times ten, rounded), read loosely: blanks after the `G`
+/// are skipped and anything that is not a number after it is passed over.
+fn g_codes_loosely(text: &str) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !c.eq_ignore_ascii_case(&'G') {
+            continue;
+        }
+        while chars.next_if(|d| *d == ' ' || *d == '\t').is_some() {}
+        let mut number = String::new();
+        while let Some(d) = chars.next_if(|d| d.is_ascii_digit() || *d == '.') {
+            number.push(d);
+        }
+        if let Ok(v) = number.parse::<f64>()
+            && v.is_finite()
+        {
+            out.push((v * 10.0).round() as i64);
+        }
+    }
+    out
 }
 
 fn lines(l: &[&str]) -> Vec<String> {
@@ -334,8 +361,9 @@ impl Post5 {
                 );
             }
             let b = &self.base;
-            let written_while_on: [(&str, &[String]); 6] = [
+            let written_while_on: [(&str, &[String]); 7] = [
                 ("spindle_on", &b.spindle_on),
+                ("dwell", std::slice::from_ref(&b.dwell)),
                 ("operation_start", &b.operation_start),
                 ("operation_end", &b.operation_end),
                 ("coolant_on", &b.coolant_on),
@@ -780,18 +808,22 @@ impl Writer5<'_> {
     fn rewind(&mut self, from: &Joints, back: &[f64], r: &RewindAt<'_>, turn: &Turn<'_>, values: &Values) -> Result<f64> {
         let ease = REWIND_EASE.min(r.rewind.distance);
         let z = from.linear.z;
-        let wanted = z + r.rewind.distance;
+        // Never below the operation's clearance, where its own links turn the rotaries: a post
+        // that turns them wherever the tool is would otherwise turn a short draw out with the
+        // tool still in the groove.
+        let floor = r.floor.unwrap_or(f64::NEG_INFINITY);
+        let wanted = (z + r.rewind.distance).max(floor);
         let mut top = wanted;
         if let Some((lo, hi)) = r.machine.linear_limits {
             // Shortened to the travel left, never below the operation's clearance.
-            let need = wanted.min(r.floor.unwrap_or(wanted).max(z + ease));
+            let need = floor.max(z + ease);
             if hi.z < need - 1e-9 {
                 let at: Vec<String> =
                     r.machine.rotaries.iter().zip(&from.rotary).map(|(a, v)| format!("{}{:.3}°", a.letter.char(), v.to_degrees())).collect();
                 return Err(CamError::Unsafe(format!(
                     "a rewind at {} needs Z up to {need:.3} mm to draw the tool out of the cut{}, beyond the Z travel {:.3} to {:.3} mm",
                     at.join(" "),
-                    if need < wanted { " to the operation's clearance" } else { "" },
+                    if floor > z + ease { " to the operation's clearance" } else { "" },
                     lo.z,
                     hi.z
                 )));

@@ -453,6 +453,9 @@ fn output_and_preview_are_never_the_same_file() {
     let mut spellings = vec![dir.0.join(".").join("a.tap"), dir.0.join("sub").join("..").join("a.tap")];
     if cfg!(windows) {
         spellings.push(dir.0.join("A.TAP"));
+        // Windows drops dots and spaces at the end of a name: these open `a.tap` too.
+        spellings.push(dir.0.join("a.tap."));
+        spellings.push(dir.0.join("a.tap. ."));
     }
     for page in spellings {
         let page = page.to_string_lossy().into_owned();

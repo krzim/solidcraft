@@ -1193,8 +1193,9 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// `path` as one file is named whatever its spelling: absolute, its folder resolved (links,
-/// `.` and `..`), `/` between parts, and in lower case on Windows, whose file names are not
-/// case-sensitive.
+/// `.` and `..`) or the whole path if the file is there, `/` between parts, and on Windows
+/// without the dots and spaces it drops from the end of a name and in lower case, as its file
+/// names are not case-sensitive.
 fn file_key(path: &str) -> String {
     let p = Path::new(path.trim());
     let abs = if p.is_relative() { std::env::current_dir().map(|d| d.join(p)).unwrap_or_else(|_| p.to_path_buf()) } else { p.to_path_buf() };
@@ -1213,7 +1214,14 @@ fn file_key(path: &str) -> String {
     };
     let abs = lexical(&abs);
     let key = match (abs.parent(), abs.file_name()) {
-        (Some(dir), Some(name)) => std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()).join(name),
+        (Some(dir), Some(name)) => {
+            // Windows drops the dots and spaces at the end of a name (`a.tap.` opens `a.tap`).
+            let name = name.to_string_lossy();
+            let name = if cfg!(windows) { name.trim_end_matches(['.', ' ']) } else { &name };
+            // A file that is there already is named by itself (a link to it, a short name).
+            let joined = dir.join(name);
+            std::fs::canonicalize(&joined).unwrap_or_else(|_| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()).join(name))
+        }
         _ => abs,
     };
     let text = key.to_string_lossy().replace('\\', "/");
