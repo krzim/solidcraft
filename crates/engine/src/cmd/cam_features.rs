@@ -51,7 +51,7 @@ pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new("cam.features", "CAM Fe
         "bodies?: [names] (default every visible body); origin?: [x,y,z] (work zero, as a job's); axis?: \"z\" (default) | \"a\" (a 4th \
          axis about work X: every side square to X, at the A angle that brings it up); tolerance?: mm (default 0.01) → setups: [{a_deg, \
          tool_axis, top_z, bottom_z, bounds, swing_radius?, features}], holes: [{id: \"hole:k\", a_deg?, center, center_work, diameter, \
-         top_z, bottom_z, depth, through, floor: through|flat|cone, tip_z?, counterbore?, counterbore_of?, countersink?}], hole_groups, \
+         top_z, bottom_z, depth, through, floor: through|flat|cone|round, tip_z?, counterbore?, counterbore_of?, countersink?}], hole_groups, \
          pockets: [{id: \"pocket:k\", floor_z, top_z, depth, outline, area, min_corner_radius, sharp_corners, walls_vertical, islands}], \
          faces: [{id: \"face:k\", z, area, role: top|plateau|step|island_top|pocket_floor|hole_floor}], profiles: [{id: \"profile:k\", top_z, \
          bottom_z, outline, min_concave_radius?}], fillets, chamfers, surfaces, turned (axis a), notes. Read from the exact B-rep, in \
@@ -133,6 +133,9 @@ pub(crate) struct Setup {
     pub top: f64,
     pub bottom: f64,
     pub swing: Option<f64>,
+    /// The highest point of the job's fixtures along this setup's tool axis, from their exact
+    /// boxes: the clearance height left out goes above it.
+    pub fixture_top: Option<f64>,
 }
 
 /// What kind of outline a feature gives a 2D operation.
@@ -191,7 +194,15 @@ impl FeatureSet {
                 }
             }
         };
-        Err(format!("no feature `{id}`: {known} (`cam.features` lists them with the job's bodies, origin and axis)"))
+        let along = match self.reply.axis {
+            AxisSpec::Z => {
+                "found along Z only, as the job's machine has no A axis about X (with `machine: \"4axis_a\"` the sides are found too; \
+                 `cam.features {axis: \"z\"}` gives these ids)"
+            }
+            AxisSpec::A => "found on every side about X, as the job's machine has an A axis (`cam.features {axis: \"a\"}` gives these ids)",
+        };
+        let shown: String = if id.chars().count() > 40 { format!("{}…", id.chars().take(40).collect::<String>()) } else { id.to_string() };
+        Err(format!("no feature `{shown}`: {known}; features are {along}, with the job's bodies and origin"))
     }
 
     pub fn setup(&self, g: &Geo) -> Option<&Setup> {
@@ -226,7 +237,9 @@ impl Lazy {
         let found = self.cell.get_or_init(|| {
             let run = || -> Result<FeatureSet> {
                 let names = part_names(cmd, s, self.bodies.as_deref(), &self.fixtures)?;
-                recognize(cmd, s, &names, self.origin, Lazy::axis_of(&self.machine), self.tol, &self.machine)
+                let mut set = recognize(cmd, s, &names, self.origin, Lazy::axis_of(&self.machine), self.tol, &self.machine)?;
+                fixture_tops(s, &self.fixtures, self.origin, &mut set.setups)?;
+                Ok(set)
             };
             run().map_err(|e| match e {
                 EngineError::BadParams { msg, .. } => msg,
@@ -256,20 +269,62 @@ pub(crate) struct HoleTarget {
     pub through: bool,
 }
 
-/// The default heights of an operation on a feature of `setup`, `given` laid over them.
-fn feature_heights(setup: &Setup, top: f64, bottom: f64, given: Option<&HeightsPartial>) -> Heights {
-    let mut clearance = setup.top + 10.0;
+/// The highest point of the bodies `fixtures` along each setup's tool axis: the corners of each
+/// body's exact box, in the setup's frame.
+fn fixture_tops(s: &Session, fixtures: &[String], origin: Vec3, setups: &mut [Setup]) -> Result<()> {
+    if fixtures.is_empty() {
+        return Ok(());
+    }
+    let st = s.world_state()?;
+    for n in fixtures.iter().take(MAX_BODY_NAMES) {
+        let Some(b) = st.bodies.iter().find(|b| &b.name == n) else { continue };
+        let bx = b.body.exact_bounds().unwrap_or_else(|_| b.body.outline_bounds());
+        let (lo, hi) = (bx.min - origin, bx.max - origin);
+        if !(lo.is_finite() && hi.is_finite()) {
+            continue;
+        }
+        for su in setups.iter_mut() {
+            for k in 0..8u8 {
+                let p = Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
+                let z = su.frame.to_local(p).z;
+                su.fixture_top = Some(su.fixture_top.map_or(z, |m: f64| m.max(z)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The heights of an operation on a feature of `setup` whose material runs from `top` down to
+/// `bottom`, `given` laid over them. Those left out are worked out from those given: the retract
+/// 3 mm above the material (the setup's top or the `top` given, the higher), the clearance 10 mm
+/// above it, 5 mm above the retract given, 5 mm past the swing on a 4th axis and 5 mm above the
+/// fixtures. Out of order, the refusal names each height and where it came from.
+fn feature_heights(setup: &Setup, top: f64, bottom: f64, given: Option<&HeightsPartial>) -> std::result::Result<Heights, String> {
+    let g = given.copied().unwrap_or_default();
+    let top_v = g.top.unwrap_or(top);
+    let bottom_v = g.bottom.unwrap_or(bottom);
+    let material = setup.top.max(top_v);
+    let retract = g.retract.unwrap_or(material + 3.0);
+    let mut clearance = (material + 10.0).max(retract + 5.0);
     if let Some(sw) = setup.swing {
         clearance = clearance.max(sw + 5.0);
     }
-    let mut h = Heights { clearance, retract: setup.top + 3.0, top, bottom };
-    if let Some(g) = given {
-        h.clearance = g.clearance.unwrap_or(h.clearance);
-        h.retract = g.retract.unwrap_or(h.retract);
-        h.top = g.top.unwrap_or(h.top);
-        h.bottom = g.bottom.unwrap_or(h.bottom);
+    if let Some(fx) = setup.fixture_top {
+        clearance = clearance.max(fx + 5.0);
     }
-    h
+    let clearance = g.clearance.unwrap_or(clearance);
+    let h = Heights { clearance, retract, top: top_v, bottom: bottom_v };
+    if h.clearance < h.retract || h.retract < h.top || h.top < h.bottom {
+        let from = |v: Option<f64>, x: f64, k: &str, d: &str| format!("{k} {} ({})", num(x), if v.is_some() { "given" } else { d });
+        return Err(format!(
+            "the heights must be ordered clearance ≥ retract ≥ top ≥ bottom; here {}, {}, {}, {}",
+            from(g.clearance, h.clearance, "clearance", "the default"),
+            from(g.retract, h.retract, "retract", "the default"),
+            from(g.top, h.top, "top", "the feature's"),
+            from(g.bottom, h.bottom, "bottom", "the feature's")
+        ));
+    }
+    Ok(h)
 }
 
 /// The rotary angles and A angle of the setup feature `id` is in, for an operation that names
@@ -305,8 +360,18 @@ fn in_frame<'s>(ctx: &Ctx<'_>, set: &'s FeatureSet, op: &str, id: &str, frame: &
     Ok(g)
 }
 
-/// The regions, heights and contour side of a 2D operation on feature `id`, in `frame`.
-pub(super) fn feature_cut(ctx: &Ctx<'_>, op: &str, id: &str, frame: &Frame, given: Option<&HeightsPartial>) -> Result<FeatureCut> {
+/// The regions, heights and contour side of a 2D operation on feature `id`, in `frame`. A pocket
+/// passes its tool's radius as `facing`: on a face at the setup's top (nothing of the part above
+/// it) the pocket then covers the face's extent grown by the radius and 1 mm, so the tool's edge
+/// passes the face's edges instead of stopping a radius inside them.
+pub(super) fn feature_cut(
+    ctx: &Ctx<'_>,
+    op: &str,
+    id: &str,
+    frame: &Frame,
+    given: Option<&HeightsPartial>,
+    facing: Option<f64>,
+) -> Result<FeatureCut> {
     let set = ctx.features.get(ctx.cmd, ctx.s)?;
     let g = in_frame(ctx, set, op, id, frame)?;
     let Some(setup) = set.setup(g) else { return Err(ctx.bad(op, format!("feature `{id}` has no setup"))) };
@@ -333,7 +398,7 @@ pub(super) fn feature_cut(ctx: &Ctx<'_>, op: &str, id: &str, frame: &Frame, give
         }
         (_, Some(o)) => o.clone(),
     };
-    let heights = feature_heights(setup, g.top, g.bottom, given);
+    let heights = feature_heights(setup, g.top, g.bottom, given).map_err(|e| ctx.bad(op, e))?;
     if !(heights.top > heights.bottom + 1e-9) {
         let why = if g.flat_top {
             format!(
@@ -348,6 +413,19 @@ pub(super) fn feature_cut(ctx: &Ctx<'_>, op: &str, id: &str, frame: &Frame, give
     }
     // An island is in the way only where the cut goes below its top.
     let holes: Vec<Loop2> = g.islands.iter().filter(|(_, top)| *top > heights.bottom + ctx.tol).map(|(l, _)| l.clone()).collect();
+    let outer = match facing {
+        Some(r) if g.kind == Kind::Face && g.flat_top && holes.is_empty() && (g.bottom - setup.top).abs() <= ctx.tol && r.is_finite() && r > 0.0 => {
+            let m = r + 1.0;
+            let [lo, hi] = g.bounds;
+            Loop2::polygon(&[
+                Vec2::new(lo[0] - m, lo[1] - m),
+                Vec2::new(hi[0] + m, lo[1] - m),
+                Vec2::new(hi[0] + m, hi[1] + m),
+                Vec2::new(lo[0] - m, hi[1] + m),
+            ])
+        }
+        _ => outer,
+    };
     let side = match g.kind {
         Kind::Profile => SideSpec::Outside,
         _ => SideSpec::Inside,
@@ -366,12 +444,13 @@ pub(super) fn op_cut(
     feature: Option<&str>,
     heights: Option<&HeightsPartial>,
     frame: &Frame,
+    facing: Option<f64>,
 ) -> Result<OpCut> {
     if let Some(id) = feature {
         if sketch.is_some() || polygon.is_some() || profiles.is_some() {
             return Err(ctx.bad(op, "give a `feature`, a `sketch` or a `polygon`, one of them"));
         }
-        let cut = feature_cut(ctx, op, id, frame, heights)?;
+        let cut = feature_cut(ctx, op, id, frame, heights, facing)?;
         return Ok(OpCut { regions: cut.regions, heights: cut.heights, side: Some(cut.side) });
     }
     let regions = ctx.regions(op, sketch, profiles, polygon, frame)?;
@@ -574,6 +653,24 @@ impl<'a> Topo<'a> {
             }
         }
         r
+    }
+
+    /// The largest distance of face `f`'s edges from the line through `origin` along the unit
+    /// `axis`: circles exactly, other edges by their control points (an upper bound).
+    fn edges_reach(&self, f: usize, origin: Vec3, axis: Vec3) -> f64 {
+        let off = |p: Vec3| {
+            let d = p - origin;
+            (d - axis * d.dot(axis)).len()
+        };
+        let mut out: f64 = 0.0;
+        for e in self.face_edges(f) {
+            match self.shapes.get(e) {
+                Some(EdgeShape::Circle(c)) => out = out.max(off(c.center) + c.radius),
+                Some(EdgeShape::Hull(pts)) => out = pts.iter().fold(out, |m, p| m.max(off(*p))),
+                None => {}
+            }
+        }
+        out
     }
 
     /// The largest distance of face `f` from the work X axis (an upper bound).
@@ -1177,7 +1274,7 @@ pub(crate) fn recognize(cmd: &str, s: &Session, names: &[String], origin: Vec3, 
             notes.push(format!("more than {MAX_SETUPS} sides face square to X: only the first {MAX_SETUPS} are looked at"));
             break;
         }
-        setups.push(Setup { a_deg, rotary, frame, top: 0.0, bottom: 0.0, swing: None });
+        setups.push(Setup { a_deg, rotary, frame, top: 0.0, bottom: 0.0, swing: None, fixture_top: None });
     }
     if unreachable > 0 {
         notes.push(format!("{unreachable} directions faces look along cannot be reached by the machine's rotary axis"));
@@ -1285,7 +1382,32 @@ fn find(topos: &[Topo<'_>], setups: &[Setup], axis: AxisSpec, tol: f64, notes: &
                     _ => Lie::Mixed,
                 }
             };
-            let wall_top = |lp: &LoopGeo| lp.beside.iter().filter_map(|g| zrange(*g)).map(|r| r.1).fold(f64::NEG_INFINITY, f64::max);
+            // The top of the walls rising from a loop at `z`: up its faces and on through every
+            // face joined to them that rises from `z` and is not flat (a round or chamfer at the
+            // foot, the upright wall above it, a round at its top), up to the flat faces round
+            // them. A wall that starts on a round is as tall as the wall above the round.
+            let flat = |g: usize| matches!(t.surface(g), Some(FaceSurface::Plane { normal, .. }) if lz(normal.vec()).abs() > 1.0 - PARALLEL);
+            let wall_top = |lp: &LoopGeo, z: f64| -> f64 {
+                let mut seen: BTreeSet<usize> = lp.beside.iter().copied().collect();
+                let mut todo: Vec<usize> = lp.beside.iter().copied().filter(|g| !flat(*g)).collect();
+                let mut top = lp.beside.iter().filter_map(|g| zrange(*g)).map(|r| r.1).fold(f64::NEG_INFINITY, f64::max);
+                while let Some(g) = todo.pop() {
+                    for e in t.face_edges(g) {
+                        for h in t.edge_faces.get(e).into_iter().flatten().copied() {
+                            if !seen.insert(h) || flat(h) {
+                                continue;
+                            }
+                            if let Some((lo, hi)) = zrange(h)
+                                && lo >= z - tol
+                            {
+                                top = top.max(hi);
+                                todo.push(h);
+                            }
+                        }
+                    }
+                }
+                top
+            };
             let wall_foot = |lp: &LoopGeo| lp.beside.iter().filter_map(|g| zrange(*g)).map(|r| r.0).fold(f64::NEG_INFINITY, f64::max);
 
             // Holes along this setup's axis.
@@ -1383,6 +1505,23 @@ fn find(topos: &[Topo<'_>], setups: &[Setup], axis: AxisSpec, tol: f64, notes: &
                         }
                         _ => {}
                     }
+                }
+                // A curved face below the bottom circle, its edges within the wall's radius, with
+                // material just outside the wall under its end, closes the hole (a round at its
+                // foot, a ball end): it is blind, its round floor under `bottom_z`. A point below
+                // on the axis would be in the hole's air.
+                let closes = beside_at(lo).iter().any(|g| {
+                    !matches!(t.surface(*g), Some(FaceSurface::Plane { .. } | FaceSurface::Cone { .. }))
+                        && zrange(*g).is_some_and(|(_, top)| top <= z_of(c.origin + up * lo) + tol)
+                        && t.edges_reach(*g, c.origin, c.axis) <= c.radius + tol
+                }) && circles.iter().find(|x| (x.1 - lo).abs() <= tol).is_some_and(|(_, _, k)| {
+                    let eps = (tol * 2.0).max(c.radius * 1e-3);
+                    let radial = ((k.start - c.origin) - c.axis * (k.start - c.origin).dot(c.axis)).normalized();
+                    radial.is_some_and(|r| matches!(t.body.classify_point(k.start + r * eps - up * eps + t.origin), Ok(PointClass::Inside)))
+                });
+                if !decided && closes {
+                    floor = "round";
+                    decided = true;
                 }
                 if !decided {
                     // Just under the bottom on the axis: air means it comes out.
@@ -1493,14 +1632,14 @@ fn find(topos: &[Topo<'_>], setups: &[Setup], axis: AxisSpec, tol: f64, notes: &
                     .iter()
                     .enumerate()
                     .filter(|(i, lp)| *i != oi && lie(lp, z) == Lie::Up)
-                    .map(|(_, lp)| (Loop2 { segs: oriented(&lp.segs, lp.area, false) }, wall_top(lp), lp))
+                    .map(|(_, lp)| (Loop2 { segs: oriented(&lp.segs, lp.area, false) }, wall_top(lp, z), lp))
                     .collect();
                 let (pts, area, b) = outline(&outer.segs, tol);
                 let net_area = r9(area - islands.iter().map(|(_, _, lp)| lp.area.abs()).sum::<f64>());
                 let outer_ccw = oriented(&outer.segs, outer.area, true);
                 let top = match outer_lie {
-                    Lie::Up => wall_top(outer),
-                    Lie::Mixed => wall_top(outer).max(z),
+                    Lie::Up => wall_top(outer, z),
+                    Lie::Mixed => wall_top(outer, z).max(z),
                     Lie::Down => z,
                 };
                 let geo = Geo {

@@ -204,9 +204,9 @@ that setup.
 | List | Each feature |
 | --- | --- |
 | `setups` | `a_deg`, `tool_axis` (work), `top_z`, `bottom_z`, `bounds`, `swing_radius` (axis `a`), `features` (the ids machined from that side) |
-| `holes` | `hole:k`: `center`, `center_work`, `diameter`, `top_z`, `bottom_z`, `depth`, `through`, `floor` (`through`, `flat` or `cone` with `tip_z`), `counterbore` / `counterbore_of` (the hole above or below it on the same axis), `countersink` (`diameter`, `angle_deg`), `faces` |
+| `holes` | `hole:k`: `center`, `center_work`, `diameter`, `top_z`, `bottom_z`, `depth`, `through`, `floor` (`through`, `flat`, `cone` with `tip_z`, or `round`: the wall runs on into a curved floor within its radius, below `bottom_z`), `counterbore` / `counterbore_of` (the hole above or below it on the same axis), `countersink` (`diameter`, `angle_deg`), `faces` |
 | `hole_groups` | holes of one diameter, depth and kind: `diameter`, `depth`, `through`, `count`, `ids` |
-| `pockets` | `pocket:k`: a planar floor walled all round. `floor_z`, `top_z` (its highest wall), `depth`, `outline` (counter-clockwise), `area` (less its islands), `bounds`, `min_corner_radius` (the smallest inside corner; 0 when one is sharp), `sharp_corners`, `walls_vertical`, `islands` (`outline`, `top_z`, `area`), `face_id` |
+| `pockets` | `pocket:k`: a planar floor walled all round. `floor_z`, `top_z` (the top of its walls, followed up past a round or chamfer at their foot), `depth`, `outline` (counter-clockwise), `area` (less its islands), `bounds`, `min_corner_radius` (the smallest inside corner; 0 when one is sharp), `sharp_corners`, `walls_vertical` (false when the walls are rounded, chamfered or drafted at the floor: the outline is then the floor's, inside the walls), `islands` (`outline`, `top_z` the top of the island, past a round at its foot, `area`), `face_id` |
 | `faces` | `face:k`: every planar face facing the tool, with `z`, `area`, `bounds`, `normal_work` and `role`: `top`, `plateau` (everything round it falls away), `step` (open on some sides), `island_top`, `pocket_floor` (with `pocket`), `hole_floor` (a blind hole's floor or a counterbore's step) |
 | `profiles` | `profile:k`: the outline of a face whose walls fall straight away all round, and the outline of the bottom face (the silhouette) when no face above gives the same: `top_z`, `bottom_z`, `outline`, `min_concave_radius` (its notches, where a tool running outside must fit) |
 | `fillets`, `chamfers` | `fillet:k`, `chamfer:k`: rounds and chamfers falling away from the edges of faces facing the tool, `radius` or `angle_deg` (from the tool axis), `top_z`, `bottom_z`, `bounds`, `faces` |
@@ -236,12 +236,15 @@ A `pocket` or `contour` operation takes `feature` in place of `sketch` or `polyg
 | --- | --- | --- | --- |
 | `pocket:k` | its outline, with every island that rises above the operation's bottom | its highest wall, its floor | inside |
 | `hole:k` | its circle | its top, its bottom (a through hole: the part's bottom face) | inside |
-| `face:k` | its outline, with what stands on it | the walls round it (a top face: none, so give `heights.top`), the face | inside |
+| `face:k` | its outline, with what stands on it (a pocket on a face at the setup's top covers the face's extent grown by the tool's radius and 1 mm, so it faces to the edges) | the walls round it (a top face: none, so give `heights.top`), the face | inside |
 | `profile:k` | its outline | its face, the foot of its walls | outside |
 
 `heights` may then be left out or given in part (`{"bottom": -3}`): what is left out comes from
-the feature, `clearance` 10 mm and `retract` 3 mm above the part's top in the feature's setup (on a
-4th axis `clearance` also clears the part's swing radius by 5 mm). Without a feature all four
+the feature and from the heights given: `retract` 3 mm above the material (the part's top in the
+feature's setup, or the `top` given when higher), `clearance` 10 mm above the material and at
+least 5 mm above the `retract` given, 5 mm past the part's swing radius on a 4th axis and 5 mm
+above the job's `fixtures` (the corners of their exact boxes in the setup's frame). Heights out of
+order are refused with each value and whether it was given or a default. Without a feature all four
 heights are still required. The job finds features as `cam.features` does with the job's
 `bodies` (else every visible body not in `fixtures`), `origin` and `tolerance`, along `a` when the
 machine has one rotary about X, else `z`.
@@ -262,7 +265,7 @@ the same lookup.
 
 | Key | Meaning |
 | --- | --- |
-| `profile_path` | A machine profile: a JSON array of tools (a tool library), or an object with `tools` or `tool_library_path` and optionally `machine`, `post` or `post_path`, `a_reversed`, `a_limits_deg`, `work_offset` (as a job has them; relative paths are read from the file's folder). Give this, `tools` or `tool_library_path`. |
+| `profile_path` | A machine profile: a JSON array of tools (a tool library), or an object with `tools` or `tool_library_path` and optionally `machine` or `machine_path` (a file holding the machine JSON), `post` or `post_path`, `a_reversed`, `a_limits_deg`, `work_offset` (as a job has them; relative paths are read from the file's folder). Give this, `tools` or `tool_library_path`. |
 | `tools`, `tool_library_path` | The tools to choose from, as a job has them. |
 | `bodies`, `origin`, `tolerance` | As `cam.features`; they are copied into the job. |
 | `axis` | `z` or `a`. Default: `a` when the profile's machine has one rotary about X. |
@@ -287,8 +290,9 @@ operations, in order:
 3. **Pockets**, roughed with the largest flat end mill the pocket takes (flutes as long as the
    depth preferred), 0.2 mm left on the walls; islands lower than the rim in bands of their own.
 4. **Holes**, counterbores first, milled as round pockets with the largest flat end mill of at most
-   80% of the hole's diameter. A hole no tool fits is skipped, naming a drill of its diameter when
-   the library has one.
+   80% of the hole's diameter. A hole no tool fits is skipped, with the largest diameter that would
+   fit and the operation to add; a drill of its diameter in the library is named, but `cam.job` has
+   no drilling operation to use it yet.
 5. **Pocket walls** finished with a contour by the largest flat end mill whose radius is at most
    the pocket's `min_corner_radius` (when a corner is sharp: the smallest that fits, with a check
    saying what it leaves).
@@ -301,6 +305,8 @@ operations, in order:
 
 Pockets and holes on other sides of a 4th-axis part are `indexed` at their A angles; facing,
 profiles and 3D finishing are 3-axis only. Steps (faces open on some sides) are listed under
-`skipped` with the operation to cut them. Always run the job with `dry_run: true` first; the
+`skipped` with the operation to cut them (a pocket on a step stays inside its outline: give a
+`polygon` past its open sides to clear them). A pocket whose walls are not upright gets a `check`
+line saying its walls are left, with the bounds for a 3D finish. Always run the job with `dry_run: true` first; the
 suggestion is tested to pass on a plate with a pocket, an island and holes, and on a bar with a
 pocket on each side.

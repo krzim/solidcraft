@@ -45,7 +45,7 @@ pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new("cam.suggest", "Suggest
     .contract(&SUGGEST_CONTRACT)
     .output(output_schema_for::<CamSuggestReply>)
     .params(
-        "profile_path: machine profile .json (a tool library array, or {tools | tool_library_path, machine?, post? | post_path?, \
+        "profile_path: machine profile .json (a tool library array, or {tools | tool_library_path, machine? | machine_path?, post? | post_path?, \
          a_reversed?, a_limits_deg?, work_offset?}) | tools: [Tool JSON] | tool_library_path; bodies?; origin?: [x,y,z]; axis?: \"z\" | \
          \"a\" (default: a when the machine has an A axis); tolerance?; post?: built-in (default the profile's, else linuxcnc_4axis); \
          stock_top?: mm faced off the top (default 0.5); check?: bool (also run cam.job as a dry run) → job (a complete cam.job job, \
@@ -84,7 +84,8 @@ struct Profile {
     work_offset: Option<Value>,
 }
 
-const PROFILE_KEYS: &[&str] = &["a_limits_deg", "a_reversed", "machine", "post", "post_path", "tool_library_path", "tools", "work_offset"];
+const PROFILE_KEYS: &[&str] =
+    &["a_limits_deg", "a_reversed", "machine", "machine_path", "post", "post_path", "tool_library_path", "tools", "work_offset"];
 
 fn load_profile(cmd: &str, p: &CamSuggestParams) -> Result<Profile> {
     let given = [p.profile_path.is_some(), p.tools.is_some(), p.tool_library_path.is_some()].iter().filter(|x| **x).count();
@@ -126,9 +127,21 @@ fn load_profile(cmd: &str, p: &CamSuggestParams) -> Result<Profile> {
                     Some(_) => Err(bad(cmd, format!("profile_path {path}: `{k}` must be a string"))),
                 }
             };
+            let machine = match (o.get("machine"), o.get("machine_path")) {
+                (Some(_), Some(_)) => return Err(bad(cmd, format!("profile_path {path}: give `machine` or `machine_path`, not both"))),
+                (m, None) => m.cloned(),
+                (None, Some(Value::String(mp))) => {
+                    let file = beside(base.as_deref(), mp);
+                    match read_json(cmd, &file, "machine_path")? {
+                        m @ Value::Object(_) => Some(m),
+                        _ => return Err(bad(cmd, format!("machine_path {file}: a machine file holds the CAM crate's `Machine` JSON object"))),
+                    }
+                }
+                (None, Some(_)) => return Err(bad(cmd, format!("profile_path {path}: `machine_path` must be a string"))),
+            };
             Ok(Profile {
                 tools,
-                machine: o.get("machine").cloned(),
+                machine,
                 post: text("post")?,
                 post_path: text("post_path")?.map(|pp| beside(base.as_deref(), &pp)),
                 a_reversed: o.get("a_reversed").cloned(),
@@ -551,6 +564,16 @@ fn operations(plan: &mut Plan, set: &FeatureSet, tools: &[Pick], flats: &[&Pick]
             );
             plan.add(op, if indexed { "indexed pocket" } else { "pocket" }, &rough.tool, vec![pk.id.clone()], why);
         }
+        if !pk.walls_vertical {
+            plan.check.push(format!(
+                "{}: its walls are not upright (rounded, chamfered or drafted where they meet the floor): its pocket and wall finish follow                  the floor's outline, inside the walls, and leave them; finish the walls with a `waterline` or `parallel` operation over                  its bounds [[{}, {}], [{}, {}]]",
+                pk.id,
+                num(pk.bounds[0][0]),
+                num(pk.bounds[0][1]),
+                num(pk.bounds[1][0]),
+                num(pk.bounds[1][1])
+            ));
+        }
         // The finishing contour round its walls, added after the holes.
         let corner = pk.min_corner_radius;
         let takes = |t: &Pick| contour_takes(&t.tool, &regions, Side::Inside, g.top, g.bottom, tol);
@@ -600,11 +623,17 @@ fn operations(plan: &mut Plan, set: &FeatureSet, tools: &[Pick], flats: &[&Pick]
         let Some(t) = pick else {
             let drill = tools.iter().find(|t| t.tool.kind == ToolKind::Drill && (t.tool.diameter - h.diameter).abs() <= tol.max(0.01));
             plan.skipped.push(format!(
-                "{} (diameter {} mm): no flat end mill of at most {}% of its diameter fits{}",
+                "{} (diameter {} mm): no flat end mill of at most {}% of its diameter ({} mm) fits; add one to the tools to mill it as a \
+                 round pocket, {{\"type\": \"pocket\", \"feature\": \"{}\", \"tool\": <its number>}}{}",
                 h.id,
                 num(h.diameter),
                 num(HOLE_TOOL_SHARE * 100.0),
-                drill.map_or(String::new(), |d| format!("; drill it with tool {}", d.tool.number))
+                num(h.diameter * HOLE_TOOL_SHARE),
+                h.id,
+                drill.map_or(String::new(), |d| format!(
+                    " (drill tool {} has its diameter, but cam.job has no drilling operation to use it)",
+                    d.tool.number
+                ))
             ));
             continue;
         };
@@ -746,7 +775,9 @@ fn operations(plan: &mut Plan, set: &FeatureSet, tools: &[Pick], flats: &[&Pick]
     }
     for f in r.faces.iter().filter(|f| f.role == "step" && in_axis(f.a_deg)) {
         plan.skipped.push(format!(
-            "{} is a step open on some sides: cut it with `{{\"type\": \"pocket\", \"feature\": \"{}\"}}` and a tool of your choice",
+            "{} is a step open on some sides: cut it with `{{\"type\": \"pocket\", \"feature\": \"{}\"}}` and a tool of your choice (the \
+             pocket stays inside the face's outline, so it leaves a tool's radius along the open sides: for those, give a `polygon` \
+             running past them instead, with `heights`)",
             f.id, f.id
         ));
     }

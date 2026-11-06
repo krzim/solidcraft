@@ -657,6 +657,7 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
                 o.feature.as_deref(),
                 o.heights.as_ref(),
                 frame,
+                None,
             )?;
             let regions = two.regions;
             let cut = Cut { heights: two.heights, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
@@ -686,6 +687,7 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
                 o.feature.as_deref(),
                 o.heights.as_ref(),
                 frame,
+                Some(r.tool.radius()),
             )?;
             let regions = two.regions;
             let cut = Cut { heights: two.heights, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };

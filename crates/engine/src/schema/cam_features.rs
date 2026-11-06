@@ -121,7 +121,8 @@ pub struct HoleReport {
     pub depth: f64,
     /// It comes out on the other side.
     pub through: bool,
-    /// `through`, `flat` (a flat floor) or `cone` (a drill point).
+    /// `through`, `flat` (a flat floor), `cone` (a drill point) or `round` (the wall runs on into
+    /// a curved floor within its radius, a round at its foot or a ball end, below `bottom_z`).
     pub floor: String,
     /// The drill point's tip (with `floor: "cone"`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,7 +181,8 @@ pub struct PocketReport {
     /// Sharp inside corners (a cutter leaves its own radius there).
     pub sharp_corners: usize,
     /// Every wall is square to the floor (no draft or round at its foot): the outline is the
-    /// pocket's all the way up.
+    /// pocket's all the way up. When false the outline is the floor's, inside the walls: a 2D
+    /// pocket or contour on it leaves the walls, and `cam.suggest` says so under `check`.
     pub walls_vertical: bool,
     /// Bosses standing in it.
     pub islands: Vec<IslandReport>,
@@ -306,9 +308,9 @@ pub struct CamSuggestParams {
     #[serde(default)]
     pub tolerance: Option<f64>,
     /// A machine profile: a JSON file holding either an array of tools (a tool library) or an
-    /// object with `tools` or `tool_library_path`, and optionally `machine`, `post` or
-    /// `post_path`, `a_reversed`, `a_limits_deg`, `work_offset` (as a job has them; relative
-    /// paths are read from the file's folder). Give this, `tools` or `tool_library_path`.
+    /// object with `tools` or `tool_library_path`, and optionally `machine` or `machine_path` (a
+    /// file holding the `Machine` JSON), `post` or `post_path`, `a_reversed`, `a_limits_deg`,
+    /// `work_offset` (as a job has them; relative paths are read from the file's folder). Give this, `tools` or `tool_library_path`.
     #[serde(default)]
     pub profile_path: Option<String>,
     /// The tools to choose from, as a job's `tools`.
