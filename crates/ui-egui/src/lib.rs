@@ -19,6 +19,9 @@ pub mod bom_panel;
 pub mod browser;
 pub mod browser_canvas;
 pub mod browser_prompts;
+mod cam_view_layer;
+pub mod cam_view_panel;
+pub mod cam_view_player;
 pub mod canvas;
 pub mod cli_link;
 #[cfg(test)]
@@ -580,6 +583,10 @@ pub struct SolveApp {
     pub sketch_report: Option<sketch_report::SketchReport>,
     /// The Bill of Materials window, when open.
     pub bom: Option<bom_panel::BomPanel>,
+    /// The CAM simulation panel, when open (it opens whenever a view is loaded).
+    pub cam_panel: Option<cam_view_panel::CamPanel>,
+    /// Plays the CAM simulation view and runs its commands off the window thread.
+    pub cam_player: cam_view_player::CamPlayer,
     material_card_review: Option<material_card_review::ReviewWindow>,
     /// Context menus, rename box and Properties window.
     pub menu: context_menu::MenuState,
@@ -856,6 +863,8 @@ impl SolveApp {
             design_properties: None,
             sketch_report: None,
             bom: None,
+            cam_panel: None,
+            cam_player: Default::default(),
             material_card_review: None,
             menu: context_menu::MenuState::default(),
             gesture: mouse_gesture::State::default(),
@@ -2003,6 +2012,10 @@ impl SolveApp {
         }
         if id == "assembly.bom" {
             bom_panel::open(self);
+            return;
+        }
+        if id == "cam.view.load" {
+            cam_view_panel::open(self);
             return;
         }
         // Inspect → Measure → Properties: the window, not a reply nobody sees (#8095).
@@ -3278,6 +3291,8 @@ impl SolveApp {
         self.poll_deferred(ui.ctx());
         self.poll_delete_check(ui.ctx());
         timeline::tick_playback(self, ui.ctx());
+        cam_view_player::follow(self);
+        cam_view_player::tick(self, ui.ctx());
         if !self.embedded && !self.embed_editor {
             toolbar::app_bar(self, ui);
         }
@@ -3443,6 +3458,7 @@ impl SolveApp {
         design_properties::show(self, ui.ctx());
         sketch_report::show(self, ui.ctx());
         bom_panel::show(self, ui.ctx());
+        cam_view_panel::show(self, ui.ctx());
         material_card_review::show(self, ui.ctx());
         recovery_ui::show(self, ui.ctx());
         mesh_units::show(self, ui.ctx());
@@ -3541,6 +3557,11 @@ impl SolveApp {
                 ctx.request_repaint();
                 continue;
             }
+            // The CAM simulation view's commands: in its player's queue, cutting off the window thread.
+            let Some(req) = cam_view_player::intercept(self, req) else {
+                ctx.request_repaint();
+                continue;
+            };
             // A slow design change or export: computed off the window thread (#1989).
             let Some(req) = self.offload_control(ctx, req) else {
                 ctx.request_repaint();

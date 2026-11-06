@@ -859,6 +859,24 @@ cosine of the turn (to a stop between a rapid and a cut, or at a right angle), r
 2000 mm/s² takes 10.05 s. The machine model's accelerations and tool change fill in what the
 job's rates leave out.
 
+**In the window.** The Simulation panel opens with Simulation View (`ui.start` of
+`cam.view.load`) and whenever a view is loaded, an agent's load too; closing it closes the view.
+It loads a job (and, optionally, a G-code file, a machine model and a workholding), plays,
+pauses and steps the program by move, operation, tool change or finding, at a speed from ×0.25
+to ×256 of the estimated real time, and loops. Its timeline shows the operations as bands, the
+tool changes as ticks, the findings as marks and how far the program has been checked; a click
+or a drag goes there. Under it: the line and its G-code, the operation, the tool, the position
+(A included), the feed, the spindle, the time and the material removed, the findings (a click
+goes to one) and what the view shows. Every action is a `cam.view.*` command. The 3D view draws
+the stock as cut so far coloured by the tool that cut it last, the toolpaths in one colour per
+operation (or tool) with what is still to come dim, rapids dashed and each plunge's foot marked,
+the tool with its shank and holder and the machine's spindle parts at the tool's pose, the
+workholding see-through, and the findings as crosses. The design's own bodies are hidden unless
+`part` is shown. Commands that cut the stock (`load`, `seek`, `export_stock`), from the panel,
+from playing or from an agent over the control channel, run in order off the window thread; the
+window keeps drawing meanwhile. When nothing is asked, the program is checked to its end in the
+background, so every finding is on the timeline.
+
 ### Machine model
 
 A machine model file (`"format": "solidcraft.machine_model", "version": 1`) gives the table,

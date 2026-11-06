@@ -53,6 +53,7 @@ pub use cmd::{
     Addition, CommandInfo, CommandSpec, OpenSteps, addition, auto_operation, command_specs, dimension_roles, extrude_reach, find_command,
     resolve_design_links, shown_scope, standard_view,
 };
+pub use solidcraft_cam as cam;
 pub use solidcraft_doc as doc;
 pub use solidcraft_doc::Visibility;
 pub use solidcraft_geom as geom;
