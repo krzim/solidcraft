@@ -19,11 +19,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod adaptive;
 mod check;
 pub mod collision;
 mod cutter;
 pub mod drill;
 mod dropcutter;
+pub mod engagement;
 mod frame;
 mod gcode;
 pub mod gcode5;
@@ -88,9 +90,13 @@ pub(crate) fn invalid<T>(why: impl Into<String>) -> Result<T> {
 }
 
 #[cfg(test)]
+mod adaptive_tests;
+#[cfg(test)]
 mod collision_tests;
 #[cfg(test)]
 mod drill_tests;
+#[cfg(test)]
+mod engagement_tests;
 #[cfg(test)]
 mod foundation_tests;
 #[cfg(test)]
