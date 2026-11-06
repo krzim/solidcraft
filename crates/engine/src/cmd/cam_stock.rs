@@ -172,12 +172,14 @@ pub(super) fn check_motion(
     machine: &Machine,
     surfaces: &Surfaces,
     stock: Option<&Stock>,
+    unchecked: &[bool],
     tol: f64,
     failures: &mut Vec<String>,
 ) -> Result<(RapidsReport, Option<TravelReport>)> {
     let stages = stock_stages(job, stock);
     let stages = if stages.len() == program.operations.len() { stages } else { Vec::new() };
-    let check = check_rapids_staged(text, program, post, machine, &surfaces.all, &surfaces.part, stock, &stages, tol, RAPID_STEP)
+    let unchecked = if unchecked.len() == program.operations.len() { unchecked } else { &[] };
+    let check = check_rapids_staged(text, program, post, machine, &surfaces.all, &surfaces.part, stock, &stages, unchecked, tol, RAPID_STEP)
         .map_err(|e| cam_err(cmd, "checking the rapids", e))?;
     let op_name = |k: Option<usize>| {
         k.and_then(|k| program.operations.get(k)).map(|o| match o {

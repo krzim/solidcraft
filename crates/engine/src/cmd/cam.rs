@@ -1168,7 +1168,9 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     }
     gouge.pass = gouge.hits == 0;
     // Every rapid of the program as written, and every position against the machine's travel.
-    let (rapids, travel) = cam_stock::check_motion(cmd, &job, &text, &program, &post, &machine, &surfaces, stock.as_ref(), tol, &mut failures)?;
+    let unchecked: Vec<bool> = planned.iter().map(|p| !p.gouge_check).collect();
+    let (rapids, travel) =
+        cam_stock::check_motion(cmd, &job, &text, &program, &post, &machine, &surfaces, stock.as_ref(), &unchecked, tol, &mut failures)?;
     let simulation = if params.simulate.unwrap_or(false) {
         let deliberate = planned.iter().any(|p| !p.gouge_check);
         match sim::check_program(cmd, &text, &machine, &tools, &surfaces.part, stock.as_ref(), tol, None, deliberate) {

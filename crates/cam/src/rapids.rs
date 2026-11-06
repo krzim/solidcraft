@@ -14,10 +14,15 @@
 //!   not tracked, so a rapid below the stock's top over it fails), except on a retract straight
 //!   up the tool's axis, which only passes through room the tool already fills. The caller
 //!   may say what is left of it as each operation starts ([`check_rapids_staged`]: a box
-//!   faced all over is lower after the facing);
+//!   faced all over is lower after the facing). The part does not count against such a
+//!   retract either when the block's operation cuts what the model does not show on purpose
+//!   (`unchecked`, an operation without a gouge check: a deburr of a sharp-edged model): it
+//!   leaves the cut where its own feed moves ended;
 //! - a block that turns the rotary of a 4th axis (a table about X) must keep the cutter
-//!   outside the radius the stock sweeps (without a stock, the part's largest radius and the
-//!   tolerance), all through the turn, wherever the stock is level with it along X.
+//!   outside the radius the stock sweeps, all through the turn, wherever the stock is level with
+//!   it along X. Without a stock the part is cut into [`TURN_SLICES`] slices along X, each held
+//!   to the largest radius of the part's facets over it and the tolerance, so a slender section
+//!   is not held to the radius of the part's widest one.
 //!
 //! A block after a return to the machine's home (`G28`, `G30`), a move in machine coordinates
 //! (`G53`) or a tool change starts from where the reader cannot follow: only its end is
@@ -53,6 +58,8 @@ const MAX_BLOCK_SAMPLES: usize = 2_000_000;
 /// Most hits kept in full (all are counted).
 const MAX_HITS_KEPT: usize = 1000;
 /// The line written at the start of every operation of the marked program.
+/// Slices of the part along X for the turn check without a stock.
+pub const TURN_SLICES: usize = 128;
 const MARK: &str = "(SOLIDCRAFT RAPID CHECK OPERATION START)";
 
 /// What a rapid runs into.
@@ -201,21 +208,45 @@ struct TurnZone {
     x: (f64, f64),
 }
 
-fn turn_zone(machine: &Machine, part: &Surface, stock: Option<&Stock>, tol: f64) -> Option<TurnZone> {
-    let [axis] = machine.rotaries.as_slice() else { return None };
+fn turn_zones(machine: &Machine, part: &Surface, stock: Option<&Stock>, tol: f64) -> Vec<TurnZone> {
+    let [axis] = machine.rotaries.as_slice() else { return Vec::new() };
     if axis.carrier != Carrier::Table || axis.direction.normalized().map_or(0.0, |d| d.x.abs()) < 1.0 - 1e-9 {
-        return None;
+        return Vec::new();
     }
     let c = axis.center - machine.work_origin;
     let center = Vec2::new(c.y, c.z);
-    match stock {
-        Some(s) => Some(TurnZone { center, radius: s.radius_about_x(center) - tol, x: s.x_range() }),
-        None => {
-            let b = part.bounds();
-            let radius = part.triangles().iter().flatten().map(|p| (p.y - center.x).hypot(p.z - center.y)).fold(0.0, f64::max);
-            (!b.is_empty()).then_some(TurnZone { center, radius: radius + tol, x: (b.min.x, b.max.x) })
+    if let Some(s) = stock {
+        return vec![TurnZone { center, radius: s.radius_about_x(center) - tol, x: s.x_range() }];
+    }
+    let b = part.bounds();
+    if b.is_empty() || !b.min.x.is_finite() || !b.max.x.is_finite() {
+        return Vec::new();
+    }
+    // Each facet's farthest point from the axis is one of its corners (the distance from a
+    // line is convex), and it counts in every slice its X range meets.
+    let (x0, x1) = (b.min.x, b.max.x);
+    let slices = if x1 - x0 > tol { TURN_SLICES } else { 1 };
+    let width = (x1 - x0) / slices as f64;
+    let slice_of = |x: f64| if width > 0.0 { (((x - x0) / width).floor().max(0.0) as usize).min(slices - 1) } else { 0 };
+    let mut radius = vec![0.0f64; slices];
+    for t in part.triangles() {
+        let (lo, hi) = t.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.x), hi.max(p.x)));
+        let far = t.iter().map(|p| (p.y - center.x).hypot(p.z - center.y)).fold(0.0, f64::max);
+        let (i, j) = (slice_of(lo), slice_of(hi));
+        for r in radius.iter_mut().skip(i).take(j.saturating_sub(i) + 1) {
+            *r = r.max(far);
         }
     }
+    radius
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| **r > 0.0)
+        .map(|(k, r)| {
+            let lo = x0 + width * k as f64;
+            let hi = if k + 1 == slices { x1 } else { x0 + width * (k + 1) as f64 };
+            TurnZone { center, radius: r + tol, x: (lo - tol, hi + tol) }
+        })
+        .collect()
 }
 
 /// The farthest any point of `tool` that is checked lies from its tip (mm).
@@ -244,13 +275,15 @@ pub fn check_rapids(
     tol: f64,
     step: f64,
 ) -> Result<RapidCheck> {
-    check_rapids_staged(text, program, post, machine, obstacles, part, stock, &[], tol, step)
+    check_rapids_staged(text, program, post, machine, obstacles, part, stock, &[], &[], tol, step)
 }
 
 /// [`check_rapids`], with what is left of the stock as each operation starts: `stages[k]` is
 /// the stock the rapids of operation `k` are held against (one per operation, or none at all
 /// for `stock` throughout). A block of no known operation, and every 4th-axis turn, is held
-/// against `stock`, the stock as the job starts.
+/// against `stock`, the stock as the job starts. `unchecked[k]` says operation `k` cuts what
+/// the model does not show on purpose (one per operation, or none at all): its retracts
+/// straight up the tool's axis are not held against the part.
 #[allow(clippy::too_many_arguments)]
 pub fn check_rapids_staged(
     text: &str,
@@ -261,6 +294,7 @@ pub fn check_rapids_staged(
     part: &Surface,
     stock: Option<&Stock>,
     stages: &[Option<Stock>],
+    unchecked: &[bool],
     tol: f64,
     step: f64,
 ) -> Result<RapidCheck> {
@@ -277,6 +311,9 @@ pub fn check_rapids_staged(
     }
     if !stages.is_empty() && stages.len() != program.operations.len() {
         return invalid("the stock's stages must be one per operation");
+    }
+    if !unchecked.is_empty() && unchecked.len() != program.operations.len() {
+        return invalid("the operations without a gouge check must be given one per operation");
     }
     for s in stages.iter().flatten() {
         s.validate()?;
@@ -297,7 +334,7 @@ pub fn check_rapids_staged(
             every.push(i);
         }
     }
-    let zone = turn_zone(machine, part, stock, tol);
+    let zones = turn_zones(machine, part, stock, tol);
     let lever = machine.work_origin.len() + machine.rotaries.iter().map(|r| r.center.len()).sum::<f64>();
     // Lines that return home, counted up to each line, so a gap between two blocks is seen at once.
     let mut homed = vec![0usize];
@@ -339,12 +376,15 @@ pub fn check_rapids_staged(
                     (Some(_), Some(s)) => s.as_ref(),
                     _ => stock,
                 };
-                check_block(&mut out, &poses, (line, owner.as_ref().map(|_| k)), tool, cutter, obstacles, left, tol, step)?;
+                let deliberate = owner.is_some() && unchecked.get(k).copied().unwrap_or(false);
+                check_block(&mut out, &poses, (line, owner.as_ref().map(|_| k)), tool, cutter, obstacles, left, deliberate, tol, step)?;
                 let turns = from.is_some_and(|f| f.rotary.iter().zip(&to.rotary).any(|(a, b)| (a - b).abs() > 1e-9));
-                if let (true, Some(z)) = (turns, zone) {
-                    let deepest = poses
+                if turns {
+                    let deepest = zones
                         .iter()
-                        .filter_map(|p| axis_intrusion(p, tool.radius(), z.center, z.radius, z.x.0, z.x.1).map(|d| (d, p.tip)))
+                        .flat_map(|z| {
+                            poses.iter().filter_map(move |p| axis_intrusion(p, tool.radius(), z.center, z.radius, z.x.0, z.x.1).map(|d| (d, p.tip)))
+                        })
                         .reduce(|a, b| if b.0 > a.0 { b } else { a });
                     if let Some((depth, at)) = deepest {
                         out.hit(RapidHit { line, operation: owner.as_ref().map(|_| k), kind: RapidHitKind::Turn, depth, at });
@@ -402,14 +442,18 @@ fn check_block(
     cutter: &Cutter,
     obstacles: &Surface,
     stock: Option<&Stock>,
+    deliberate: bool,
     tol: f64,
     step: f64,
 ) -> Result<()> {
     let (line, op) = at;
     let path = Toolpath5 { moves: poses.iter().map(|&to| Move5::Rapid { to }).collect() };
-    let hits = gouges_in(obstacles, cutter, &path, tol, step, Moves::All)?;
-    if let Some(h) = hits.iter().max_by(|a, b| a.distance.total_cmp(&b.distance)) {
-        out.hit(RapidHit { line, operation: op, kind: RapidHitKind::Part, depth: h.distance, at: h.pose.tip });
+    // A retract out of a cut the model does not show leaves it the way it went in.
+    if !(deliberate && retract(poses)) {
+        let hits = gouges_in(obstacles, cutter, &path, tol, step, Moves::All)?;
+        if let Some(h) = hits.iter().max_by(|a, b| a.distance.total_cmp(&b.distance)) {
+            out.hit(RapidHit { line, operation: op, kind: RapidHitKind::Part, depth: h.distance, at: h.pose.tip });
+        }
     }
     if !tool.envelopes().is_empty() {
         let hits = holder_collisions_in(obstacles, tool, &path, 0.0, step, Moves::All)?;

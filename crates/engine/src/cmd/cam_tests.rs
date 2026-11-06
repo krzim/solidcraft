@@ -1025,18 +1025,17 @@ fn square_bar() -> Session {
 }
 
 /// The post rises to the operation's clearance before A turns: at 12 the bar's corners sweep
-/// through the tool, refused; at 25 the turn is clear.
+/// through the tool, refused (by the 4th-axis setup check while planning, before the rapid
+/// check of the written program, which finds the same turn: see the CAM crate's rapids tests);
+/// at 25 the turn is clear.
 #[test]
 fn an_a_turn_low_beside_a_square_bar_is_refused() {
     let mut s = square_bar();
-    let e = s.execute("cam.job", &json!({"job": square_bar_job(12.0), "output": Dir::new("turn").file("bar.tap")})).unwrap_err();
-    assert!(e.to_string().contains("rapids:") && e.to_string().contains("operation `side`"), "{e}");
-    let r = run(&mut s, "cam.job", json!({"job": square_bar_job(12.0), "dry_run": true}));
-    assert_eq!(r["gouge"]["pass"], true, "{r}");
-    let hits = r["rapids"]["first"].as_array().unwrap();
-    let turn = hits.iter().find(|h| h["kind"] == "turn").unwrap_or_else(|| panic!("{r}"));
-    assert_eq!(turn["operation"], "side", "{r}");
-    assert!(turn["depth"].as_f64().is_some_and(|d| (d - (200f64.sqrt() + 0.01 - 12.0)).abs() < 0.05), "{r}");
+    for p in [json!({"job": square_bar_job(12.0), "output": Dir::new("turn").file("bar.tap")}), json!({"job": square_bar_job(12.0), "dry_run": true})]
+    {
+        let e = s.execute("cam.job", &p).unwrap_err();
+        assert!(matches!(e, EngineError::BadParams { .. }) && e.to_string().contains("clearance") && e.to_string().contains("14.1421"), "{e}");
+    }
     let r = run(&mut s, "cam.job", json!({"job": square_bar_job(25.0), "dry_run": true}));
     assert_clean(&r);
     // Round stock of radius 30 reaches past a clearance of 25: the rapids are in it, the turn too.
@@ -1618,7 +1617,9 @@ fn hostile_chamfers_and_chamfer_mills_are_refused() {
     // Indexed, the chamfer runs in the frame the A angle brings under the tool.
     let mut job = chamfer_job(1.0);
     job["machine"] = json!("4axis_a");
-    let inner = job["operations"][1].take();
+    let mut inner = job["operations"][1].take();
+    // Clear of the plate's corners as A turns (14.1 mm from the axis): the 4th-axis setup check.
+    inner["heights"]["clearance"] = json!(20);
     job["operations"] = json!([{"type": "indexed", "a_deg": 0, "operation": inner}]);
     let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
     assert_clean(&r);
@@ -1637,7 +1638,12 @@ fn face_mills_ramp_in_and_chamfer_mills_never_rough() {
     };
     let mut job = chamfer_job(1.0);
     job["operations"][0].as_object_mut().unwrap().remove("ramp_angle_deg");
+    job["operations"][0]["entry"] = json!({"type": "plunge"});
     refused(&mut s, job, "ramp");
+    // A pocket's default entry is a helix, which a face mill may take.
+    let mut job = chamfer_job(1.0);
+    job["operations"][0].as_object_mut().unwrap().remove("ramp_angle_deg");
+    assert_clean(&run(&mut s, "cam.job", json!({"job": job, "dry_run": true})));
     let r = run(&mut s, "cam.job", json!({"job": chamfer_job(1.0), "dry_run": true}));
     assert_clean(&r);
     for tool in [7, 1] {
@@ -2270,8 +2276,8 @@ fn an_indexed_pattern_is_the_indexed_operations_it_stands_for() {
     let angles: Vec<f64> = ops.iter().filter_map(|o| o["a_deg"].as_f64()).collect();
     assert_eq!(angles, [0.0, 90.0, 180.0, 270.0]);
     assert!(ops.iter().all(|o| o["kind"] == "indexed parallel"), "{r}");
-    for a in ["A90.", "A180.", "A270."] {
-        assert!(text.contains(a), "{a}");
+    for a in ["A90", "A180", "A270"] {
+        assert!(text.split_whitespace().any(|w| w.trim_end_matches('.') == a), "{a}: {text}");
     }
     // A count spreads the angles evenly over a turn: the same four.
     let count = faces_job(json!([{"type": "indexed_pattern", "count": 4, "operation": face_op("face", 40.0)}]));

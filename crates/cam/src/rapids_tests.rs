@@ -268,7 +268,7 @@ fn a_rapid_over_a_faced_stock_is_held_against_what_is_left() {
     ]);
     let text = emit_program(&ops, &post, &machine).unwrap();
     let run = |stages: &[Option<Stock>]| {
-        check_rapids_staged(&text, &ops, &post, &machine, &part_and_clamp(), &part(), Some(&stock), stages, 0.01, RAPID_STEP)
+        check_rapids_staged(&text, &ops, &post, &machine, &part_and_clamp(), &part(), Some(&stock), stages, &[], 0.01, RAPID_STEP)
     };
     let faced = stock.faced(stock.footprint(), 0.0);
     assert_eq!(faced, Stock::Box { min: Vec3::new(-15.0, -15.0, -12.0), max: Vec3::new(15.0, 15.0, 0.0) });
@@ -291,8 +291,8 @@ fn a_rapid_over_a_faced_stock_is_held_against_what_is_left() {
     assert!(run(&[Some(stock), Some(bad)]).is_err());
     // A program that is not the one written: every block against the stock as given.
     let other = "G0 X-30 Y0 Z10\nG0 X-30 Y0 Z0.5\nG0 X0 Y0 Z0.5\n";
-    let r =
-        check_rapids_staged(other, &ops, &post, &machine, &part_and_clamp(), &part(), Some(&stock), &[Some(stock), Some(faced)], 0.01, 0.5).unwrap();
+    let r = check_rapids_staged(other, &ops, &post, &machine, &part_and_clamp(), &part(), Some(&stock), &[Some(stock), Some(faced)], &[], 0.01, 0.5)
+        .unwrap();
     assert!(!r.tools_known && r.hits.iter().any(|h| h.kind == RapidHitKind::Stock), "{r:?}");
 }
 
@@ -313,4 +313,65 @@ fn an_arc_past_the_travel_between_samples_is_found() {
         m.linear_limits = Some((Vec3::new(-200.0, -200.0, -50.0), Vec3::new(200.0, 100.001, 50.0)));
         assert_eq!(check_travel(text, &m).unwrap().unwrap().violation, None, "{text}");
     }
+}
+
+/// Without a stock, an A turn is held to the part's radius where the tool is along X: over the
+/// slender end of a stepped bar a turn clears it at a height the wide end would not allow.
+#[test]
+fn an_a_turn_is_held_to_the_part_where_the_tool_is_along_x() {
+    let mut tris = block(Vec3::new(-20.0, -15.0, -15.0), Vec3::new(0.0, 15.0, 15.0)).triangles().to_vec();
+    tris.extend_from_slice(block(Vec3::new(0.0, -10.0, -10.0), Vec3::new(20.0, 10.0, 10.0)).triangles());
+    let bar = Surface::new(tris).unwrap();
+    let machine = Machine::four_axis_a();
+    let mut post = Post5::mach3_4axis();
+    post.clearance_retract = false;
+    let turn_at = |x: f64, rho: f64| {
+        let path = Toolpath5 {
+            moves: vec![
+                Move5::Rapid { to: rotary_pose(x, 0.0, 40.0) },
+                Move5::Rapid { to: rotary_pose(x, 0.0, rho) },
+                Move5::Rapid { to: rotary_pose(x, 45f64.to_radians(), rho) },
+                Move5::Rapid { to: rotary_pose(x, 45f64.to_radians(), 40.0) },
+            ],
+        };
+        let p = program(vec![MachineOperation::Continuous(Operation5 {
+            name: "turn".into(),
+            tool: flat(1, 4.0),
+            spindle_rpm: 12000.0,
+            coolant: false,
+            path,
+        })]);
+        let text = emit_program(&p, &post, &machine).unwrap();
+        check_rapids(&text, &p, &post, &machine, &bar, &bar, None, 0.01, RAPID_STEP).unwrap()
+    };
+    // The small section reaches 14.14 mm from the axis, the large one 21.21 mm.
+    assert!(!turn_at(10.0, 18.0).hits.iter().any(|h| h.kind == RapidHitKind::Turn), "over the small section");
+    let r = turn_at(-10.0, 18.0);
+    let hit = r.hits.iter().find(|h| h.kind == RapidHitKind::Turn).unwrap_or_else(|| panic!("{r:?}"));
+    assert!((hit.depth - (450f64.sqrt() + 0.01 - 18.0)).abs() < 0.05, "{hit:?}");
+    // Within the tool's radius of the step the large section counts.
+    assert!(turn_at(1.0, 18.0).hits.iter().any(|h| h.kind == RapidHitKind::Turn));
+}
+
+/// An operation that cuts what the model does not show (no gouge check) retracts out of its
+/// cut straight up: that retract is not held against the part, but its other rapids still are.
+#[test]
+fn a_retract_out_of_an_unchecked_cut_is_not_a_crash() {
+    let machine = Machine::three_axis();
+    let post = Post5::mach3_4axis();
+    // Over the clamp's side at Z 2 (through it), then down to 0.2 over the block: the cut goes
+    // 0.3 into its top and the tool retracts.
+    let p = program(vec![rapids_op("deburr", flat(1, 6.0), &[Vec3::new(0.0, 0.0, 8.0), Vec3::new(0.0, 0.0, 0.2)])]);
+    let text = emit_program(&p, &post, &machine).unwrap();
+    let checked = check_rapids_staged(&text, &p, &post, &machine, &part_and_clamp(), &part(), None, &[], &[false], 0.01, RAPID_STEP).unwrap();
+    assert!(checked.hits.iter().any(|h| h.kind == RapidHitKind::Part), "{checked:?}");
+    let unchecked = check_rapids_staged(&text, &p, &post, &machine, &part_and_clamp(), &part(), None, &[], &[true], 0.01, RAPID_STEP).unwrap();
+    assert!(unchecked.pass(), "{unchecked:?}");
+    // A rapid across through the clamp is held against it all the same.
+    let across = program(vec![rapids_op("deburr", flat(1, 6.0), &[Vec3::new(12.0, 0.0, 2.0), Vec3::new(25.0, 0.0, 2.0)])]);
+    let text = emit_program(&across, &post, &machine).unwrap();
+    let r = check_rapids_staged(&text, &across, &post, &machine, &part_and_clamp(), &part(), None, &[], &[true], 0.01, RAPID_STEP).unwrap();
+    assert!(r.hits.iter().any(|h| h.kind == RapidHitKind::Part), "{r:?}");
+    // One flag per operation, or none.
+    assert!(check_rapids_staged(&text, &across, &post, &machine, &part_and_clamp(), &part(), None, &[], &[true, true], 0.01, RAPID_STEP).is_err());
 }
