@@ -552,6 +552,8 @@ struct Ctx<'a> {
     part: &'a Surface,
     origin: Vec3,
     tol: f64,
+    /// The part's machinable features, found when an operation names one (`cam_features.rs`).
+    features: &'a features::Lazy,
 }
 
 impl Ctx<'_> {
@@ -646,10 +648,20 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
         Op3Spec::Contour(o) => {
             let c = o.common();
             let r = ctx.resolve(&c)?;
-            let regions = ctx.regions(c.name, o.sketch.as_ref(), o.profiles.as_deref(), o.polygon.as_deref(), frame)?;
-            let cut = Cut { heights: heights(&o.heights), feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
+            let two = features::op_cut(
+                ctx,
+                c.name,
+                o.sketch.as_ref(),
+                o.profiles.as_deref(),
+                o.polygon.as_deref(),
+                o.feature.as_deref(),
+                o.heights.as_ref(),
+                frame,
+            )?;
+            let regions = two.regions;
+            let cut = Cut { heights: two.heights, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
             let params = ContourParams {
-                side: match o.side.unwrap_or(SideSpec::Outside) {
+                side: match o.side.or(two.side).unwrap_or(SideSpec::Outside) {
                     SideSpec::Outside => Side::Outside,
                     SideSpec::Inside => Side::Inside,
                     SideSpec::On => Side::On,
@@ -665,8 +677,18 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
         Op3Spec::Pocket(o) => {
             let c = o.common();
             let r = ctx.resolve(&c)?;
-            let regions = ctx.regions(c.name, o.sketch.as_ref(), o.profiles.as_deref(), o.polygon.as_deref(), frame)?;
-            let cut = Cut { heights: heights(&o.heights), feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
+            let two = features::op_cut(
+                ctx,
+                c.name,
+                o.sketch.as_ref(),
+                o.profiles.as_deref(),
+                o.polygon.as_deref(),
+                o.feature.as_deref(),
+                o.heights.as_ref(),
+                frame,
+            )?;
+            let regions = two.regions;
+            let cut = Cut { heights: two.heights, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter * 0.5) };
             let params = PocketParams {
                 stepover: or_tool(o.stepover, r.tool.stepover, r.tool.diameter * 0.4),
                 climb: o.climb.unwrap_or(true),
@@ -875,8 +897,14 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
         Planned { op: MachineOperation::Continuous(op), poses: path, tool: r.tool, gouge_check: c.gouge_check, report, axes: "4-axis".into() }
     };
     match spec {
-        OperationSpec::Contour(o) => indexed(&Op3Spec::Contour(o.clone()), vec![0.0; rotaries], None),
-        OperationSpec::Pocket(o) => indexed(&Op3Spec::Pocket(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::Contour(o) => match features::op_index(ctx, &o.name, o.feature.as_deref())? {
+            Some((rotary, a)) => indexed(&Op3Spec::Contour(o.clone()), rotary, Some(a)),
+            None => indexed(&Op3Spec::Contour(o.clone()), vec![0.0; rotaries], None),
+        },
+        OperationSpec::Pocket(o) => match features::op_index(ctx, &o.name, o.feature.as_deref())? {
+            Some((rotary, a)) => indexed(&Op3Spec::Pocket(o.clone()), rotary, Some(a)),
+            None => indexed(&Op3Spec::Pocket(o.clone()), vec![0.0; rotaries], None),
+        },
         OperationSpec::Parallel(o) => indexed(&Op3Spec::Parallel(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Roughing(o) => indexed(&Op3Spec::Roughing(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Waterline(o) => indexed(&Op3Spec::Waterline(o.clone()), vec![0.0; rotaries], None),
@@ -943,7 +971,7 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
 }
 
 /// `cam.job`.
-fn job(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.job";
     let params: CamJobParams = parse(cmd, p, "")?;
     let dry_run = params.dry_run.unwrap_or(false);
@@ -1005,7 +1033,8 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
     }
 
-    let ctx = Ctx { cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, origin, tol };
+    let found = features::Lazy::new(job.bodies.clone(), job.fixtures.clone().unwrap_or_default(), origin, tol, &machine);
+    let ctx = Ctx { cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, origin, tol, features: &found };
     let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
     for spec in &job.operations {
         planned.push(plan(&ctx, spec, post.base.arc_tolerance)?);
@@ -1364,6 +1393,10 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
 
+#[path = "cam_features.rs"]
+pub(super) mod features;
+#[path = "cam_suggest.rs"]
+pub(super) mod suggest;
 #[cfg(test)]
 #[path = "cam_tests.rs"]
 mod tests;

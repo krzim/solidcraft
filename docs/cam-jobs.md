@@ -168,3 +168,139 @@ rotary letter's lowest and highest angle), `bounds` and `errors` (the first line
 cannot read). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
 elsewhere are read on a best-effort basis and stop at the first block it cannot follow
 (incremental coordinates, for one).
+
+## Machinable features and suggested jobs
+
+Two commands let an agent go from a modelled part to a checked program without drawing a sketch
+for every cut or guessing a single height:
+
+| Command | What it does |
+| --- | --- |
+| `cam.features` | Lists the part's machinable features with stable ids and their exact geometry |
+| `cam.suggest` | Proposes a whole job from those features and a tool library, for `cam.job` to check |
+
+A short session: `cam.features {}` to see what there is, `cam.suggest {"profile_path": "my-mill.json"}`
+for a job, `cam.job {"job": …, "dry_run": true}` to check it, then `cam.job {"job": …, "output":
+"part.tap", "preview": "part.html"}`. Every refusal names the key or value to change.
+
+### `cam.features`
+
+```json
+{"bodies": ["Plate"], "origin": [0, 0, 0], "axis": "z", "tolerance": 0.01}
+```
+
+Every key is optional: the bodies default to every visible body, `origin` to the design's origin
+(the job's work zero), `axis` to `"z"` and `tolerance` to 0.01 mm (how close two sizes or
+positions must be to count as equal). With `axis: "a"` (a 4th axis about work X) every side whose
+normal is square to X is a setup of its own, at the A angle the machine turns to bring that side
+up, so A = 0 is the 3-axis setup and the other sides follow it round.
+
+Features are read from the exact B-rep, never from a mesh: the faces' analytic surfaces, their
+loops of edges and the faces on the other side of each edge, lines and arcs read exactly in the
+setup's plane. Every coordinate of a feature is in its setup's frame (work coordinates turned by
+the setup's A angle: its Z is the tool axis), so its numbers go straight into an operation of
+that setup.
+
+| List | Each feature |
+| --- | --- |
+| `setups` | `a_deg`, `tool_axis` (work), `top_z`, `bottom_z`, `bounds`, `swing_radius` (axis `a`), `features` (the ids machined from that side) |
+| `holes` | `hole:k`: `center`, `center_work`, `diameter`, `top_z`, `bottom_z`, `depth`, `through`, `floor` (`through`, `flat` or `cone` with `tip_z`), `counterbore` / `counterbore_of` (the hole above or below it on the same axis), `countersink` (`diameter`, `angle_deg`), `faces` |
+| `hole_groups` | holes of one diameter, depth and kind: `diameter`, `depth`, `through`, `count`, `ids` |
+| `pockets` | `pocket:k`: a planar floor walled all round. `floor_z`, `top_z` (its highest wall), `depth`, `outline` (counter-clockwise), `area` (less its islands), `bounds`, `min_corner_radius` (the smallest inside corner; 0 when one is sharp), `sharp_corners`, `walls_vertical`, `islands` (`outline`, `top_z`, `area`), `face_id` |
+| `faces` | `face:k`: every planar face facing the tool, with `z`, `area`, `bounds`, `normal_work` and `role`: `top`, `plateau` (everything round it falls away), `step` (open on some sides), `island_top`, `pocket_floor` (with `pocket`), `hole_floor` (a blind hole's floor or a counterbore's step) |
+| `profiles` | `profile:k`: the outline of a face whose walls fall straight away all round, and the outline of the bottom face (the silhouette) when no face above gives the same: `top_z`, `bottom_z`, `outline`, `min_concave_radius` (its notches, where a tool running outside must fit) |
+| `fillets`, `chamfers` | `fillet:k`, `chamfer:k`: rounds and chamfers falling away from the edges of faces facing the tool, `radius` or `angle_deg` (from the tool axis), `top_z`, `bottom_z`, `bounds`, `faces` |
+| `surfaces` | `surface:k`: other curved faces, joined where they touch: `kinds`, `min_radius`, `top_z`, `bottom_z`, `bounds` |
+| `turned` | `turned:k` (axis `a`): a diameter turned about the A axis, `diameter`, `x_min`, `x_max` |
+
+Ids are numbered per kind in a fixed order: the A = 0 setup first, then from the top down, then by
+position (Y, then X). The same bodies, origin, axis and tolerance give the same ids, and the A = 0
+features have the same ids with `axis: "z"` and `axis: "a"`. `notes` says what was left out: mesh
+bodies, holes square to the tool axis on a 3-axis mill, sides a 4th axis cannot reach.
+
+A hole is a whole round wall along the tool axis with material outside it, open at its top (the
+part of a round wall that is a pocket's corner or a slot's end is a wall, not a hole). Whether a
+round wall is a hole or a boss is read from the planar faces at its ends (the wall leaving an
+inner loop of a face into the material, or rising from a floor's outer loop), else by
+classifying a point just outside it on the exact solid.
+
+### Operations on features
+
+A `pocket` or `contour` operation takes `feature` in place of `sketch` or `polygon`:
+
+```json
+{"name": "pocket", "type": "pocket", "feature": "pocket:0", "tool": 2}
+```
+
+| Feature | Region | Heights (`top`, `bottom`) | `side` of a contour |
+| --- | --- | --- | --- |
+| `pocket:k` | its outline, with every island that rises above the operation's bottom | its highest wall, its floor | inside |
+| `hole:k` | its circle | its top, its bottom (a through hole: the part's bottom face) | inside |
+| `face:k` | its outline, with what stands on it | the walls round it (a top face: none, so give `heights.top`), the face | inside |
+| `profile:k` | its outline | its face, the foot of its walls | outside |
+
+`heights` may then be left out or given in part (`{"bottom": -3}`): what is left out comes from
+the feature, `clearance` 10 mm and `retract` 3 mm above the part's top in the feature's setup (on a
+4th axis `clearance` also clears the part's swing radius by 5 mm). Without a feature all four
+heights are still required. The job finds features as `cam.features` does with the job's
+`bodies` (else every visible body not in `fixtures`), `origin` and `tolerance`, along `a` when the
+machine has one rotary about X, else `z`.
+
+A feature on another side of a 4th-axis part carries its A angle: named outside an `indexed`
+operation, the operation is indexed there itself (the reply's `kind` is `indexed pocket` and its
+`a_deg` the feature's); inside an `indexed` operation at another angle it is refused with the
+angle to use. Fillets, chamfers, surfaces and turned diameters have no outline: a 2D operation on
+one is refused with the `boundary` rectangle and floor to give a `parallel` or `waterline`
+operation instead. Drilling and boring operations take `features: ["hole:0", "hole:1"]` through
+the same lookup.
+
+### `cam.suggest`
+
+```json
+{"profile_path": "C:/cam/my-mill.json", "axis": "a", "stock_top": 0.5, "check": true}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `profile_path` | A machine profile: a JSON array of tools (a tool library), or an object with `tools` or `tool_library_path` and optionally `machine`, `post` or `post_path`, `a_reversed`, `a_limits_deg`, `work_offset` (as a job has them; relative paths are read from the file's folder). Give this, `tools` or `tool_library_path`. |
+| `tools`, `tool_library_path` | The tools to choose from, as a job has them. |
+| `bodies`, `origin`, `tolerance` | As `cam.features`; they are copied into the job. |
+| `axis` | `z` or `a`. Default: `a` when the profile's machine has one rotary about X. |
+| `post` | A built-in post. Default: the profile's, else `linuxcnc_4axis`. |
+| `stock_top` | Material faced off the top, 0 to 5 mm (default 0.5; 0: no facing). |
+| `check` | Also run the job through `cam.job` as a dry run and return its report as `dry_run`. |
+
+The reply: `job` (a complete job: name, machine, post, origin, bodies, tolerance, only the tools it
+uses, and its operations, which name features), `operations` (each with the features it machines
+and why it was chosen), `tools` (what each is used for), `assumptions`, `check` (what to verify
+before running the program), `skipped` (features left out, tools that could not be used, and why)
+and, with `check`, `dry_run`. Nothing is written.
+
+Only tools with `spindle_rpm` and `feed` are picked. Each pick is tried with the operation itself
+on the feature's exact outline, so a tool is never proposed for a pocket it does not fit. The
+operations, in order:
+
+1. **Facing** (3-axis, when the top is flat and `stock_top` is above 0): a pocket over the part's
+   extent and 1 mm round it, `stock_top` deep, with the largest flat end mill.
+2. **3D roughing** (curved surfaces only): the whole part down to the lowest curved area, 0.25 mm
+   left, with the largest flat end mill.
+3. **Pockets**, roughed with the largest flat end mill the pocket takes (flutes as long as the
+   depth preferred), 0.2 mm left on the walls; islands lower than the rim in bands of their own.
+4. **Holes**, counterbores first, milled as round pockets with the largest flat end mill of at most
+   80% of the hole's diameter. A hole no tool fits is skipped, naming a drill of its diameter when
+   the library has one.
+5. **Pocket walls** finished with a contour by the largest flat end mill whose radius is at most
+   the pocket's `min_corner_radius` (when a corner is sharp: the smallest that fits, with a check
+   saying what it leaves).
+6. **3D finishing** of surfaces, fillets and chamfers: a parallel finish over their bounds with the
+   largest ball end mill whose radius is at most their smallest radius (else the smallest ball,
+   else a bull nose, else a flat end mill).
+7. **Turned diameters** (axis `a`): a rotary finish along their X range.
+8. **Outer profiles** (3-axis), last: a contour outside with the largest flat end mill that fits
+   their notches, flutes as long as the depth preferred.
+
+Pockets and holes on other sides of a 4th-axis part are `indexed` at their A angles; facing,
+profiles and 3D finishing are 3-axis only. Steps (faces open on some sides) are listed under
+`skipped` with the operation to cut them. Always run the job with `dry_run: true` first; the
+suggestion is tested to pass on a plate with a pocket, an island and holes, and on a bar with a
+pocket on each side.

@@ -1,0 +1,10 @@
+{
+  "en": { "cmd.cam.features": "CAM Features", "cmd.cam.suggest": "Suggest CAM Job" },
+  "ar": { "cmd.cam.features": "ميزات التشغيل CAM", "cmd.cam.suggest": "اقتراح مهمة CAM" },
+  "de": { "cmd.cam.features": "CAM-Features", "cmd.cam.suggest": "CAM-Auftrag vorschlagen" },
+  "fr": { "cmd.cam.features": "Entités FAO", "cmd.cam.suggest": "Proposer un travail FAO" },
+  "he": { "cmd.cam.features": "תכונות CAM", "cmd.cam.suggest": "הצעת משימת CAM" },
+  "ja": { "cmd.cam.features": "CAMフィーチャー", "cmd.cam.suggest": "CAMジョブを提案" },
+  "vi": { "cmd.cam.features": "Đặc trưng CAM", "cmd.cam.suggest": "Đề xuất công việc CAM" },
+  "zh": { "cmd.cam.features": "CAM 特征", "cmd.cam.suggest": "建议 CAM 作业" }
+}
