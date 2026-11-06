@@ -22,6 +22,7 @@
 mod check;
 pub mod collision;
 mod cutter;
+pub mod drill;
 mod dropcutter;
 mod frame;
 mod gcode;
@@ -85,6 +86,8 @@ pub(crate) fn invalid<T>(why: impl Into<String>) -> Result<T> {
 
 #[cfg(test)]
 mod collision_tests;
+#[cfg(test)]
+mod drill_tests;
 #[cfg(test)]
 mod foundation_tests;
 #[cfg(test)]

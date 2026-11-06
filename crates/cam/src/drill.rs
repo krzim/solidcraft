@@ -1,0 +1,376 @@
+//! Drilling: holes at points, fed straight down the tool axis with a drill (or plunged with a
+//! flat end mill), in one of four cycles.
+//!
+//! Every cycle is written out as plain rapid and feed moves (and a dwell), which every
+//! controller reads and the read-back follows; no canned cycle (G81, G82, G83, G73) is written.
+//! The moves are those cycles' own:
+//! - [`Cycle::Simple`]: feed to depth, rapid out to the retract (R) height.
+//! - [`Cycle::Dwell`]: the same with a pause at depth.
+//! - [`Cycle::Peck`]: feed a peck deeper at a time, rapid right out to the R height after each
+//!   peck (clearing the chips), rapid back down to a little above the depth reached, and feed on.
+//! - [`Cycle::ChipBreak`]: feed a peck deeper at a time, backing off a short way at rapid
+//!   after each to break the chip.
+//!
+//! Holes are visited in a greedy nearest-neighbour order from the hole lowest in X (then Y),
+//! deterministic for the same points. Between holes the tool rises to the clearance height,
+//! or with [`DrillParams::stay_at_retract`] travels at the R height, which is allowed only when
+//! the R height is above everything in the way ([`DrillParams::part_top`]).
+//!
+//! A drill's point is a cone below its full diameter: [`tip_length`] is how far. A hole's
+//! depth is to the tip, or with [`DrillParams::to_full_diameter`] to where the drill reaches
+//! its full diameter. The gouge check ([`tool_gouges`]) holds the drill's real shape against
+//! the part: the cylinder above the point and the cone, inscribed by stepped cylinders.
+
+use serde::{Deserialize, Serialize};
+use solidcore_record::{Vec2, Vec3};
+use solidcraft_geom::prelude::*;
+
+use crate::check::verify;
+use crate::collision::{Hit, gouges};
+use crate::cutter::Cutter;
+use crate::multiaxis::{Move5, Pose, Toolpath5};
+use crate::ops::Heights;
+use crate::path::{MAX_MOVES, Move, Toolpath};
+use crate::surface::Surface;
+use crate::tool::{Tool, ToolKind};
+use crate::{CamError, Result, invalid};
+
+/// Most holes one drilling operation drills.
+pub const MAX_HOLES: usize = 10_000;
+/// The point angle of a drill that gives none (degrees).
+pub const DEFAULT_POINT_ANGLE_DEG: f64 = 118.0;
+/// Holes closer together than this (mm) are the same hole, drilled once.
+pub const SAME_HOLE: f64 = 1e-6;
+/// Most pecks into one hole.
+const MAX_PECKS: usize = 10_000;
+/// Most stepped cylinders a drill's point is checked with.
+const MAX_POINT_STEPS: usize = 64;
+/// Largest coordinate, height or distance accepted (mm).
+const MAX_COORD: f64 = 1.0e6;
+/// Longest dwell (seconds).
+const MAX_DWELL: f64 = 3600.0;
+
+/// How each hole is drilled.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Cycle {
+    /// Feed to depth, then rapid out to the R height.
+    Simple,
+    /// Feed to depth, pause `seconds`, rapid out.
+    Dwell { seconds: f64 },
+    /// Feed `peck` deeper at a time (from the hole's top); after each peck rapid out to the R
+    /// height, then rapid back down to `clearance` above the depth reached.
+    Peck { peck: f64, clearance: f64 },
+    /// Feed `peck` deeper at a time; after each peck rapid back `back_off` (staying in the
+    /// hole) to break the chip.
+    ChipBreak { peck: f64, back_off: f64 },
+}
+
+impl Cycle {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Cycle::Simple => "simple",
+            Cycle::Dwell { .. } => "dwell",
+            Cycle::Peck { .. } => "peck",
+            Cycle::ChipBreak { .. } => "chip_break",
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let distance = |v: f64| v > 0.0 && v <= MAX_COORD;
+        match *self {
+            Cycle::Simple => Ok(()),
+            Cycle::Dwell { seconds } if (0.0..=MAX_DWELL).contains(&seconds) => Ok(()),
+            Cycle::Dwell { .. } => invalid("the dwell must be from 0 to 3600 seconds"),
+            Cycle::Peck { peck, clearance } => {
+                if !distance(peck) {
+                    return invalid("the peck depth must be above 0");
+                }
+                if !distance(clearance) {
+                    return invalid("the peck clearance (how far above the depth reached the tool comes back down to) must be above 0");
+                }
+                Ok(())
+            }
+            Cycle::ChipBreak { peck, back_off } => {
+                if !distance(peck) {
+                    return invalid("the peck depth must be above 0");
+                }
+                if !distance(back_off) {
+                    return invalid("the chip-breaking back-off must be above 0");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A drilling operation's settings, in the operation's frame (its Z the tool axis).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DrillParams {
+    pub cycle: Cycle,
+    /// `clearance`: where the tool travels between holes; `retract`: the R height, where rapid
+    /// motion towards a hole stops and feed begins; `top`: the hole's top, where pecks are
+    /// counted from; `bottom`: the hole's depth (to the tip, or see `to_full_diameter`).
+    pub heights: Heights,
+    /// The feed into the hole (mm/min).
+    pub feed: f64,
+    /// Take `bottom` as where the drill reaches its full diameter: the tip goes
+    /// [`tip_length`] deeper. A flat end mill has no point and goes to `bottom` either way.
+    pub to_full_diameter: bool,
+    /// Travel between holes at the R height rather than the clearance height. Allowed only when
+    /// the R height is above `part_top`.
+    pub stay_at_retract: bool,
+    /// The highest point of everything the tool could meet travelling between holes (the part
+    /// and its fixtures, in this frame); `None`: not known, and the tool does not stay at the R
+    /// height.
+    pub part_top: Option<f64>,
+}
+
+/// The drill's point angle (radians): its own, or [`DEFAULT_POINT_ANGLE_DEG`].
+pub fn point_angle(tool: &Tool) -> f64 {
+    tool.point_angle_deg.unwrap_or(DEFAULT_POINT_ANGLE_DEG).to_radians()
+}
+
+/// How far below its full diameter a drill's tip is (mm): `r / tan(point angle / 2)`. 0 for
+/// every other kind of tool (and for a drill with a 180° point).
+pub fn tip_length(tool: &Tool) -> f64 {
+    if tool.kind != ToolKind::Drill {
+        return 0.0;
+    }
+    let half = point_angle(tool) * 0.5;
+    if !(half > 1e-6) || half >= std::f64::consts::FRAC_PI_2 - 1e-12 {
+        return 0.0;
+    }
+    tool.radius() / half.tan()
+}
+
+/// A drilling operation takes a drill, or a flat end mill to plunge with.
+pub fn check_drilling_tool(tool: &Tool) -> Result<()> {
+    match tool.kind {
+        ToolKind::Drill | ToolKind::FlatEndmill => Ok(()),
+        other => {
+            invalid(format!("a drilling operation needs a drill, or a flat end mill to plunge with; tool {} is a {}", tool.number, other.label()))
+        }
+    }
+}
+
+/// The depths (operation Z) a hole from `top` to `bottom` is fed to, one per peck: `peck`
+/// apart from the top, the last at `bottom`. `None` for a peck: one feed to `bottom`.
+pub fn peck_depths(top: f64, bottom: f64, peck: Option<f64>) -> Result<Vec<f64>> {
+    if !(top.is_finite() && bottom.is_finite() && top > bottom) {
+        return invalid("the hole has no depth: its bottom must be below its top");
+    }
+    let Some(peck) = peck else { return Ok(vec![bottom]) };
+    if !(peck > 0.0) || !(peck <= MAX_COORD) {
+        return invalid("the peck depth must be above 0");
+    }
+    let n = ((top - bottom) / peck - 1e-9).ceil().max(1.0);
+    if !(n <= MAX_PECKS as f64) {
+        return Err(CamError::TooLarge(format!("more than {MAX_PECKS} pecks into one hole; use a larger peck")));
+    }
+    let n = n as usize;
+    Ok((1..=n).map(|k| if k == n { bottom } else { top - peck * k as f64 }).collect())
+}
+
+/// `points` without repeats (holes within [`SAME_HOLE`] of an earlier one), in the order they
+/// are drilled: from the one lowest in X (then Y), each time on to the nearest hole not yet
+/// drilled (the first in `points` among equally near ones). Returns the order and how many
+/// repeats were dropped.
+pub fn order_holes(points: &[Vec2]) -> Result<(Vec<Vec2>, usize)> {
+    if points.is_empty() {
+        return invalid("there are no holes to drill");
+    }
+    if points.len() > MAX_HOLES {
+        return Err(CamError::TooLarge(format!("more than {MAX_HOLES} holes in one drilling operation")));
+    }
+    if points.iter().any(|p| !p.is_finite() || p.x.abs() > MAX_COORD || p.y.abs() > MAX_COORD) {
+        return invalid("the hole positions must be finite numbers within 1000 m");
+    }
+    let mut done = vec![false; points.len()];
+    let first = points.iter().enumerate().min_by(|a, b| a.1.x.total_cmp(&b.1.x).then(a.1.y.total_cmp(&b.1.y))).map_or(0, |(i, _)| i);
+    let mut order = Vec::with_capacity(points.len());
+    let mut repeats = 0;
+    let mut current = Some(first);
+    while let Some(i) = current {
+        let Some(p) = points.get(i).copied() else { break };
+        if let Some(d) = done.get_mut(i) {
+            *d = true;
+        }
+        order.push(p);
+        let mut next: Option<(usize, f64)> = None;
+        for (j, q) in points.iter().enumerate() {
+            if done.get(j).copied().unwrap_or(true) {
+                continue;
+            }
+            let d = p.dist(*q);
+            if d <= SAME_HOLE {
+                if let Some(x) = done.get_mut(j) {
+                    *x = true;
+                }
+                repeats += 1;
+                continue;
+            }
+            if next.is_none_or(|(_, best)| d < best) {
+                next = Some((j, d));
+            }
+        }
+        current = next.map(|(j, _)| j);
+    }
+    Ok((order, repeats))
+}
+
+/// Collects moves, refusing more than [`MAX_MOVES`].
+struct Moves(Vec<Move>);
+
+impl Moves {
+    fn push(&mut self, m: Move) -> Result<()> {
+        if self.0.len() >= MAX_MOVES {
+            return Err(CamError::TooLarge(format!("the toolpath has more than {MAX_MOVES} moves")));
+        }
+        self.0.push(m);
+        Ok(())
+    }
+
+    fn rapid(&mut self, p: Vec2, z: f64) -> Result<()> {
+        self.push(Move::Rapid { to: p.extend(z) })
+    }
+
+    fn feed(&mut self, p: Vec2, z: f64, feed: f64) -> Result<()> {
+        self.push(Move::Feed { to: p.extend(z), feed })
+    }
+}
+
+/// Drills a hole at each of `points` (the operation's XY; repeats are drilled once) with
+/// `tool`, in the order of [`order_holes`]. The path is checked with [`verify`] before it is
+/// returned.
+pub fn drill(points: &[Vec2], tool: &Tool, params: &DrillParams) -> Result<Toolpath> {
+    tool.validate()?;
+    check_drilling_tool(tool)?;
+    params.heights.validate()?;
+    params.cycle.validate()?;
+    if !(params.feed > 0.0) || !(params.feed <= 1.0e6) {
+        return invalid("the drilling feed must be above 0");
+    }
+    let h = params.heights;
+    let tip = if params.to_full_diameter { h.bottom - tip_length(tool) } else { h.bottom };
+    if !(tip < h.top) {
+        return invalid("the hole has no depth: its bottom must be below its top");
+    }
+    if h.top - tip > tool.flute_length + 1e-9 {
+        return invalid(format!(
+            "the hole is {} mm deep, deeper than tool {}'s flutes ({} mm): the chips could not get out",
+            h.top - tip,
+            tool.number,
+            tool.flute_length
+        ));
+    }
+    if params.stay_at_retract && !params.part_top.is_some_and(|t| t.is_finite() && h.retract > t) {
+        return invalid(
+            "`stay_at_retract` needs the retract (R) height above the top of the part and its fixtures; travel at the clearance height instead",
+        );
+    }
+    let travel = if params.stay_at_retract { h.retract } else { h.clearance };
+    let peck = match params.cycle {
+        Cycle::Peck { peck, .. } | Cycle::ChipBreak { peck, .. } => Some(peck),
+        Cycle::Simple | Cycle::Dwell { .. } => None,
+    };
+    let depths = peck_depths(h.top, tip, peck)?;
+    let (holes, _) = order_holes(points)?;
+
+    let mut m = Moves(Vec::new());
+    for (i, &p) in holes.iter().enumerate() {
+        let over = if i == 0 { h.clearance } else { travel };
+        m.rapid(p, over)?;
+        if over > h.retract {
+            m.rapid(p, h.retract)?;
+        }
+        for (k, &z) in depths.iter().enumerate() {
+            m.feed(p, z, params.feed)?;
+            let last = k + 1 == depths.len();
+            match params.cycle {
+                Cycle::Dwell { seconds } if last => m.push(Move::Dwell { seconds })?,
+                Cycle::Peck { clearance, .. } if !last => {
+                    m.rapid(p, h.retract)?;
+                    let back = (z + clearance).min(h.retract);
+                    if back < h.retract {
+                        m.rapid(p, back)?;
+                    }
+                }
+                Cycle::ChipBreak { back_off, .. } if !last => m.rapid(p, (z + back_off).min(h.retract))?,
+                _ => {}
+            }
+        }
+        m.rapid(p, h.retract)?;
+        if (i + 1 == holes.len() || !params.stay_at_retract) && h.clearance > h.retract {
+            m.rapid(p, h.clearance)?;
+        }
+    }
+    let path = Toolpath { moves: m.0 };
+    verify(&path, &Heights { bottom: tip, ..h })?;
+    Ok(path)
+}
+
+/// The poses of `path` moved `h` up their tool axes.
+fn raised(path: &Toolpath5, h: f64) -> Toolpath5 {
+    let up = |p: Pose| Pose::new(p.up(h), p.axis);
+    let moves = path
+        .moves
+        .iter()
+        .map(|m| match *m {
+            Move5::Rapid { to } => Move5::Rapid { to: up(to) },
+            Move5::Feed { to, feed } => Move5::Feed { to: up(to), feed },
+            Move5::Dwell { seconds } => Move5::Dwell { seconds },
+        })
+        .collect();
+    Toolpath5 { moves }
+}
+
+/// The gouges of `tool` along the cutting moves of `path`, as [`gouges`] finds them for a
+/// milling cutter. A drill is held against the surface as its real shape: the full diameter
+/// from [`tip_length`] up, and its point as stepped cylinders inscribed in the cone, each
+/// within the larger of `tol` and 1/64 of the tip length of the cone along the axis. One hit
+/// per move, at its deepest; the pose is the tip's.
+pub fn tool_gouges(surface: &Surface, tool: &Tool, path: &Toolpath5, tol: f64, sample_step: f64) -> Result<Vec<Hit>> {
+    if tool.kind != ToolKind::Drill {
+        return gouges(surface, &tool.cutter()?, path, tol, sample_step);
+    }
+    tool.validate()?;
+    let (r, length) = (tool.radius(), tip_length(tool));
+    if !(length > 1e-9) {
+        return gouges(surface, &Cutter::flat(r)?, path, tol, sample_step);
+    }
+    let steps = ((length / tol.max(1e-6)).ceil().max(1.0) as usize).min(MAX_POINT_STEPS);
+    let mut hits: Vec<Hit> = Vec::new();
+    for k in 1..=steps {
+        let t = k as f64 / steps as f64;
+        let h = length * t;
+        for mut hit in gouges(surface, &Cutter::flat(r * t)?, &raised(path, h), tol, sample_step)? {
+            hit.pose = Pose::new(hit.pose.up(-h), hit.pose.axis);
+            match hits.iter_mut().find(|x| x.index == hit.index) {
+                Some(x) if hit.distance > x.distance => *x = hit,
+                Some(_) => {}
+                None => hits.push(hit),
+            }
+        }
+    }
+    hits.sort_by_key(|h| h.index);
+    Ok(hits)
+}
+
+/// The tip positions of the holes in `path` (for reports): where each feed into a new hole ends
+/// deepest, in drilling order.
+pub fn hole_bottoms(path: &Toolpath) -> Vec<Vec3> {
+    let mut out: Vec<Vec3> = Vec::new();
+    let mut at: Option<Vec2> = None;
+    for m in &path.moves {
+        if let Move::Feed { to, .. } = *m {
+            let xy = Vec2::new(to.x, to.y);
+            match out.last_mut() {
+                Some(last) if at.is_some_and(|a| a.dist(xy) <= SAME_HOLE) => last.z = last.z.min(to.z),
+                _ => out.push(to),
+            }
+            at = Some(xy);
+        }
+    }
+    out
+}

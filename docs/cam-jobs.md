@@ -123,7 +123,7 @@ is; the reply's notes say so.
 `number`, `kind` (`flat_endmill`, `ball_endmill`, `bull_nose`, `drill`), `diameter`,
 `flute_length`, and optional `description`, `flutes`, `spindle_rpm`, `feed`, `plunge_feed`,
 `stepdown`, `stepover`, `corner_radius` (bull nose), `shank_diameter`, `stickout`, `holder:
-[{diameter, length}]`. An operation without `spindle_rpm` or `feeds` takes the tool's; its
+[{diameter, length}]`, `point_angle_deg` (a drill's point, default 118). An operation without `spindle_rpm` or `feeds` takes the tool's; its
 stepdown and stepover default to the tool's too.
 
 ### Operations
@@ -139,12 +139,13 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `parallel` | `heights` (`bottom` is the floor); `stepover` (tool's, else 10% of its diameter); `angle_deg` (0); `boundary?: {rect?: [[x, y], [x, y]], polygon?}` (the part's extent); `stock_to_leave` (0); `step` (a quarter of the diameter); `tolerance`; `zigzag` (true) |
 | `roughing` | `heights` (`top` is the stock's top); `stepdown`; `stepover`; `angle_deg`; `boundary`; `stock_to_leave` (0.25); `step`; `tolerance`; `zigzag` |
 | `waterline` | `heights` (levels from `top` to `bottom`); `stepdown` (tool's, else a quarter of its diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` (true) |
-| `indexed` | `a_deg` and `operation`: any of the five above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
+| `drill` | `sketch` (circle centres, `circles` (true), filtered by `diameter_range: [min, max]`, and lone points, `sketch_points` (true)) or `points: [[x, y], …]`; `heights` (`retract` is the R height, `top` the hole's top, `bottom` its depth); `cycle`: `simple` \| `dwell` \| `peck` \| `chip_break` (simple); `peck` (tool's stepdown, else its diameter); `peck_clearance` (0.5); `back_off` (0.5); `dwell_seconds` (0.5); `to_full_diameter` (false); `stay_at_retract` (false). See [Drilling](#drilling). |
+| `indexed` | `a_deg` and `operation`: any of the six above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
 | `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}` or `{type: "helix", pitch}`; `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
 | `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
 | `wrap` | `radius` (of the cylinder the path is drawn on); `points: [[x, y, z], …]` (x along the axis, y the arc length round it, z the depth: 0 on the cylinder, negative into it) or `sketch` + `curve` (a curve id; its sketch x and y are taken as x and arc length) with `depth` (0); `clearance` (5) and `retract` (1) above the cylinder; `max_angle_step_deg` (2) |
 
-The 3-axis operations (`contour` to `waterline`) run with every rotary at zero; on `3axis` and
+The 3-axis operations (`contour` to `drill`) run with every rotary at zero; on `3axis` and
 `4axis_a` that is work coordinates. Inside `indexed` their heights, polygons and boundaries are
 in the frame A = `a_deg` brings under the tool: its Z is the tool axis, so at A = 90° the frame's
 Z is work +Y. A sketch used as a boundary must lie on a plane square to the operation's tool axis
@@ -168,3 +169,46 @@ rotary letter's lowest and highest angle), `bounds` and `errors` (the first line
 cannot read). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
 elsewhere are read on a best-effort basis and stop at the first block it cannot follow
 (incremental coordinates, for one).
+
+## Drilling
+
+A `drill` operation feeds a drill (or a flat end mill, plunging) straight down the tool axis at
+each hole, at the operation's plunge feed. Any other tool is refused. It is a 3-axis operation,
+so it also runs inside `indexed`: its points and heights are then in the frame the angle brings
+under the tool.
+
+```json
+{"name": "holes", "type": "drill", "tool": 3, "sketch": "Holes", "diameter_range": [4, 5],
+ "heights": {"clearance": 15, "retract": 2, "top": 0, "bottom": -12}, "cycle": "peck", "peck": 4}
+```
+
+**Holes.** With `sketch`: the centres of its circles (not construction ones; with
+`diameter_range`, only circles of a diameter in it) and its points that are not part of a curve.
+The sketch must lie on a plane square to the tool axis (either way up). With `points`: the
+holes in the operation's XY. Repeated positions are drilled once. Holes are drilled in a greedy
+nearest-neighbour order from the one lowest in X (then Y), the same order every time.
+
+**Cycles.** Every cycle is written as plain `G0`/`G1` moves and a `G4` dwell, which every
+controller reads and the read-back follows; no canned cycle (`G81`, `G82`, `G83`, `G73`) is
+written.
+
+| `cycle` | Each hole |
+| --- | --- |
+| `simple` | Feed from the R height to the bottom, rapid out to R. |
+| `dwell` | The same, with a pause of `dwell_seconds` at the bottom. |
+| `peck` | Feed `peck` deeper at a time, counted from `top` (the last peck ends at the bottom); after each peck rapid right out to R, then rapid back down to `peck_clearance` above the depth reached. |
+| `chip_break` | Feed `peck` deeper at a time; after each peck rapid back `back_off` (staying in the hole) to break the chip, then feed on. |
+
+**Depth.** `bottom` is where the tip goes. With `to_full_diameter: true` it is where the drill
+reaches its full diameter, and the tip goes deeper by the point's length, radius / tan(point
+angle / 2): 1.80 mm for a 6 mm drill with a 118° point. A hole deeper than the tool's flutes is
+refused.
+
+**Between holes** the tool rises to the clearance height. `stay_at_retract: true` travels at the R
+height instead, and is refused unless the R height is above the highest point of the part and the
+fixtures in the operation's frame.
+
+**Checks.** The gouge check holds a drill against the part as its real shape: the full diameter
+from the point's length up, and the point as stepped cylinders inscribed in its cone (within the
+job's tolerance along the axis, at most 64 steps). Model the holes as cut bodies; drilled into a
+part that shows no hole, the operation gouges and the job is refused.

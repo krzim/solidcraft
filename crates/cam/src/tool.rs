@@ -71,6 +71,10 @@ pub struct Tool {
     /// The holder from its face up, as stacked cylinders; empty: no holder is checked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holder: Vec<HolderSection>,
+    /// A drill's point angle (degrees, the included angle of its tip); left out, 118. Other
+    /// kinds ignore it. See [`crate::drill::tip_length`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_angle_deg: Option<f64>,
 }
 
 /// One cylinder of a tool holder.
@@ -110,6 +114,7 @@ impl Tool {
             shank_diameter: None,
             stickout: None,
             holder: Vec::new(),
+            point_angle_deg: None,
         }
     }
 
@@ -170,6 +175,9 @@ impl Tool {
         }
         if self.holder.iter().any(|s| !(s.diameter > 0.0) || !(s.diameter <= 10_000.0) || !(s.length > 0.0) || !(s.length <= 10_000.0)) {
             return invalid("a holder section's diameter and length must be above 0 and at most 10 m");
+        }
+        if self.point_angle_deg.is_some_and(|a| !(a >= 1.0) || !(a <= 180.0)) {
+            return invalid("a drill's point angle must be from 1 to 180 degrees");
         }
         if [self.spindle_rpm, self.feed, self.plunge_feed, self.stepdown, self.stepover].iter().flatten().any(|v| !(*v > 0.0) || !(*v <= 1.0e6)) {
             return invalid("a tool's spindle speed, feeds, stepdown and stepover must be above 0");

@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use solidcore_record::{Loop2, Region2, Seg2, Vec2, Vec3};
-use solidcraft_cam::collision::{gouges, holder_collisions};
+use solidcraft_cam::collision::holder_collisions;
+use solidcraft_cam::drill::tool_gouges;
 use solidcraft_cam::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, Rewind, Tcp, emit_program, parse5};
 use solidcraft_cam::indexed::{IndexedOperation, frame_for_index};
 use solidcraft_cam::kinematics::{AxisLetter, Carrier, Machine, RotaryAxis};
@@ -56,7 +57,7 @@ pub static COMMANDS: &[CommandSpec] = &[
              a_limits_deg?: [min, max], post: built-in name (cam.posts) | post_path: Post5 JSON file, work_offset?: 1-6, origin?: [x,y,z] \
              (the design point that is work zero; on a 4th axis the A axis is work X through it), bodies?: [names] (default every visible \
              body), fixtures?: [names] (checked against, never cut), tolerance?: mm (default 0.01; bodies are tessellated at half of it), \
-             tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | roughing | waterline | indexed \
+             tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | roughing | waterline | drill | indexed \
              {a_deg, operation} | rotary_finish | rotary_roughing | wrap, tool: number, spindle_rpm?, feeds?: {cut, plunge}, coolant?, \
              gouge_check?, …}]; unknown keys are refused); output: G-code path (required unless dry_run); preview?: HTML path (the part \
              and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
@@ -221,6 +222,7 @@ fn tool_sample() -> Value {
         shank_diameter: Some(1.0),
         stickout: Some(1.0),
         holder: vec![HolderSection { diameter: 1.0, length: 1.0 }],
+        point_angle_deg: Some(118.0),
         ..Tool::new(1, ToolKind::BullNose, 1.0, 1.0)
     };
     serde_json::to_value(tool).unwrap_or(Value::Null)
@@ -550,6 +552,8 @@ struct Ctx<'a> {
     machine: &'a Machine,
     tools: &'a [Tool],
     part: &'a Surface,
+    /// The part and the fixtures.
+    all: &'a Surface,
     origin: Vec3,
     tol: f64,
 }
@@ -728,6 +732,10 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
             let path = waterline(surface, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
             Ok((path, r, "waterline"))
         }
+        Op3Spec::Drill(o) => {
+            let (path, r) = drill::plan(ctx, o, frame)?;
+            Ok((path, r, "drill"))
+        }
     }
 }
 
@@ -738,6 +746,7 @@ fn common3(op: &Op3Spec) -> Common<'_> {
         Op3Spec::Parallel(o) => o.common(),
         Op3Spec::Roughing(o) => o.common(),
         Op3Spec::Waterline(o) => o.common(),
+        Op3Spec::Drill(o) => o.common(),
     }
 }
 
@@ -880,6 +889,7 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
         OperationSpec::Parallel(o) => indexed(&Op3Spec::Parallel(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Roughing(o) => indexed(&Op3Spec::Roughing(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Waterline(o) => indexed(&Op3Spec::Waterline(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::Drill(o) => indexed(&Op3Spec::Drill(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Indexed(o) => {
             let name = common3(&o.operation).name;
             if rotaries != 1 {
@@ -1005,7 +1015,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
     }
 
-    let ctx = Ctx { cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, origin, tol };
+    let ctx = Ctx { cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, all: &surfaces.all, origin, tol };
     let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
     for spec in &job.operations {
         planned.push(plan(&ctx, spec, post.base.arc_tolerance)?);
@@ -1023,8 +1033,9 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         let step = (p.tool.radius() * 0.5).clamp(0.1, 2.0);
         let op = p.report.name.clone();
         if p.gouge_check {
-            let cutter = p.tool.cutter().map_err(|e| cam_err(cmd, &format!("operation `{op}`"), e))?;
-            let hits = gouges(&surfaces.all, &cutter, &p.poses, tol, step).map_err(|e| cam_err(cmd, &format!("operation `{op}`: gouge check"), e))?;
+            // A drill is checked as its own shape, point and all.
+            let hits =
+                tool_gouges(&surfaces.all, &p.tool, &p.poses, tol, step).map_err(|e| cam_err(cmd, &format!("operation `{op}`: gouge check"), e))?;
             let worst = hits.iter().map(|h| h.distance).fold(0.0, f64::max);
             p.report.gouge = worst;
             gouge.worst = gouge.worst.max(worst);
@@ -1363,6 +1374,9 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
     reply.rapid_minutes = params.rapid_rate.map(|r| reply.rapid_length / r);
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
+
+#[path = "cam_drill.rs"]
+mod drill;
 
 #[cfg(test)]
 #[path = "cam_tests.rs"]
