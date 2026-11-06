@@ -45,6 +45,8 @@ use crate::{EngineError, Result, Session};
 
 #[path = "cam_helical.rs"]
 mod helical;
+#[path = "cam_rates.rs"]
+mod rates;
 
 const JOB_CONTRACT: TypedContract<CamJobParams> = TypedContract::new();
 const POSTS_CONTRACT: TypedContract<CamPostsParams> = TypedContract::new();
@@ -61,7 +63,10 @@ pub static COMMANDS: &[CommandSpec] = &[
              (the design point that is work zero; on a 4th axis the A axis is work X through it), bodies?: [names] (default every visible \
              body), fixtures?: [names] (checked against, never cut), tolerance?: mm (default 0.01; bodies are tessellated at half of it), \
              stock?: {box: {min, max}} | {cylinder: {radius, x_min, x_max}} | {around_part: {margin: [x,y,z]}} (work coordinates; no \
-             rapid may pass through it), tools: [Tool JSON] | tool_library_path, operations: [{name, type: contour | pocket | parallel | \
+             rapid may pass through it), tools: [Tool JSON] | tool_library_path, machine_rates?: {rapid_xyz_mm_min, rapid_z_mm_min?, \
+             rapid_a_deg_min?, max_feed_mm_min?, max_feed_z_mm_min?, max_a_deg_min?, spindle_rpm?: [min, max], spindle_start_seconds?, \
+             travel_mm?: [x, y, z]} | machine_rates_path (the machine's top rates: times the program as it runs and warns about blocks \
+             the controller slows), operations: [{name, type: contour | pocket | parallel | \
              roughing | waterline | scallop | steep_shallow | pencil | rest_finish | drill | chamfer {heights: {clearance, retract, top}, \
              width, tip_offset?, side?} | indexed {a_deg, operation} | indexed_pattern {a_deg: [..] | count, start_deg?, operation} | \
              rotary_finish | rotary_roughing (pattern: lines | helix | rings) | wrap | wrap_pocket | wrap_contour | bore | thread_mill | face \
@@ -71,9 +76,12 @@ pub static COMMANDS: &[CommandSpec] = &[
              and toolpaths, self-contained); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a check fails → \
              operations: [{name, kind, tool, moves, cut_length, cut_minutes, max_tilt_deg, a_deg?, gouge, holder_collisions, warnings}], \
              program_lines, program_head, readback: {max_tip_deviation, max_axis_deviation_deg, allowed_tip, allowed_axis_deg, \
-             cut_minutes, pass}, gouge: {worst, tolerance, hits, skipped, pass}, holder_collisions, rapids: {checked, hits, worst, pass, \
-             from_unknown, first: [{line, operation?, kind, depth, at}]}, travel: {checked, violation?, pass} | null, stock, passed, \
-             failures, dry_run, outputs: {gcode?, preview?}, notes. Without dry_run or allow_unsafe a failed check refuses and nothing is written",
+             cut_minutes, pass}, cut_minutes, rapid_minutes?, machine_time?: {cut_minutes, written_cut_minutes, rapid_minutes, \
+             spindle_minutes, total_minutes, slowed_blocks, rotary_over, feed_over, peak_rotary_deg_min?, peak_feed_mm_min?, \
+             spindle_out_of_range, span_mm, warnings}, gouge: {worst, tolerance, hits, skipped, pass}, holder_collisions, rapids: \
+             {checked, hits, worst, pass, from_unknown, first: [{line, operation?, kind, depth, at}]}, travel: {checked, violation?, pass} \
+             | null, stock, passed, failures, dry_run, outputs: {gcode?, preview?}, notes. Without dry_run or allow_unsafe a failed check \
+             refuses and nothing is written",
         ),
     CommandSpec::new("cam.posts", "CAM Posts", crate::checked!("cam.posts", posts))
         .noundo()
@@ -266,6 +274,7 @@ fn post_sample() -> Value {
     post.base.tool_length_on_first_z = true;
     post.base.modal_motion = true;
     post.safe_rotate_first = true;
+    post.coolant_after_turn = true;
     post.inverse_time_decimals = Some(4);
     post.rewind = Some(Rewind { distance: 1.0, retract_feed: 1.0, plunge_feed: 1.0 });
     serde_json::to_value(post).unwrap_or(Value::Null)
@@ -1066,6 +1075,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let machine = machine_of(cmd, &job)?;
     let (post_name, post) = post_of(cmd, &job, base)?;
     let tools = tools_of(cmd, &job, base)?;
+    let machine_rates = rates::rates_of(cmd, &job, base)?;
     let surfaces = surfaces_of(cmd, s, &job, origin, tol)?;
     let mut notes = surfaces.notes.clone();
     let stock = cam_stock::stock_of(cmd, &job, &surfaces, tol, &mut notes)?;
@@ -1093,6 +1103,13 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let program = MachineProgram { name: name.clone(), operations: planned.iter().map(|p| p.op.clone()).collect(), work_offset: job.work_offset };
     let text = emit_program(&program, &post, &machine).map_err(|e| cam_err(cmd, "writing the program", e))?;
     let rb = readback_program(&text, &program, &post, &machine).map_err(|e| cam_err(cmd, "reading the program back", e))?;
+    let machine_time = match &machine_rates {
+        Some(r) => Some(rates::time_report(cmd, &text, &machine, &post, r)?),
+        None => None,
+    };
+    if let Some(t) = &machine_time {
+        notes.extend(t.warnings.iter().cloned());
+    }
 
     // Gouges and holder collisions, along every cutting move.
     let mut failures: Vec<String> = Vec::new();
@@ -1181,6 +1198,8 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
             outputs.preview = Some(path.clone());
         }
     }
+    let cut_minutes = machine_time.as_ref().map_or(readback.cut_minutes, |t| t.cut_minutes);
+    let rapid_minutes = machine_time.as_ref().map(|t| t.rapid_minutes);
     let reply = CamJobReply {
         name,
         machine: machine.name.clone(),
@@ -1189,6 +1208,9 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         program_lines: text.lines().count(),
         program_head: text.lines().take(HEAD_LINES).map(str::to_string).collect(),
         readback,
+        cut_minutes,
+        rapid_minutes,
+        machine_time,
         gouge,
         holder_collisions: holder_total,
         rapids,

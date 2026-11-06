@@ -23,6 +23,7 @@ use solidcraft_geom::prelude::*;
 
 use crate::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, parse5};
 use crate::kinematics::{Carrier, Joints, Machine, arc_distance, forward, tool_axis};
+use crate::machine_time::{DwellUnit, joint_dwells_in};
 use crate::multiaxis::{Move5, Pose, Program5, Toolpath5, slerp};
 use crate::path::arc_sweep;
 use crate::{CamError, Result};
@@ -139,7 +140,7 @@ fn pose_at(machine: &Machine, linear: Vec3, rotary: &[f64], tcp: bool) -> Pose {
 pub fn readback_program(text: &str, program: &MachineProgram, post: &Post5, machine: &Machine) -> Result<Readback5> {
     post.validate()?;
     machine.validate()?;
-    let written = parse5(text, &machine.letters())?;
+    let written = joint_dwells_in(DwellUnit::of(&post.base)?, parse5(text, &machine.letters())?);
     let (allowed_tip, allowed_axis) = allowance5(post, machine, program)?;
     let reach = (allowed_tip * 10.0).max(1.0);
 

@@ -35,6 +35,7 @@ pub mod helical;
 pub mod indexed;
 pub mod kinematics;
 mod leads;
+pub mod machine_time;
 mod multiaxis;
 mod offset;
 mod ops;
@@ -123,6 +124,8 @@ mod helical_tests;
 mod kinematics_tests;
 #[cfg(test)]
 mod leads_tests;
+#[cfg(test)]
+mod machine_time_tests;
 #[cfg(test)]
 mod rapids_tests;
 #[cfg(test)]

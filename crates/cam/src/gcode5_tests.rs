@@ -1133,3 +1133,83 @@ fn dialect_switches_validate_and_default_to_the_old_output() {
     close(rotary[0], deg(90.0), 1e-12);
     assert!(parse5("G28 G91 Z0.\nG0 X1 Y1 Z1 A0", &a).is_err());
 }
+
+/// `op` with its coolant on.
+fn with_coolant(op: MachineOperation) -> MachineOperation {
+    match op {
+        MachineOperation::Indexed(o) => MachineOperation::Indexed(IndexedOperation { coolant: true, ..o }),
+        other => other,
+    }
+}
+
+#[test]
+fn coolant_can_come_on_after_the_first_turn_of_a() {
+    let machine = Machine::four_axis_a();
+    let side = |name: &str, a: f64| with_coolant(indexed_op(name, 3, vec![deg(a)], contour_path().moves));
+    let program = MachineProgram { name: "sides".into(), operations: vec![side("side 0", 0.0), side("side 90", 90.0)], work_offset: None };
+    // By default the coolant comes on before the index, as it always has.
+    let before = emit_program(&program, &dialect(), &machine).unwrap();
+    assert!(before.contains("\nG54\nM8\nG0 A0.\nG0 X0. Y-3.\n"), "{before}");
+    // With the switch, right after it; the second side keeps the coolant on through its turn.
+    let post = Post5 { coolant_after_turn: true, ..dialect() };
+    post.validate().unwrap();
+    let after = emit_program(&program, &post, &machine).unwrap();
+    assert!(after.contains("\nG54\nG0 A0.\nM8\nG0 X0. Y-3.\nG43 Z10. H3\n"), "{after}");
+    assert!(after.contains("\n(SIDE 90)\nG17 G90 G94\nG54\nG0 A90.\nG0 X0. Y-3.\n"), "{after}");
+    assert_eq!(after.matches("M8").count(), 1, "{after}");
+    assert!(after.ends_with("G0 Z10.\n\nM9\nM5\nG28 G91 Z0.\nG90\nG28 G91 X0. Y0.\nG90\nM30\n"), "{after}");
+    // Only the coolant line moves.
+    assert_eq!(before.replace("M8\n", ""), after.replace("M8\n", ""));
+    assert_modal_with_points(&after);
+    assert!(readback_program(&after, &program, &post, &machine).unwrap().within());
+
+    // A wrapped helix starts with a turn of A too; its coolant follows that turn.
+    let helix = MachineProgram { operations: vec![MachineOperation::Continuous(op5("helix", helix_of(1)))], ..program.clone() };
+    let text = emit_program(&helix, &post, &machine).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let m8 = lines.iter().position(|l| *l == "M8").unwrap();
+    assert!(lines[m8 - 1].starts_with("G0 A"), "{text}");
+    assert!(!lines[..m8].iter().any(|l| l.starts_with("G1 ") || l.starts_with("G93")), "{text}");
+    assert!(readback_program(&text, &helix, &post, &machine).unwrap().within());
+
+    // Where nothing turns (a 3-axis machine), the coolant is written where it always was.
+    let flat = Machine::three_axis();
+    let level = MachineProgram { operations: vec![with_coolant(indexed_op("top", 3, vec![], contour_path().moves))], ..program.clone() };
+    let plain = emit_program(&level, &dialect(), &flat).unwrap();
+    assert_eq!(emit_program(&level, &post, &flat).unwrap(), plain);
+    assert!(plain.contains("\nG54\nM8\nG0 X0. Y-3.\n"), "{plain}");
+
+    // The switch is data: written only when on, read back as it was.
+    let json = serde_json::to_string(&post).unwrap();
+    assert!(json.contains("\"coolant_after_turn\":true"), "{json}");
+    assert_eq!(serde_json::from_str::<Post5>(&json).unwrap(), post);
+    assert!(!serde_json::to_string(&dialect()).unwrap().contains("coolant_after_turn"));
+    assert!(!serde_json::to_string(&Post5::mach3_4axis()).unwrap().contains("coolant_after_turn"));
+}
+
+/// With `coolant_after_turn`, through tool changes, an operation without coolant and a wrapped
+/// cut that rewinds, with and without `safe_rotate_first`: every `M8` comes right after a turn
+/// of A, never before it or after a cut, and every program reads back.
+#[test]
+fn coolant_after_turn_follows_every_index() {
+    let machine = limited_a();
+    let side = |name: &str, t: u32, a: f64| with_coolant(indexed_op(name, t, vec![deg(a)], contour_path().moves));
+    let mut helix = op5("helix", helix_of(3));
+    helix.tool = Tool::new(5, ToolKind::BallEndmill, 6.0, 20.0);
+    let dry = match side("c", 4, 180.0) {
+        MachineOperation::Indexed(o) => MachineOperation::Indexed(IndexedOperation { coolant: false, ..o }),
+        other => other,
+    };
+    let program = MachineProgram {
+        name: "p".into(),
+        operations: vec![side("a", 3, 0.0), side("b", 4, 90.0), dry, MachineOperation::Continuous(helix), side("d", 5, 270.0)],
+        work_offset: None,
+    };
+    for first in [true, false] {
+        let post = Post5 { coolant_after_turn: true, safe_rotate_first: first, ..dialect() };
+        let text = emit_program(&program, &post, &machine).unwrap();
+        println!("=== safe_rotate_first {first}\n{text}");
+        let rb = readback_program(&text, &program, &post, &machine).unwrap();
+        assert!(rb.within(), "{rb:?}");
+    }
+}

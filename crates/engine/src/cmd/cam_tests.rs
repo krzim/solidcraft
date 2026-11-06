@@ -2456,3 +2456,124 @@ fn a_turn_between_operations_is_checked_where_the_tool_turns() {
     let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
     assert_eq!(r["operations"].as_array().map(Vec::len), Some(2), "{r}");
 }
+
+/// A small mill's top rates: 8000 mm/min across, 4000 in Z, A at 8000°/min, the spindle from
+/// 10000 to 24000 rpm with a six-second start.
+fn mill_rates() -> Value {
+    json!({
+        "rapid_xyz_mm_min": 8000, "rapid_z_mm_min": 4000, "rapid_a_deg_min": 8000,
+        "max_feed_mm_min": 8000, "max_feed_z_mm_min": 4000, "max_a_deg_min": 8000,
+        "spindle_rpm": [10000, 24000], "spindle_start_seconds": 6, "travel_mm": [300, 170, 130]
+    })
+}
+
+#[test]
+fn machine_rates_time_the_program_and_warn_about_slowed_blocks() {
+    let mut s = bar();
+    // Without rates: the time at feed as written, no rapid time.
+    let r = run(&mut s, "cam.job", json!({"job": barrel_job(), "dry_run": true}));
+    assert_clean(&r);
+    assert!(r["machine_time"].is_null() && r["rapid_minutes"].is_null(), "{r}");
+    assert_eq!(r["cut_minutes"], r["readback"]["cut_minutes"], "{r}");
+
+    // With the mill's rates: rapids timed, one spindle start, nothing slowed.
+    let mut job = barrel_job();
+    job["machine_rates"] = mill_rates();
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    let t = &r["machine_time"];
+    assert!(r["rapid_minutes"].as_f64().is_some_and(|m| m > 0.0), "{r}");
+    assert_eq!(r["rapid_minutes"], t["rapid_minutes"], "{r}");
+    assert_eq!(r["cut_minutes"], t["cut_minutes"], "{r}");
+    assert!((t["spindle_minutes"].as_f64().unwrap() - 0.1).abs() < 1e-12, "{t}");
+    assert_eq!(t["slowed_blocks"], 0, "{t}");
+    assert!(t["peak_rotary_deg_min"].as_f64().is_some_and(|p| p > 0.0), "the cuts turning A are in inverse time: {t}");
+    let written = t["written_cut_minutes"].as_f64().unwrap();
+    assert!((written - r["readback"]["cut_minutes"].as_f64().unwrap()).abs() < 1e-9, "{r}");
+    let total = t["cut_minutes"].as_f64().unwrap() + t["rapid_minutes"].as_f64().unwrap() + t["spindle_minutes"].as_f64().unwrap();
+    assert!((t["total_minutes"].as_f64().unwrap() - total).abs() < 1e-9, "{t}");
+
+    // An A that turns slower than the cuts ask: the controller slows them, the reply says so,
+    // and the program still passes its checks.
+    job["machine_rates"]["max_a_deg_min"] = json!(200);
+    job["machine_rates"]["spindle_rpm"] = json!([15000, 24000]);
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    let t = &r["machine_time"];
+    assert!(t["rotary_over"].as_u64().is_some_and(|n| n > 0), "{t}");
+    assert!(t["cut_minutes"].as_f64().unwrap() > written, "{t}");
+    let notes = r["notes"].to_string();
+    assert!(notes.contains("ask A to turn faster than its 200°/min"), "{notes}");
+    assert!(notes.contains("outside the machine's 15000-24000 rpm (S12000 at line"), "{notes}");
+    assert_eq!(t["spindle_out_of_range"][0]["rpm"].as_f64(), Some(12000.0), "{t}");
+
+    // The rates may come from a file beside the job.
+    let dir = Dir::new("rates");
+    std::fs::write(dir.0.join("rates.json"), mill_rates().to_string()).unwrap();
+    let mut job = barrel_job();
+    job["machine_rates_path"] = json!("rates.json");
+    let job_path = dir.file("bar.cam.json");
+    std::fs::write(&job_path, job.to_string()).unwrap();
+    let r = run(&mut s, "cam.job", json!({"job_path": job_path, "dry_run": true}));
+    assert_clean(&r);
+    assert_eq!(r["machine_time"]["slowed_blocks"], 0, "{r}");
+
+    // Bad rates are refused before anything is planned, never a panic.
+    let with = |f: &dyn Fn(&mut Value)| {
+        let mut job = barrel_job();
+        job["machine_rates"] = mill_rates();
+        f(&mut job);
+        json!({"job": job, "dry_run": true})
+    };
+    let cases = [
+        (with(&|j| j["machine_rates"]["rapid_xyz"] = json!(1)), "rapid_xyz"),
+        (with(&|j| j["machine_rates"]["rapid_xyz_mm_min"] = json!(0)), "machine rate"),
+        (with(&|j| j["machine_rates"]["max_a_deg_min"] = json!(-5)), "machine rate"),
+        (with(&|j| j["machine_rates"]["max_feed_mm_min"] = json!(1e300)), "machine rate"),
+        (with(&|j| j["machine_rates"]["spindle_rpm"] = json!([24000, 10000])), "spindle"),
+        (with(&|j| j["machine_rates"]["spindle_start_seconds"] = json!(1e9)), "spindle"),
+        (with(&|j| j["machine_rates"]["travel_mm"] = json!([300, 0, 130])), "travel"),
+        (with(&|j| j["machine_rates"] = json!({"max_a_deg_min": 100})), "rapid_xyz_mm_min"),
+        (with(&|j| j["machine_rates"] = json!("8000")), "machine_rates"),
+        (with(&|j| j["machine_rates_path"] = json!("rates.json")), "not both"),
+    ];
+    for (p, word) in cases {
+        let e = s.execute("cam.job", &p).unwrap_err();
+        assert!(matches!(e, EngineError::BadParams { .. }) && e.to_string().contains(word), "{p}: {e}");
+    }
+    std::fs::write(dir.0.join("rates.json"), json!({"rapid_xyz_mm_min": 8000, "max_a": 1}).to_string()).unwrap();
+    let e = s.execute("cam.job", &json!({"job_path": job_path, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("max_a"), "{e}");
+    std::fs::write(dir.0.join("rates.json"), "{not json").unwrap();
+    assert!(matches!(s.execute("cam.job", &json!({"job_path": job_path, "dry_run": true})), Err(EngineError::BadParams { .. })));
+    std::fs::remove_file(dir.0.join("rates.json")).unwrap();
+    assert!(matches!(s.execute("cam.job", &json!({"job_path": job_path, "dry_run": true})), Err(EngineError::BadParams { .. })));
+}
+
+#[test]
+fn a_post_file_may_switch_the_coolant_on_after_the_index() {
+    let mut s = pocketed_block();
+    let dir = Dir::new("coolant");
+    let mut post = run(&mut s, "cam.posts", json!({"name": "mach3"}))["post"].clone();
+    post["coolant_after_turn"] = json!(true);
+    std::fs::write(dir.0.join("mill.post.json"), post.to_string()).unwrap();
+    let mut job = side_pocket_job();
+    job["operations"][0]["operation"]["coolant"] = json!(true);
+    let r = run(&mut s, "cam.job", json!({"job": job.clone(), "dry_run": true}));
+    assert_clean(&r);
+    let head: Vec<String> = r["program_head"].as_array().unwrap().iter().filter_map(Value::as_str).map(str::to_string).collect();
+    let at = |l: &str| head.iter().position(|h| h == l).unwrap_or_else(|| panic!("no `{l}` in {head:?}"));
+    // The built-in post keeps the coolant before the index, as it always has.
+    assert!(at("M8") < head.iter().position(|h| h.contains("A90")).unwrap(), "{head:?}");
+    let o = job.as_object_mut().unwrap();
+    o.remove("post");
+    o.insert("post_path".into(), json!("mill.post.json"));
+    let job_path = dir.file("side.cam.json");
+    std::fs::write(&job_path, job.to_string()).unwrap();
+    let r = run(&mut s, "cam.job", json!({"job_path": job_path, "dry_run": true}));
+    assert_clean(&r);
+    let head: Vec<&str> = r["program_head"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    let turn = head.iter().position(|h| h.contains("A90")).unwrap();
+    assert_eq!(head.get(turn + 1), Some(&"M8"), "{head:?}");
+    assert_eq!(head.iter().filter(|h| **h == "M8").count(), 1, "{head:?}");
+}
