@@ -89,7 +89,7 @@ pub struct AdaptiveParams {
     pub min_engagement: f64,
     /// Engagement the path never exceeds outside an entry helix (radians), 5° to 180°.
     pub max_engagement: f64,
-    /// Material left on the walls and floors (mm).
+    /// Material left on the walls (mm); in 3D roughing, on the part all round.
     pub stock_to_leave: f64,
     /// Chord error allowed on curved boundaries, and how far the path may be simplified (mm).
     pub tolerance: f64,
@@ -168,6 +168,24 @@ fn mills(tool: &Tool) -> Result<()> {
     if tool.kind == ToolKind::Drill { invalid("a drill cannot mill: it cuts only at its point") } else { Ok(()) }
 }
 
+/// Refuses levels deeper apart than the tool's flutes reach: below them the shank would rub on
+/// the material the flutes leave standing (the deep, light cut adaptive clearing is for makes
+/// that easy to ask for).
+fn check_flutes(tool: &Tool, top: f64, zs: &[f64]) -> Result<()> {
+    let mut prev = top;
+    for &z in zs {
+        if prev - z > tool.flute_length + 1e-9 {
+            return invalid(format!(
+                "a level {:.3} mm deep is more than the tool's flute length {:.3} mm: use a smaller stepdown",
+                prev - z,
+                tool.flute_length
+            ));
+        }
+        prev = z;
+    }
+    Ok(())
+}
+
 /// Counts cell visits against [`MAX_WORK`].
 struct Work(std::cell::Cell<f64>);
 
@@ -184,7 +202,7 @@ impl Work {
         self.0.set(self.0.get() + n);
         if self.0.get() > MAX_WORK {
             return Err(CamError::TooLarge(
-                "the adaptive clearing needs too much work; use a larger tool or optimal load, or a smaller region".into(),
+                "the adaptive clearing needs too much work; use a larger tool, optimal load or engagement limit, or a smaller region".into(),
             ));
         }
         Ok(())
@@ -209,7 +227,7 @@ impl Grid {
         let fy = ((hi.y - lo.y) / h).ceil() + 1.0;
         if !(fx >= 1.0 && fy >= 1.0) || !(fx * fy <= MAX_CELLS as f64) {
             return Err(CamError::TooLarge(format!(
-                "the region needs more than {MAX_CELLS} cells for this tool and load; use a larger tool or optimal load, or split the region"
+                "the region needs more than {MAX_CELLS} cells for this tool, load and engagement limit; use a larger tool, optimal load or engagement limit, or split the region"
             )));
         }
         Ok(Grid { origin: lo, h, nx: fx as usize, ny: fy as usize })
@@ -409,14 +427,18 @@ struct Knobs {
 impl Knobs {
     fn new(tool: &Tool, p: &AdaptiveParams) -> Knobs {
         let r = tool.radius();
-        let w = p.optimal_load.min(2.0 * r);
+        let limit = (p.max_engagement - PLAN_MARGIN).max(p.max_engagement * 0.5);
+        let load = p.optimal_load.min(2.0 * r);
+        let target = (1.0 - load / r).clamp(-1.0, 1.0).acos().min(limit * 0.92);
+        // The width actually aimed at: the load's, or less where the limit holds the engagement
+        // below the load's. The raster and the steps follow it, so a step into material (a
+        // concave wall above all) stays within the limit.
+        let w = (r * (1.0 - target.cos())).min(load);
         let h = (r / 16.0).min(w / 4.0).max(r * 1e-3);
         let step = (w * 0.5).clamp(2.0 * h, r * 0.25);
         // Only points in line with their neighbours are left out: the walk's engagement holds for
         // the points it took, and a corner cut short near the edge of a cut can bite much deeper.
         let simplify = (p.tolerance * 0.01).min(1e-4);
-        let limit = (p.max_engagement - PLAN_MARGIN).max(p.max_engagement * 0.5);
-        let target = (1.0 - w / r).clamp(-1.0, 1.0).acos().min(limit * 0.92);
         Knobs {
             r,
             h,
@@ -830,7 +852,7 @@ impl<'a> Level<'a> {
         loop {
             if *self.steps >= MAX_STEPS {
                 return Err(CamError::TooLarge(format!(
-                    "the adaptive clearing needs more than {MAX_STEPS} steps; use a larger optimal load or a smaller region"
+                    "the adaptive clearing needs more than {MAX_STEPS} steps; use a larger optimal load or engagement limit, or a smaller region"
                 )));
             }
             if pts.len() >= MAX_MOVES / 4 {
@@ -1183,6 +1205,8 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
     cut.heights.validate()?;
     cut.feeds.validate()?;
     check_stepdown(cut.stepdown)?;
+    let zs = levels(cut.heights.top, cut.heights.bottom, cut.stepdown, false)?;
+    check_flutes(tool, cut.heights.top, &zs)?;
     let k = Knobs::new(tool, params);
     let shape = Shape::from_regions(regions, params.tolerance)?;
     let (mut lo, mut hi) = (Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY));
@@ -1209,7 +1233,6 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
         let left = lv.material_cells();
         (plan, helices, left)
     };
-    let zs = levels(cut.heights.top, cut.heights.bottom, cut.stepdown, false)?;
     let mut e = Emit::new(cut.heights, cut.feeds);
     let mut slab_top = cut.heights.top;
     for &z in &zs {
@@ -1334,6 +1357,7 @@ pub fn adaptive_roughing(surface: &Surface, tool: &Tool, p: &AdaptiveRoughingPar
         }
         zs.sort_by(|a, b| b.total_cmp(a));
     }
+    check_flutes(tool, p.heights.top, &zs)?;
     // Grown by the stock to leave all round and by the margin sideways only, so a floor at the
     // stock to leave is a level the centre may stand at.
     let grown = {
@@ -1405,6 +1429,14 @@ pub fn adaptive_roughing(surface: &Surface, tool: &Tool, p: &AdaptiveRoughingPar
     }
     let left_area = left as f64 * k.h * k.h;
     let mut warnings = Vec::new();
+    if p.boundary.rect.is_none() {
+        // The tool goes down outside the stock as open air: a blank larger than the part would be
+        // cut into from the side at the level's full depth.
+        warnings.push(
+            "the stock was taken as the part's extent seen from above, and the tool goes down to each level just outside it: if the blank is larger, give the boundary's rectangle as the blank's extent"
+                .into(),
+        );
+    }
     if left > 0 {
         warnings
             .push(format!("about {left_area:.2} mm² of material within reach was left over the levels (narrow corners the walk did not get into)"));

@@ -13,11 +13,33 @@ use crate::Result;
 use crate::schema::cam_adaptive::{AdaptiveOp, AdaptiveReport, AdaptiveRoughingOp, ComparedPath};
 
 /// The engagement limits from the optimal load and what the operation gives: `(least, most)`
-/// in degrees.
-fn limits(radius: f64, load: f64, min_deg: Option<f64>, max_deg: Option<f64>) -> (f64, f64) {
+/// in degrees. The default least stays below the most the operation gives.
+pub(super) fn limits(radius: f64, load: f64, min_deg: Option<f64>, max_deg: Option<f64>) -> (f64, f64) {
     let opt = if radius > 0.0 { (1.0 - load / radius).clamp(-1.0, 1.0).acos().to_degrees() } else { 90.0 };
     let most = max_deg.unwrap_or_else(|| (opt * 1.5).max(opt + 15.0).min(180.0));
-    (min_deg.unwrap_or(opt / 3.0), most)
+    (min_deg.unwrap_or_else(|| (opt / 3.0).min(most * 0.5)), most)
+}
+
+/// How far above the limit the measured engagement may be before the report warns (degrees):
+/// the planner works on a raster a sixteenth of the radius fine.
+const OVER_LIMIT: f64 = 3.0;
+
+/// Warnings for a measured path that broke what the operation asked for.
+pub(super) fn engagement_warnings(rep: &AdaptiveReport) -> Vec<String> {
+    let mut out = Vec::new();
+    if !rep.measured {
+        return out;
+    }
+    if rep.max_engagement_deg > rep.limit_deg + OVER_LIMIT {
+        out.push(format!(
+            "the measured engagement reaches {:.1}° outside the entries, above the limit of {:.1}°: check the path, or use a lighter optimal load",
+            rep.max_engagement_deg, rep.limit_deg
+        ));
+    }
+    if rep.full_slot_share > 0.0 {
+        out.push(format!("the tool runs in a full slot for {:.1}% of the cutting time outside the entries", rep.full_slot_share * 100.0));
+    }
+    out
 }
 
 /// The adaptive parameters of either operation, checked the way every angle of a job is.
@@ -61,8 +83,10 @@ fn measure(
 }
 
 fn report(a: &AdaptivePath, e: Option<Engagement>, limit_deg: f64) -> AdaptiveReport {
+    let measured = e.is_some();
     let e = e.unwrap_or_default();
     AdaptiveReport {
+        measured,
         max_engagement_deg: e.max_deg,
         max_entry_engagement_deg: e.max_entry_deg,
         mean_engagement_deg: e.mean_deg,
@@ -106,10 +130,11 @@ pub(super) fn plan(ctx: &Ctx<'_>, o: &AdaptiveOp, frame: &Frame) -> Result<(Tool
     )?;
     let a = adaptive(&regions, &r.tool, &p, &cut).map_err(|e| ctx.bad(c.name, e))?;
     let mut warnings = a.warnings.clone();
-    let material = Material { regions: regions.clone(), top: cut.heights.top };
+    let material = Material { regions: regions.clone(), top: cut.heights.top, within: None };
     let radius = r.tool.radius();
     let e = measure(&a.path, Some(&a.roles), radius, &material, &mut warnings);
     let mut rep = report(&a, e, p.max_engagement.to_degrees());
+    warnings.extend(engagement_warnings(&rep));
     if o.compare.unwrap_or(true) {
         let pp = PocketParams {
             stepover: r.tool.diameter * 0.4,
@@ -167,25 +192,25 @@ pub(super) fn plan_roughing(ctx: &Ctx<'_>, o: &AdaptiveRoughingOp, surface: &Sur
     };
     let a = adaptive_roughing(surface, &r.tool, &rp).map_err(|e| ctx.bad(c.name, e))?;
     let mut warnings = a.warnings.clone();
-    // The stock as the operation took it: the boundary's rectangle, else the part's extent.
+    // The stock as the operation took it: the boundary's rectangle, else the part's extent, and
+    // inside the boundary's polygon too when there is one.
     let stock = match boundary.rect {
-        Some([lo, hi]) => Some(rect_region(lo, hi)),
+        Some([lo, hi]) => Some((lo, hi)),
         None => {
             let b = surface.bounds();
-            (!b.is_empty()).then(|| rect_region(Vec2::new(b.min.x, b.min.y), Vec2::new(b.max.x, b.max.y)))
+            (!b.is_empty()).then(|| (Vec2::new(b.min.x, b.min.y), Vec2::new(b.max.x, b.max.y)))
         }
     };
     let e = match stock {
-        Some(region) => {
-            let mut regions = vec![region];
-            if let Some(extra) = &boundary.region {
-                regions = vec![extra.clone()];
-            }
-            measure(&a.path, Some(&a.roles), r.tool.radius(), &Material { regions, top: rp.heights.top }, &mut warnings)
+        Some((lo, hi)) => {
+            let regions = vec![boundary.region.clone().unwrap_or_else(|| rect_region(lo, hi))];
+            let material = Material { regions, top: rp.heights.top, within: Some([lo, hi]) };
+            measure(&a.path, Some(&a.roles), r.tool.radius(), &material, &mut warnings)
         }
         None => None,
     };
     let rep = report(&a, e, p.max_engagement.to_degrees());
+    warnings.extend(engagement_warnings(&rep));
     *ctx.adaptive.borrow_mut() = Some((rep, warnings));
     Ok((a.path, r, "adaptive_roughing"))
 }

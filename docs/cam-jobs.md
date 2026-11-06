@@ -193,20 +193,35 @@ cleared material when there is one with the tool down, by lifting to `retract` o
   the helix the operation is refused, saying so.
 - **Levels.** `adaptive` cuts the same path at every depth pass. `adaptive_roughing` plans each
   level where the dropped cutter (grown by `stock_to_leave`) is at or below it; with `flats` it
-  adds a level at every flat area of the part (raised by the stock to leave).
+  adds a level at every flat area of the part (raised by the stock to leave). Levels further
+  apart than the tool's `flute_length` are refused: the shank would rub on the wall the flutes
+  leave.
 - **Corners.** An inside corner sharper than the limit allows is not driven into: a fillet
   somewhat larger than the tool's is left there for a finishing contour (`left_area` in the
   report).
 
 Defaults: `optimal_load` is the tool's `stepover` (a tool library's adaptive start values), else
 10% of its diameter; `max_engagement_deg` one and a half times the optimal load's engagement and
-at least 15° more than it; `min_engagement_deg` a third of it.
+at least 15° more than it; `min_engagement_deg` a third of it, and at most half the
+`max_engagement_deg`. A `max_engagement_deg` below the load's engagement wins: the path aims at
+the narrower width the limit allows, which is slower to plan; a width under about 3% of the
+tool's radius can be refused as too much work.
+
+- **Stock.** `adaptive_roughing` takes the material as the box over `boundary` (its rectangle,
+  and inside its polygon too) from `top` down, and goes down to a level in the open air outside
+  it. Without `boundary.rect` the stock is the part's extent seen from above, and the report
+  warns: a blank larger than that would be cut into from the side at the level's full depth, so
+  give the blank's extent as `boundary.rect`. Nothing round the stock is modelled: keep the
+  levels that go down outside it above the vise jaws and clamps.
 
 Each adaptive operation's report carries `adaptive`, measured along the path as written,
 independently of the planner (exact containment in the profiles or stock, exact distances to
-every earlier move, the tool's circumference looked at in 1° steps): `max_engagement_deg`,
+every earlier move, the tool's circumference looked at in 1° steps): `measured` (false when the
+path was too long to measure: the figures are then 0, and a warning says so), `max_engagement_deg`,
 `max_entry_engagement_deg`, `mean_engagement_deg`, `full_slot_share` (of the cutting time
 outside entries at 170° or more: 0), `entry_slot_share`, `limit_deg`, `levels`, `helices`,
 `lifts`, `left_area` and, for `adaptive` with `compare`, `pocket`: a plain offset pocket of the
 same profiles (stepover 40% of the diameter) measured the same way (`max_engagement_deg`,
-`full_slot_share`, `cut_length`, `cut_minutes`). Both operations also work inside `indexed`.
+`full_slot_share`, `cut_length`, `cut_minutes`). A measured engagement more than 3° above
+`limit_deg`, or any full slot outside the entries, is also a warning of the operation. Both
+operations also work inside `indexed`.

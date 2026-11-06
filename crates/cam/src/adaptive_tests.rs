@@ -143,7 +143,7 @@ fn assert_cleared(regions: &[Region2], path: &Toolpath, r: f64, leave: f64, bott
 }
 
 fn measure(regions: &[Region2], a: &AdaptivePath, r: f64, top: f64) -> crate::engagement::Engagement {
-    engagement(&a.path, Some(&a.roles), r, &Material { regions: regions.to_vec(), top }, 0.1).unwrap()
+    engagement(&a.path, Some(&a.roles), r, &Material { regions: regions.to_vec(), top, within: None }, 0.1).unwrap()
 }
 
 fn check_pocket(regions: &[Region2], p: &AdaptiveParams) -> AdaptivePath {
@@ -207,7 +207,7 @@ fn adaptive_against_offset_pocketing() {
     let a = adaptive(&regions, &tool, &params(), &c).unwrap();
     let pp = PocketParams { stepover: 2.4, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
     let plain = pocket(&regions, &tool, &pp, &c).unwrap();
-    let material = Material { regions: regions.to_vec(), top: 0.0 };
+    let material = Material { regions: regions.to_vec(), top: 0.0, within: None };
     let ea = engagement(&a.path, Some(&a.roles), 3.0, &material, 0.1).unwrap();
     let ep = engagement(&plain, None, 3.0, &material, 0.1).unwrap();
     assert!(ep.max_deg >= 170.0 && ep.full_slot_share > 0.0, "{ep:?}");
@@ -215,6 +215,58 @@ fn adaptive_against_offset_pocketing() {
     assert!(ea.max_deg < ep.max_deg, "{ea:?} {ep:?}");
     // A lighter cut: a longer path.
     assert!(a.path.stats().cut_length > plain.stats().cut_length, "{} {}", a.path.stats().cut_length, plain.stats().cut_length);
+}
+
+/// Climb milling keeps the material on the right of the travel (spindle clockwise): the helices
+/// go counter-clockwise and the walks round the cleared area turn counter-clockwise overall;
+/// conventional milling the other way round, and the engagement holds either way.
+#[test]
+fn climb_and_conventional_turn_opposite_ways() {
+    for climb in [true, false] {
+        let p = AdaptiveParams { climb, ..params() };
+        let a = adaptive(&[square(24.0)], &flat(6.0), &p, &cut(0.0, -1.0)).unwrap();
+        let mut arcs = 0;
+        for (m, role) in a.path.moves.iter().zip(&a.roles) {
+            if let (Move::Arc { ccw, .. }, MoveRole::Entry) = (m, role) {
+                assert_eq!(*ccw, climb, "a helix the wrong way round, climb {climb}");
+                arcs += 1;
+            }
+        }
+        assert!(arcs >= 2, "{arcs}");
+        // The signed turn between consecutive cutting moves, summed.
+        let mut turn = 0.0;
+        let mut prev: Option<(Vec3, Option<Vec2>)> = None;
+        for (m, role) in a.path.moves.iter().zip(&a.roles) {
+            let Some(to) = m.target() else { continue };
+            let dir = match (prev, role) {
+                (Some((from, _)), MoveRole::Cut) => (Vec2::new(to.x, to.y) - Vec2::new(from.x, from.y)).normalized(),
+                _ => None,
+            };
+            if let (Some((_, Some(d0))), Some(d1)) = (prev, dir) {
+                turn += d0.cross(d1).atan2(d0.dot(d1));
+            }
+            prev = Some((to, dir));
+        }
+        let turns = turn / (2.0 * PI);
+        assert!(if climb { turns > 1.0 } else { turns < -1.0 }, "climb {climb}: {turns} turns");
+        let e = measure(&[square(24.0)], &a, 3.0, 0.0);
+        assert!(e.max_deg <= 60.0 + ENGAGEMENT_TOL && e.full_slot_share == 0.0, "climb {climb}: {e:?}");
+    }
+}
+
+/// A limit well below the load's engagement (a heavy load capped at 30°): the walk's steps and
+/// raster follow the width the limit allows, not the load, so the pocket is cleared from its
+/// helix within the limit.
+#[test]
+fn a_low_limit_under_a_heavy_load_still_clears_the_pocket() {
+    let regions = [square(14.0)];
+    let p = AdaptiveParams { optimal_load: 1.8, min_engagement: 3.0 * DEG, max_engagement: 30.0 * DEG, ..params() };
+    let a = adaptive(&regions, &flat(6.0), &p, &cut(0.0, -1.0)).unwrap();
+    assert_eq!(a.helices, 1, "{a:?}");
+    let e = measure(&regions, &a, 3.0, 0.0);
+    assert!(e.max_deg <= 30.0 + ENGAGEMENT_TOL, "{e:?}");
+    assert_eq!(e.full_slot_share, 0.0, "{e:?}");
+    assert_cleared(&regions, &a.path, 3.0, 0.0, -1.0, 0.4);
 }
 
 #[test]
@@ -277,6 +329,12 @@ fn hostile_parameters_are_refused() {
         assert!(adaptive(&regions, &tool, &params(), &Cut { heights: h, ..c }).is_err(), "{h:?}");
     }
     assert!(adaptive(&regions, &tool, &params(), &Cut { stepdown: 0.0, ..c }).is_err());
+    // A pass deeper than the flutes reach (20 mm) is refused; a stepdown larger than the whole
+    // depth is not.
+    let deep = Cut { heights: Heights { bottom: -25.0, ..c.heights }, stepdown: 25.0, ..c };
+    let e = adaptive(&regions, &tool, &params(), &deep).unwrap_err();
+    assert!(e.to_string().contains("flute length"), "{e}");
+    assert!(adaptive(&regions, &tool, &params(), &Cut { stepdown: 50.0, ..c }).is_ok());
     assert!(adaptive(&regions, &tool, &params(), &Cut { feeds: Feeds { cut: 0.0, plunge: 1.0 }, ..c }).is_err());
 }
 
@@ -334,6 +392,8 @@ fn adaptive_roughing_stays_off_the_part_and_within_the_engagement() {
     assert!(a.levels >= 2, "{a:?}");
     // Entered from the open air round the stock: no helix needed.
     assert_eq!(a.helices, 0);
+    // The stock was taken from the part, which a larger blank would make wrong: said so.
+    assert!(a.warnings.iter().any(|w| w.contains("the part's extent")), "{:?}", a.warnings);
     let rest = Cutter::flat(3.0).unwrap().grown(0.25).unwrap();
     let mut lowest = f64::INFINITY;
     for (q, cutting) in a.path.points(1e-3) {
@@ -345,7 +405,7 @@ fn adaptive_roughing_stays_off_the_part_and_within_the_engagement() {
         }
     }
     assert!((lowest - 0.25).abs() < 1e-6, "{lowest}");
-    let stock = Material { regions: vec![region(&[(-20.0, -20.0), (20.0, -20.0), (20.0, 20.0), (-20.0, 20.0)], &[])], top: 6.0 };
+    let stock = Material { regions: vec![region(&[(-20.0, -20.0), (20.0, -20.0), (20.0, 20.0), (-20.0, 20.0)], &[])], top: 6.0, within: None };
     let e = engagement(&a.path, Some(&a.roles), 3.0, &stock, 0.1).unwrap();
     assert!(e.max_deg <= 60.0 + ENGAGEMENT_TOL, "{e:?}");
     assert_eq!(e.full_slot_share, 0.0, "{e:?}");
@@ -384,6 +444,8 @@ fn adaptive_roughing_enters_an_enclosed_cavity_with_a_helix() {
     };
     let a = adaptive_roughing(&surface, &flat(6.0), &p).unwrap();
     assert!(a.helices >= 1, "{a:?}");
+    // The stock was given: no warning about it.
+    assert!(!a.warnings.iter().any(|w| w.contains("the part's extent")), "{:?}", a.warnings);
     let rest = Cutter::flat(3.0).unwrap().grown(0.25).unwrap();
     for (q, cutting) in a.path.points(1e-3) {
         if cutting && let Some(z) = drop_z(&surface, &rest, q.x, q.y) {
@@ -408,6 +470,10 @@ fn adaptive_roughing_refuses_hostile_input() {
     assert!(adaptive_roughing(&surface, &tool, &p).is_err());
     let p = AdaptiveRoughingParams { adaptive: AdaptiveParams { optimal_load: -1.0, ..params() }, ..roughing_params() };
     assert!(adaptive_roughing(&surface, &tool, &p).is_err());
+    // Levels 1.9 mm apart with flutes 1.5 mm long.
+    let short = Tool { flute_length: 1.5, ..tool.clone() };
+    let e = adaptive_roughing(&surface, &short, &roughing_params()).unwrap_err();
+    assert!(e.to_string().contains("flute length"), "{e}");
     let empty = Surface::new(vec![]).unwrap();
     assert!(adaptive_roughing(&empty, &tool, &roughing_params()).is_err());
 }

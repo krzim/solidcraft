@@ -33,12 +33,17 @@ const MAX_TESTS: f64 = 4.0e9;
 const MAX_PIECES: f64 = 2.0e6;
 /// Most cells of the spatial index.
 const MAX_BUCKETS: f64 = 4.0e6;
+/// Largest coordinate of a path measured (mm).
+const MAX_COORD: f64 = 1.0e6;
 
-/// The stock a path cuts: inside `regions` (holes are left out) up to `top`.
+/// The stock a path cuts: inside `regions` (holes are left out) up to `top`, and inside the
+/// rectangle `within` (low and high corners) when there is one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Material {
     pub regions: Vec<Region2>,
     pub top: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within: Option<[Vec2; 2]>,
 }
 
 /// What [`engagement`] found.
@@ -313,10 +318,27 @@ pub fn engagement(path: &Toolpath, roles: Option<&[MoveRole]>, radius: f64, mate
     if !material.top.is_finite() {
         return invalid("the top of the material must be a finite number");
     }
+    if material.within.is_some_and(|[lo, hi]| !(lo.is_finite() && hi.is_finite() && lo.x <= hi.x && lo.y <= hi.y)) {
+        return invalid("the material's rectangle must be finite, its low corner below and left of its high one");
+    }
     let fences: Vec<(Ring<Vec2>, Vec<Ring<Vec2>>)> =
         material.regions.iter().map(|r| (r.outer.polyline(radius * 1e-3), r.holes.iter().map(|h| h.polyline(radius * 1e-3)).collect())).collect();
-    let inside = |q: Vec2| fences.iter().any(|(o, hs)| o.contains(q) && !hs.iter().any(|h| h.contains(q)));
+    let inside = |q: Vec2| {
+        material.within.is_none_or(|[lo, hi]| q.x >= lo.x && q.x <= hi.x && q.y >= lo.y && q.y <= hi.y)
+            && fences.iter().any(|(o, hs)| o.contains(q) && !hs.iter().any(|h| h.contains(q)))
+    };
 
+    // Not a finite number, or too far out to size an index by.
+    let far = |v: Vec3| !(v.x.abs() <= MAX_COORD && v.y.abs() <= MAX_COORD && v.z.abs() <= MAX_COORD);
+    for m in &path.moves {
+        let out = match *m {
+            Move::Arc { to, center, .. } => far(to) || far(center.extend(0.0)),
+            _ => m.target().is_some_and(far),
+        };
+        if out {
+            return invalid("the path must lie within 1000 m of the origin, in finite numbers");
+        }
+    }
     let stats = path.stats();
     let ds = spacing.min(radius / 8.0).max(stats.cut_length / 1.0e6).max(radius * 1e-3);
     let pieces = pieces(path, roles, ds)?;
@@ -326,6 +348,7 @@ pub fn engagement(path: &Toolpath, roles: Option<&[MoveRole]>, radius: f64, mate
             if !p.is_finite() {
                 return invalid("the path has a coordinate that is not a finite number");
             }
+
             lo = Vec2::new(lo.x.min(p.x), lo.y.min(p.y));
             hi = Vec2::new(hi.x.max(p.x), hi.y.max(p.y));
         }

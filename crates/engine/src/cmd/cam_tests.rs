@@ -513,3 +513,87 @@ fn hostile_adaptive_operations_are_refused() {
     let e = s.execute("cam.job", &with("polygon", json!([[-12, -3.5], [12, -3.5], [12, 3.5], [-12, 3.5]]))).unwrap_err();
     assert!(e.to_string().contains("no room for the entry helix"), "{e}");
 }
+
+/// A full-width load capped at 55°: the default least engagement (a third of the load's, 60°)
+/// would be above the limit, so it is kept below it instead of the operation being refused for
+/// a key it was not given.
+#[test]
+fn an_adaptive_pocket_takes_a_limit_below_a_third_of_the_load() {
+    assert!(super::adaptive::limits(3.0, 6.0, None, Some(55.0)).0 < 55.0);
+    let mut s = pocket_block();
+    let op = json!({"name": "capped", "type": "adaptive", "tool": 1, "polygon": [[-7, -7], [7, -7], [7, 7], [-7, 7]],
+                    "heights": {"clearance": 20, "retract": 2, "top": -2, "bottom": -3}, "optimal_load": 6,
+                    "max_engagement_deg": 55, "compare": false});
+    let r = run(&mut s, "cam.job", json!({"job": adaptive_job(op), "dry_run": true}));
+    assert_clean(&r);
+    let a = &r["operations"][0]["adaptive"];
+    assert_eq!(a["measured"], true, "{a}");
+    assert!(a["max_engagement_deg"].as_f64().is_some_and(|m| m <= 58.0), "{a}");
+}
+
+/// A measured path above the limit, or in a full slot outside its entries, is warned about; an
+/// unmeasured one says nothing it does not know.
+#[test]
+fn adaptive_engagement_above_the_limit_is_warned_about() {
+    use crate::schema::cam_adaptive::AdaptiveReport;
+    let ok = AdaptiveReport { measured: true, max_engagement_deg: 61.0, limit_deg: 60.0, ..AdaptiveReport::default() };
+    assert!(super::adaptive::engagement_warnings(&ok).is_empty());
+    let over = AdaptiveReport { max_engagement_deg: 75.0, ..ok.clone() };
+    assert!(super::adaptive::engagement_warnings(&over).iter().any(|w| w.contains("above the limit")));
+    let slot = AdaptiveReport { full_slot_share: 0.02, ..ok.clone() };
+    assert!(super::adaptive::engagement_warnings(&slot).iter().any(|w| w.contains("full slot")));
+    let unmeasured = AdaptiveReport { measured: false, ..over };
+    assert!(super::adaptive::engagement_warnings(&unmeasured).is_empty());
+}
+
+/// Adaptive clearing of the side pocket at A = 90°: written with A held, read back and gouge
+/// checked in the turned frame, within the engagement limit.
+#[test]
+fn an_adaptive_pocket_indexed_at_90_degrees_reads_back() {
+    let mut s = pocketed_block();
+    let job = json!({
+        "machine": "4axis_a", "post": "mach3_4axis", "tools": [flat(1, 4.0)],
+        "operations": [{"type": "indexed", "a_deg": 90, "operation": {
+            "name": "side adaptive", "type": "adaptive", "tool": 1, "polygon": [[-6, -6], [6, -6], [6, 6], [-6, 6]],
+            "heights": {"clearance": 40, "retract": 20, "top": 15, "bottom": 10}, "stepdown": 2.5,
+            "optimal_load": 0.4, "max_engagement_deg": 60, "compare": false}}]
+    });
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    let op = &r["operations"][0];
+    assert_eq!(op["kind"], "indexed adaptive", "{r}");
+    assert!((op["max_tilt_deg"].as_f64().unwrap() - 90.0).abs() < 1e-6, "{r}");
+    let a = &op["adaptive"];
+    assert_eq!(a["measured"], true, "{a}");
+    assert_eq!(a["levels"].as_u64(), Some(2), "{a}");
+    assert!(a["max_engagement_deg"].as_f64().is_some_and(|m| m > 10.0 && m <= 63.0), "{a}");
+    assert_eq!(a["full_slot_share"].as_f64(), Some(0.0), "{a}");
+    let head: Vec<&str> = r["program_head"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(head.iter().any(|l| l.contains("A90")), "{head:?}");
+}
+
+/// Adaptive roughing with no boundary takes the part's extent as the stock and says so; the
+/// engagement is measured inside both the boundary's rectangle and its polygon.
+#[test]
+fn adaptive_roughing_says_when_it_takes_the_stock_from_the_part() {
+    let mut s = dome();
+    let base = json!({"name": "rough", "type": "adaptive_roughing", "tool": 1,
+                      "heights": {"clearance": 30, "retract": 10, "top": 7, "bottom": 3}, "stepdown": 4,
+                      "optimal_load": 0.6, "max_engagement_deg": 60});
+    let r = run(&mut s, "cam.job", json!({"job": adaptive_job(base.clone()), "dry_run": true}));
+    assert_clean(&r);
+    let op = &r["operations"][0];
+    assert!(op["warnings"].as_array().unwrap().iter().any(|w| w.as_str().is_some_and(|w| w.contains("the part's extent"))), "{op}");
+    // A polygon larger than the rectangle: the stock is where both are, and so is the material
+    // the engagement is measured in (the polygon alone would show engagement in open air).
+    let mut op = base;
+    op["boundary"] = json!({"rect": [[-20, -20], [20, 20]], "polygon": [[-40, -40], [40, -40], [40, 40], [-40, 40]]});
+    let r = run(&mut s, "cam.job", json!({"job": adaptive_job(op), "dry_run": true}));
+    assert_clean(&r);
+    let op = &r["operations"][0];
+    assert!(!op["warnings"].as_array().unwrap().iter().any(|w| w.as_str().is_some_and(|w| w.contains("the part's extent"))), "{op}");
+    let a = &op["adaptive"];
+    assert_eq!(a["measured"], true, "{a}");
+    assert!(a["max_engagement_deg"].as_f64().is_some_and(|m| m <= 63.0), "{a}");
+    assert_eq!(a["full_slot_share"].as_f64(), Some(0.0), "{a}");
+}

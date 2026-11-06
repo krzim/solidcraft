@@ -22,7 +22,7 @@ fn pass(moves: &mut Vec<Move>, y: f64, z: f64) {
 }
 
 fn bar() -> Material {
-    Material { regions: vec![rect(0.0, 0.0, 100.0, 20.0)], top: 0.0 }
+    Material { regions: vec![rect(0.0, 0.0, 100.0, 20.0)], top: 0.0, within: None }
 }
 
 #[test]
@@ -78,6 +78,19 @@ fn hostile_input_is_refused() {
     assert!(engagement(&path, None, 3.0, &Material { top: f64::NAN, ..bar() }, 0.25).is_err());
     let bad = Toolpath { moves: vec![Move::Rapid { to: Vec3::new(0.0, 0.0, 10.0) }, Move::Feed { to: Vec3::new(f64::NAN, 0.0, 0.0), feed: 100.0 }] };
     assert!(engagement(&bad, None, 3.0, &bar(), 0.25).is_err());
+    // Huge but finite coordinates are refused, not sized into an index that overflows.
+    for far in [1.0e300, 1.0e12, -1.0e7] {
+        let huge = Toolpath {
+            moves: vec![
+                Move::Rapid { to: Vec3::new(0.0, 0.0, 10.0) },
+                Move::Feed { to: Vec3::new(far, 0.0, -1.0), feed: 100.0 },
+                Move::Feed { to: Vec3::new(far, far, -1.0), feed: 100.0 },
+            ],
+        };
+        assert!(engagement(&huge, None, 3.0, &bar(), 0.25).is_err(), "{far}");
+    }
+    let nan_rect = Material { within: Some([Vec2::new(f64::NAN, 0.0), Vec2::new(1.0, 1.0)]), ..bar() };
+    assert!(engagement(&path, None, 3.0, &nan_rect, 0.25).is_err());
     // Roles shorter than the path are taken as clearing.
     assert!(engagement(&path, Some(&[MoveRole::Entry]), 3.0, &bar(), 0.25).is_ok());
 }

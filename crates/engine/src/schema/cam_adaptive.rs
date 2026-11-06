@@ -111,6 +111,9 @@ operation! {
 /// compared with.
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 pub struct AdaptiveReport {
+    /// Whether the path's engagement was measured (a path too long to measure is not; the
+    /// engagement figures are then 0 and say nothing).
+    pub measured: bool,
     /// Largest engagement outside the entries, degrees.
     pub max_engagement_deg: f64,
     /// Largest engagement in the entry helices, degrees.
