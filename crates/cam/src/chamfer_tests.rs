@@ -188,7 +188,8 @@ fn the_tool_list_names_face_and_chamfer_mills() {
     let feeds = Feeds { cut: 1600.0, plunge: 50.0 };
     let face = face_mill(10.0, Some(0.2));
     let cut = Cut { heights: Heights { clearance: 10.0, retract: 2.0, top: 0.0, bottom: -0.05 }, feeds, stepdown: 1.0 };
-    let params = PocketParams { stepover: 7.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+    // A face mill ramps in: it cannot plunge.
+    let params = PocketParams { stepover: 7.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 2f64.to_radians() };
     let facing = pocket(&[rect(0.0, 0.0, 30.0, 20.0)], &face, &params, &cut).unwrap();
     let mill = chamfer_mill(4.0, 0.0, 90.0);
     let ch = ChamferParams {
@@ -446,4 +447,196 @@ fn the_gouge_check_holds_a_chamfer_mill_to_the_chamfer() {
     // stops at the depth the chamfer operation runs at.
     let g = chamfer_geometry(&tool, 1.0, DEFAULT_TIP_OFFSET).unwrap();
     close(drop_z(&modelled, &cutter, 10.0 + g.offset, 0.0).unwrap(), -g.depth, 1e-9);
+}
+
+/// Twice the signed area of the closed run of `points` seen from above: positive
+/// anticlockwise.
+fn signed_area(points: &[Vec3]) -> f64 {
+    points.iter().zip(points.iter().cycle().skip(1)).map(|(a, b)| a.x * b.y - b.x * a.y).sum()
+}
+
+#[test]
+fn a_chamfer_runs_climb_or_conventional_as_a_contour_does() {
+    // With a clockwise spindle climb milling keeps the wall on the right of the travel: round a
+    // part clockwise, round an opening anticlockwise. The same with the axis on the edge (no
+    // offset: a pointed tip and no tip offset) as off it.
+    let tool = chamfer_mill(6.0, 0.0, 90.0);
+    for tip_offset in [0.0, DEFAULT_TIP_OFFSET] {
+        for (side, climb, anticlockwise) in
+            [(Side::Outside, true, false), (Side::Outside, false, true), (Side::Inside, true, true), (Side::Inside, false, false)]
+        {
+            let p = ChamferParams { tip_offset, climb, ..chamfer_params(1.0, side) };
+            let path = chamfer(&[rect(-10.0, -10.0, 10.0, 10.0)], &tool, &p).unwrap();
+            let g = chamfer_geometry(&tool, 1.0, tip_offset).unwrap();
+            let bottom: Vec<Vec3> = path
+                .moves
+                .iter()
+                .filter(|m| matches!(m, Move::Feed { .. } | Move::Arc { .. }))
+                .filter_map(Move::target)
+                .filter(|q| (q.z + g.depth).abs() < 1e-9)
+                .collect();
+            assert!(bottom.len() >= 4, "{side:?} {climb}: {path:?}");
+            let area = signed_area(&bottom);
+            assert_eq!(area > 0.0, anticlockwise, "{side:?} climb {climb} tip offset {tip_offset}: area {area}");
+            // Every cut at the bottom is the axis's offset from the edge, outside or inside.
+            let want = if side == Side::Outside { g.offset } else { -g.offset };
+            for q in &bottom {
+                let out = q.x.abs().max(q.y.abs()) - 10.0;
+                assert!((out - want).abs() <= 1e-6 || (side == Side::Outside && out < want), "{side:?} {tip_offset}: {q:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn hostile_chamfer_params_are_refused_without_panics() {
+    let tool = chamfer_mill(6.0, 0.0, 90.0);
+    let region = [rect(-10.0, -10.0, 10.0, 10.0)];
+    let p = chamfer_params(1.0, Side::Outside);
+    let bad = [
+        ChamferParams { tolerance: f64::NAN, ..p },
+        ChamferParams { tolerance: -1.0, ..p },
+        ChamferParams { tolerance: 0.0, ..p },
+        ChamferParams { clearance: f64::NAN, ..p },
+        ChamferParams { clearance: f64::INFINITY, ..p },
+        ChamferParams { retract: f64::NAN, ..p },
+        ChamferParams { clearance: 1.0, retract: 2.0, ..p },
+        ChamferParams { feeds: Feeds { cut: f64::NAN, plunge: 100.0 }, ..p },
+        ChamferParams { feeds: Feeds { cut: 800.0, plunge: 0.0 }, ..p },
+        ChamferParams { feeds: Feeds { cut: -1.0, plunge: 100.0 }, ..p },
+        ChamferParams { width: f64::MIN_POSITIVE, tip_offset: f64::NAN, ..p },
+    ];
+    for b in bad {
+        assert!(chamfer(&region, &tool, &b).is_err(), "{b:?}");
+    }
+    // Hostile tools: no angle, angles out of range, a tip as wide as the tool, NaN.
+    let mut tools = Vec::new();
+    for (angle, tip) in
+        [(None, Some(0.0)), (Some(0.0), None), (Some(180.0), None), (Some(f64::NAN), None), (Some(90.0), Some(6.0)), (Some(90.0), Some(f64::NAN))]
+    {
+        let mut t = chamfer_mill(6.0, 0.0, 90.0);
+        t.angle_deg = angle;
+        t.tip_diameter = tip;
+        tools.push(t);
+    }
+    let mut t = chamfer_mill(6.0, 0.0, 90.0);
+    t.diameter = f64::NAN;
+    tools.push(t);
+    for t in &tools {
+        assert!(t.validate().is_err(), "{t:?}");
+        assert!(chamfer(&region, t, &p).is_err(), "{t:?}");
+    }
+    // An empty region and degenerate or huge profiles are refused, not panicked on.
+    assert!(chamfer(&[], &tool, &p).is_err());
+    assert!(chamfer(&[rect(0.0, 0.0, 0.0, 0.0)], &tool, &p).is_err());
+    assert!(chamfer(&[rect(-1e300, -1e300, 1e300, 1e300)], &tool, &p).is_err());
+    // The cutter's own checks hold on hostile shapes.
+    for (r, tip, half) in
+        [(3.0, 3.0, 0.5), (3.0, -0.1, 0.5), (3.0, 0.0, 0.0), (3.0, 0.0, 1.6), (3.0, 0.0, f64::NAN), (f64::NAN, 0.0, 0.5), (0.0, 0.0, 0.5)]
+    {
+        assert!(Cutter::tapered(r, tip, half).is_err(), "{r} {tip} {half}");
+    }
+    let c = Cutter::tapered(3.0, 0.0, 0.5).unwrap();
+    for by in [f64::NAN, -1.0, f64::INFINITY] {
+        assert!(c.grown(by).is_err() && c.shrunk(by).is_err(), "{by}");
+    }
+}
+
+#[test]
+fn roughing_and_swarf_refuse_a_chamfer_mill_and_a_face_mill_ramps_in() {
+    // A chamfer mill's point leaves ridges between roughing passes a diameter apart, which the
+    // roughing takes as cut: refused, on three axes and on four. Its tapered side cannot cut a
+    // wall along a ruling. A face mill cannot plunge into the stock, so it neither roughs nor
+    // enters a contour or a pocket without a ramp.
+    let cone = chamfer_mill(6.0, 0.0, 90.0);
+    let face = face_mill(10.0, Some(0.2));
+    let s = block(Vec3::new(-10.0, -10.0, -10.0), Vec3::new(10.0, 10.0, 0.0));
+    let rough = RoughingParams {
+        heights: Heights { clearance: 10.0, retract: 2.0, top: 1.0, bottom: -5.0 },
+        feeds: Feeds { cut: 800.0, plunge: 100.0 },
+        stepdown: 1.0,
+        stepover: 2.4,
+        angle: 0.0,
+        boundary: Boundary { rect: Some([Vec2::new(-15.0, -15.0), Vec2::new(15.0, 15.0)]), region: None },
+        stock_to_leave: 0.25,
+        step: 1.0,
+        tolerance: 0.01,
+        zigzag: true,
+    };
+    assert!(roughing(&s, &Tool::new(1, ToolKind::FlatEndmill, 6.0, 20.0), &rough).is_ok());
+    for t in [&cone, &face] {
+        let e = roughing(&s, t, &rough).unwrap_err().to_string();
+        assert!(e.contains("rough with an end mill"), "{e}");
+    }
+    let drum = crate::foundation_tests::cylinder_x(10.0, -20.0, 20.0, 64);
+    let rr = RotaryRoughingParams {
+        pattern: RotaryPattern::Lines { angle_step: 0.2, zigzag: true },
+        stock_radius: 15.0,
+        clearance: 25.0,
+        retract: 18.0,
+        floor: 8.0,
+        stepdown: 2.0,
+        feeds: Feeds { cut: 800.0, plunge: 100.0 },
+        range: Some([-20.0, 20.0]),
+        step: 1.0,
+        tolerance: 0.01,
+        stock_to_leave: 0.5,
+        max_angle_step: DEFAULT_MAX_ANGLE_STEP,
+    };
+    for t in [&cone, &face] {
+        let e = rotary_roughing(&drum, t, &rr).unwrap_err().to_string();
+        assert!(e.contains("rough with an end mill"), "{e}");
+    }
+    let bottom: Vec<Vec3> = (0..5).map(|i| Vec3::new(-10.0 + 5.0 * i as f64, 0.0, 0.0)).collect();
+    let top: Vec<Vec3> = bottom.iter().map(|b| *b + Vec3::new(0.0, 0.0, 2.0)).collect();
+    let sp = crate::strategies5::SwarfParams {
+        feeds: Feeds { cut: 800.0, plunge: 200.0 },
+        stock_to_leave: 0.0,
+        bottom_offset: 0.0,
+        levels: 1,
+        max_axis_step: 0.05,
+        retract: 2.0,
+        clearance: 30.0,
+    };
+    let e = crate::strategies5::swarf(&bottom, &top, &cone, crate::strategies5::WallSide::Left, &sp).unwrap_err().to_string();
+    assert!(e.contains("tapered"), "{e}");
+    // A face mill ramps into a pocket or a contour; straight down it is refused.
+    let region = [rect(-10.0, -10.0, 10.0, 10.0)];
+    let cut =
+        Cut { heights: Heights { clearance: 10.0, retract: 2.0, top: 0.5, bottom: 0.0 }, feeds: Feeds { cut: 800.0, plunge: 50.0 }, stepdown: 0.5 };
+    let pp = PocketParams { stepover: 7.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+    let e = pocket(&region, &face, &pp, &cut).unwrap_err().to_string();
+    assert!(e.contains("ramp"), "{e}");
+    assert!(pocket(&region, &face, &PocketParams { ramp_angle: 2f64.to_radians(), ..pp }, &cut).is_ok());
+    let cp = ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+    assert!(contour(&region, &face, &cp, &cut).unwrap_err().to_string().contains("ramp"));
+    assert!(contour(&region, &face, &ContourParams { ramp_angle: 2f64.to_radians(), ..cp }, &cut).is_ok());
+    // Without corner radii a face mill is refused the same way; a flat end mill still plunges.
+    assert!(pocket(&region, &face_mill(10.0, None), &pp, &cut).is_err());
+    assert!(pocket(&region, &Tool::new(1, ToolKind::FlatEndmill, 10.0, 20.0), &pp, &cut).is_ok());
+}
+
+#[test]
+fn the_gouge_check_follows_a_tall_cone_as_its_axis_turns() {
+    // A 10° engraving cone 2 mm across is 11.4 mm tall. Turned 90° about its tip, its side 6 mm
+    // up sweeps through a thin fin 11° round from the start; sampled for points only a radius
+    // up the tool, the samples (every 22.5°) step over the fin.
+    let c = Cutter::tapered(1.0, 0.0, f64::to_radians(5.0)).unwrap();
+    let th = f64::to_radians(11.0);
+    let u = Vec3::new(th.sin(), 0.0, th.cos());
+    let y = Vec3::new(0.0, 1.0, 0.0);
+    let fin =
+        Surface::new(vec![[u * 4.0 - y * 0.3, u * 8.0 - y * 0.3, u * 8.0 + y * 0.3], [u * 4.0 - y * 0.3, u * 8.0 + y * 0.3, u * 4.0 + y * 0.3]])
+            .unwrap();
+    let tip = Vec3::new(0.0, 0.0, 0.0);
+    // Standing at the fin's angle, the cone is deep in it.
+    let at_fin = Toolpath5 { moves: vec![Move5::Rapid { to: Pose::new(tip, u) }, Move5::Feed { to: Pose::new(tip, u), feed: 100.0 }] };
+    assert!(!gouges(&fin, &c, &at_fin, 0.01, 0.5).unwrap().is_empty());
+    let turn = Toolpath5 {
+        moves: vec![
+            Move5::Rapid { to: Pose::new(tip, Vec3::new(0.0, 0.0, 1.0)) },
+            Move5::Feed { to: Pose::new(tip, Vec3::new(1.0, 0.0, 0.0)), feed: 100.0 },
+        ],
+    };
+    assert!(!gouges(&fin, &c, &turn, 0.01, 0.5).unwrap().is_empty(), "the turn through the fin is a gouge");
 }

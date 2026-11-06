@@ -894,6 +894,7 @@ impl TipRange {
 /// would visit more than a billion samples between them is refused.
 pub fn roughing(surface: &Surface, tool: &Tool, p: &RoughingParams) -> Result<Toolpath> {
     let cutter = tool_cutter(tool)?;
+    crate::chamfer::roughs(tool, "roughing")?;
     p.heights.validate()?;
     p.feeds.validate()?;
     check_stepdown(p.stepdown)?;

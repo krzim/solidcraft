@@ -1072,6 +1072,8 @@ pub fn swarf(bottom: &[Vec3], top: &[Vec3], tool: &Tool, side: WallSide, params:
     for p in bottom.iter().chain(top) {
         finite_point(*p, "a rail point")?;
     }
+    tool.validate()?;
+    crate::chamfer::flanks(tool)?;
     let radius = tool.cutter()?.radius + params.stock_to_leave;
     let sign = if side == WallSide::Left { 1.0 } else { -1.0 };
     let wall = Wall::new(bottom, top);

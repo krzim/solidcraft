@@ -173,7 +173,9 @@ pub(crate) fn gouges_in(surface: &Surface, cutter: &Cutter, path: &Toolpath5, to
     check_step(sample_step)?;
     check_path(path)?;
     let mut hits: Vec<Hit> = Vec::new();
-    for_each_sample(path, cutter.radius, sample_step, moves, |index, pose| {
+    // Points of the end are up to its radius out and its rim height up: a tall cone's top moves
+    // farther than its radius as the axis turns.
+    for_each_sample(path, cutter.radius.max(cutter.rim_height()), sample_step, moves, |index, pose| {
         if let Some(depth) = test.depth(surface, &pose)? {
             let hit = Hit { index, pose, envelope: None, distance: depth };
             match hits.last_mut() {

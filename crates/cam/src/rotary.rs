@@ -699,6 +699,8 @@ pub fn rotary_finish(surface: &Surface, tool: &Tool, p: &RotaryParams) -> Result
 /// [`rotary_finish`]. Passes may be at most the tool diameter apart at the stock radius, and a
 /// helix goes a full turn round at each end of the range, so no stock is left at full height.
 pub fn rotary_roughing(surface: &Surface, tool: &Tool, p: &RotaryRoughingParams) -> Result<Toolpath5> {
+    tool.validate()?;
+    crate::chamfer::roughs(tool, "rotary roughing")?;
     let s = setup_check(p.pattern, p.range, p.clearance, p.retract, &p.feeds, p.step, p.tolerance, p.stock_to_leave, p.max_angle_step, surface)?;
     check_stepdown(p.stepdown)?;
     if !(p.stock_radius.is_finite() && p.stock_radius > 0.0 && p.stock_radius <= s.retract) {

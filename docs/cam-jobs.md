@@ -178,8 +178,14 @@ A face mill (`kind: "face_mill"`) is a flat end, its inserts' corners rounded by
 "chamfer"`) has `diameter` (the widest the cone cuts), `tip_diameter` (0 for a pointed tip,
 default 0) and `angle_deg`, the included angle (90 for 45° chamfers, 1 to 179, required); its
 tool-list name is `CHAMFER MILL`. Contours and pockets refuse a chamfer mill. The drop-cutter
-and the gouge check know its true shape, a flat tip and a cone, and so every 3D operation can
-use one.
+and the gouge check know its true shape, a flat tip and a cone, so the finishing operations
+(`parallel`, `waterline`, `rotary_finish`, `wrap`, 5-axis surface finishing) can use one.
+`roughing` and `rotary_roughing` refuse it, since its point leaves ridges between passes that
+the roughing would take as cut, and so does a swarf cut, since its side is tapered.
+
+A face mill's inserts do not cut at its centre, so it never goes straight down into material:
+a `contour` or `pocket` with a face mill needs `ramp_angle_deg` above 0, and `roughing` and
+`rotary_roughing`, which plunge, refuse it.
 
 The `chamfer` operation cuts a chamfer along the top edges of closed profiles in one pass:
 

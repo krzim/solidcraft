@@ -11,6 +11,11 @@
 //!
 //! The toolpath follows the profiles' offsets one pass deep, outside a part or inside an
 //! opening as a contour does, and is checked like every 2D operation before it is returned.
+//!
+//! Here too are the operations a chamfer mill or a face mill is refused for: a chamfer mill's
+//! pointed end leaves ridges between roughing passes a diameter apart, and its tapered side
+//! cannot cut a wall along a ruling; a face mill's inserts do not cut at its centre, so it
+//! never plunges straight down into material.
 
 use serde::{Deserialize, Serialize};
 use solidcore_record::Region2;
@@ -62,6 +67,37 @@ pub struct ChamferGeometry {
     pub height: f64,
     /// The widest chamfer the tool cuts with this tip offset (mm).
     pub max_width: f64,
+}
+
+/// Refuses `tool` for an operation that roughs (`what`): it plunges straight down into the
+/// stock and takes everything between passes up to a diameter apart as cut down to the level,
+/// which a chamfer mill's pointed end does not do and a face mill's centre cannot.
+pub(crate) fn roughs(tool: &Tool, what: &str) -> Result<()> {
+    match tool.kind {
+        ToolKind::Chamfer => invalid(format!(
+            "{what} needs a tool that cuts flat between its passes: a chamfer mill's pointed end leaves ridges up to its cone's height; rough with an end mill"
+        )),
+        ToolKind::FaceMill => invalid(format!("{what} plunges straight down into the stock, which a face mill cannot: rough with an end mill")),
+        _ => Ok(()),
+    }
+}
+
+/// Refuses a face mill that would go straight down into material (`ramp_angle` 0): its inserts
+/// do not cut at its centre.
+pub(crate) fn enters(tool: &Tool, ramp_angle: f64) -> Result<()> {
+    if tool.kind == ToolKind::FaceMill && !(ramp_angle > 0.0) {
+        return invalid("a face mill cannot plunge straight down into material: give a ramp angle (a few degrees)");
+    }
+    Ok(())
+}
+
+/// Refuses a chamfer mill for a cut along a wall with the tool's side (a swarf cut): its side
+/// is tapered, so it would leave the wall below its cone's top uncut.
+pub(crate) fn flanks(tool: &Tool) -> Result<()> {
+    if tool.kind == ToolKind::Chamfer {
+        return invalid("a swarf cut runs the tool's side along the wall, and a chamfer mill's side is tapered: use an end mill");
+    }
+    Ok(())
 }
 
 /// Where `tool`, a chamfer mill, runs for a chamfer `width` wide with its tip `tip_offset`

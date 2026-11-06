@@ -422,7 +422,7 @@ fn chamfer_job(width: f64) -> Value {
         "tools": [face_mill(1), chamfer_mill(7)],
         "operations": [
             {"name": "face", "type": "pocket", "tool": 1, "polygon": [[-14, -9], [14, -9], [14, 9], [-14, 9]],
-             "heights": {"clearance": 10, "retract": 2, "top": 0.5, "bottom": 0}, "stepover": 7},
+             "heights": {"clearance": 10, "retract": 2, "top": 0.5, "bottom": 0}, "stepover": 7, "ramp_angle_deg": 2},
             {"name": "deburr", "type": "chamfer", "tool": 7, "polygon": [[-15, -10], [15, -10], [15, 10], [-15, 10]],
              "heights": {"clearance": 10, "retract": 2, "top": 0}, "width": width}
         ]
@@ -535,4 +535,27 @@ fn hostile_chamfers_and_chamfer_mills_are_refused() {
     let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
     assert_clean(&r);
     assert_eq!(r["operations"][0]["kind"], "indexed chamfer", "{r}");
+}
+
+#[test]
+fn face_mills_ramp_in_and_chamfer_mills_never_rough() {
+    // A face mill's inserts do not cut at its centre: a pocket that plunges it straight down is
+    // refused, and with a ramp it runs clean. A chamfer mill's point leaves ridges between
+    // roughing passes, so roughing with it is refused; so is roughing with a face mill.
+    let mut s = plate(true);
+    let refused = |s: &mut Session, job: Value, needle: &str| {
+        let e = s.execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
+        assert!(matches!(e, EngineError::BadParams { .. }) && e.to_string().contains(needle), "{needle}: {e}");
+    };
+    let mut job = chamfer_job(1.0);
+    job["operations"][0].as_object_mut().unwrap().remove("ramp_angle_deg");
+    refused(&mut s, job, "ramp");
+    let r = run(&mut s, "cam.job", json!({"job": chamfer_job(1.0), "dry_run": true}));
+    assert_clean(&r);
+    for tool in [7, 1] {
+        let mut job = chamfer_job(1.0);
+        job["operations"] = json!([{"name": "rough", "type": "roughing", "tool": tool, "heights": {"clearance": 10, "retract": 2, "top": 1, "bottom": -3},
+                                    "stepdown": 1, "stepover": 2, "boundary": {"rect": [[-18, -13], [18, 13]]}}]);
+        refused(&mut s, job, "rough with an end mill");
+    }
 }
