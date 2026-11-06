@@ -168,3 +168,71 @@ rotary letter's lowest and highest angle), `bounds` and `errors` (the first line
 cannot read). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
 elsewhere are read on a best-effort basis and stop at the first block it cannot follow
 (incremental coordinates, for one).
+
+## Pictures and extents for agents
+
+An agent driving SolidCraft over MCP cannot open the HTML preview, but it can look at a PNG and
+read numbers. Three things let it check a toolpath before it writes G-code.
+
+**Extents in every reply.** Each operation of a `cam.job` reply carries `extents`, in work
+coordinates (the design less `origin`): `all` (the tool tip's lowest and highest X, Y, Z over
+every move, rapids included), `cut` (over the feed moves only, each from where it starts, so a
+plunge from the retract height counts), `rotary` (each rotary axis's lowest and highest angle in
+degrees as the machine turns it, chained from one operation to the next as the program runs
+them) and `summary`, the same in one line:
+
+```text
+cut X -14..14 Y -14..14 Z 0..15; all moves X -14..14 Y -14..14 Z 0..30; A 0..360°
+```
+
+A cut below the part's floor, rapids lower than the clearance or an A range larger than the
+table allows shows here without a picture.
+
+**Pictures from `cam.job`.**
+
+| Key | Meaning |
+| --- | --- |
+| `image` | A PNG of the part with every toolpath drawn over it. Written in a dry run too (it is not the program); never when the checks refuse the call. |
+| `images_dir` | A folder (made if missing) for one PNG per operation: `01-<name>.png`, `02-<name>.png`, … in program order. |
+| `view` | `iso`, `top`, `bottom`, `front`, `back`, `left` or `right`. Default: `iso`; on a machine with a rotary axis, `front` (from -Y, the A axis level across the picture). |
+| `width`, `height` | 16 to 4096 pixels (default 960 × 600). |
+
+`view`, `width` and `height` without `image` or `images_dir` are refused. The paths are checked
+against the session's folders before anything is computed, like `output`.
+
+The part is the design as the MCP `screenshot` tool draws it (without the ground grid and the
+origin's axes), by the renderer the host installed or, headless without one, the CPU rasterizer:
+no GPU is needed. Drawn over it, with the same camera:
+
+- cutting moves as solid lines, one colour per operation (orange, purple, teal, magenta, ochre,
+  brown, pink, gold, then round again);
+- rapids dashed and lighter, plunges (feeding down the tool axis) darker and thicker;
+- entries, where a cut starts after a rapid, as ringed dots;
+- every stretch the part hides from the camera faint, so the far side of a 4th-axis path shows
+  without hiding the near side;
+- the tool, grey, where the first operation drawn starts its first cut;
+- work zero's X, Y and Z as red, green and blue arrows;
+- each rotary table's axis as a dark dash-dot line with a ring whose arrow turns as a positive
+  angle turns the part (a reversed axis's the other way);
+- a legend in the top-left corner: the job's name and view, and each operation with its number,
+  type and tool.
+
+The reply's `images` says how it was drawn: `view`, `width`, `height`, `renderer` (what drew the
+part), `camera` (in design coordinates, as `view.apply {camera}` and the `screenshot` tool's
+`camera` take it, to see the same view of the design alone), `image`, `images`, `legend` (each
+operation's colour by name and as `#rrggbb`) and `key` (how to read the picture, in words).
+
+**`cam.view` and the `screenshot` tool.** `cam.view {job | job_path, path, op?, view?, width?,
+height?}` plans and checks the job as `cam.job {dry_run: true}` does, writes no G-code, and draws
+one picture to `path`: the whole job, or with `op` the operation of that name alone (an unknown
+name is refused with the job's operation names). It returns `path`, `image` (as above),
+`operations` (each `name`, `kind`, `drawn` and `extents`), `passed`, `failures` and `notes`.
+
+The MCP `screenshot` tool takes `cam_job` (a job object) or `cam_job_path` (its file), and
+`cam_op`, with `view`, `width`, `height` and `path` as usual: it runs `cam.view` and returns the
+picture as an image with that reply as text. `camera`, `grid`, `axes` and `source` do not go with
+a CAM picture and are refused. A few calls take an agent from a modelled part to checked G-code:
+
+1. `screenshot {cam_job_path: "part.cam.json"}`: look at the toolpaths and read the extents;
+2. change the job until the picture, the extents and `passed` are right;
+3. `execute cam.job {job_path: "part.cam.json", output: "part.tap"}`: write the program.

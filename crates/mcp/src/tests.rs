@@ -3916,3 +3916,39 @@ fn compact_output_follows_the_apps_preference() {
     let mut s = Server::new(app(vec![not_running])).with_options(crate::Options { compact: true });
     assert!(inspect_design_is_compact(&mut s));
 }
+
+/// `screenshot {cam_job}`: an agent sees a CAM job's toolpaths over the part as an image, with
+/// the job's extents and checks as text, and no G-code written; arguments that do not go with
+/// a CAM picture are refused.
+#[test]
+fn a_screenshot_shows_a_cam_jobs_toolpaths() {
+    let mut s = server();
+    tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 20, "width": 20, "height": 10, "corner": [-10, -10, -10]}}));
+    let job = json!({
+        "machine": "3axis",
+        "post": "linuxcnc_4axis",
+        "tools": [{"number": 1, "kind": "flat_endmill", "diameter": 4, "flute_length": 10, "spindle_rpm": 10000, "feed": 600, "plunge_feed": 150}],
+        "operations": [{
+            "name": "outline", "type": "contour", "tool": 1, "polygon": [[-10, -10], [10, -10], [10, 10], [-10, 10]],
+            "heights": {"clearance": 20, "retract": 5, "top": 0, "bottom": -3}, "stepdown": 1.5
+        }]
+    });
+    let r = raw_tool(&mut s, "screenshot", json!({"cam_job": job, "view": "top", "width": 160, "height": 120}));
+    let content = &r["result"]["content"];
+    assert_ne!(r["result"]["isError"], json!(true), "{r}");
+    assert_eq!(content[0]["type"], "image", "{r}");
+    assert!(content[0]["data"].as_str().unwrap().starts_with("iVBORw0KGgo"), "not a PNG");
+    let info: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!((info["source"].as_str(), info["passed"].as_bool()), (Some("cam"), Some(true)), "{info}");
+    assert_eq!(info["image"]["view"], "top", "{info}");
+    assert!(info["operations"][0]["extents"]["summary"].as_str().is_some_and(|t| t.starts_with("cut X")), "{info}");
+    assert!(info["path"].is_null(), "the scratch picture is not kept: {info}");
+    for bad in
+        [json!({"cam_job": job, "camera": {"target": [0, 0, 0], "yaw": 0, "pitch": 0, "distance": 100}}), json!({"cam_job": job, "grid": false})]
+    {
+        let r = raw_tool(&mut s, "screenshot", bad);
+        assert_eq!(r["result"]["isError"], json!(true), "{r}");
+    }
+    let r = raw_tool(&mut s, "screenshot", json!({"cam_job": job, "cam_op": "nope"}));
+    assert!(r["result"]["content"][0]["text"].as_str().is_some_and(|t| t.contains("`outline`")), "{r}");
+}

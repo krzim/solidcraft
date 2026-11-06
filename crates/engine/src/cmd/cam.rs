@@ -946,6 +946,13 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
 fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.job";
     let params: CamJobParams = parse(cmd, p, "")?;
+    let reply = run_job(s, cmd, params, None)?;
+    serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+/// `cam.job` (or `cam.view`, as `cmd`) with `params`; with `only`, its pictures draw that
+/// operation alone.
+fn run_job(s: &mut Session, cmd: &str, params: CamJobParams, only: Option<&str>) -> Result<CamJobReply> {
     let dry_run = params.dry_run.unwrap_or(false);
     let allow_unsafe = params.allow_unsafe.unwrap_or(false);
 
@@ -966,6 +973,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(bad(cmd, "`output` and `preview` must be different files"));
         }
     }
+    let wanted = pictures::Request::of(cmd, &params, only)?;
     let (job, base): (CamJob, Option<PathBuf>) = match (params.job, &params.job_path) {
         (Some(_), Some(_)) => return Err(bad(cmd, "give `job` or `job_path`, not both")),
         (None, None) => return Err(bad(cmd, "give the `job` (an object) or a `job_path` (a .json file)")),
@@ -1079,6 +1087,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
 
+    pictures::extents(&machine, &mut planned);
     let mut outputs = Outputs::default();
     if !dry_run {
         if let Some(path) = &output {
@@ -1099,6 +1108,11 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
             outputs.preview = Some(path.clone());
         }
     }
+    let setting = pictures::Setting { machine: &machine, origin, surface: &surfaces.all, tol, name: &name };
+    let images = pictures::write(cmd, s, &wanted, &setting, &planned).map_err(|e| match (e, &outputs.gcode) {
+        (EngineError::Other(m), Some(g)) => EngineError::Other(format!("{m} (the G-code was written to {g})")),
+        (e, _) => e,
+    })?;
     let reply = CamJobReply {
         name,
         machine: machine.name.clone(),
@@ -1114,9 +1128,10 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         dry_run,
         outputs,
         notes,
+        images,
         param_warnings: Vec::new(),
     };
-    serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
+    Ok(reply)
 }
 
 /// `text` safe to put inside HTML.
@@ -1363,6 +1378,9 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
     reply.rapid_minutes = params.rapid_rate.map(|r| reply.rapid_length / r);
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
+
+#[path = "cam_image.rs"]
+pub(super) mod pictures;
 
 #[cfg(test)]
 #[path = "cam_tests.rs"]

@@ -43,6 +43,24 @@ pub struct CamJobParams {
     /// which). Default: false.
     #[serde(default)]
     pub allow_unsafe: Option<bool>,
+    /// Where to write a PNG of the part with every toolpath drawn over it, for an agent to look
+    /// at; written in a dry run too. Default: none.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// A folder to write one PNG per operation into (`01-<name>.png`, ...); written in a dry
+    /// run too. Default: none.
+    #[serde(default)]
+    pub images_dir: Option<String>,
+    /// The view of `image` and `images_dir`: `iso`, `top`, `bottom`, `front`, `back`, `left` or
+    /// `right`. Default: `iso`, or `front` (from -Y, the A axis level) with a rotary axis.
+    #[serde(default)]
+    pub view: Option<String>,
+    /// Width of the pictures in pixels, 16 to 4096. Default: 960.
+    #[serde(default)]
+    pub width: Option<u32>,
+    /// Height of the pictures in pixels, 16 to 4096. Default: 600.
+    #[serde(default)]
+    pub height: Option<u32>,
 }
 
 /// A CAM job: what is machined, on which machine, through which post, with which tools.
@@ -566,6 +584,9 @@ pub struct CamJobReply {
     pub outputs: Outputs,
     /// How the bodies were tessellated, and anything else worth knowing.
     pub notes: Vec<String>,
+    /// The pictures drawn (`image`, `images_dir`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<super::cam_image::ImagesReport>,
     /// In the warn parameter-check mode: what the call's parameters got wrong.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub param_warnings: Vec<String>,
@@ -595,6 +616,8 @@ pub struct OperationReport {
     /// Moves with a holder collision.
     pub holder_collisions: usize,
     pub warnings: Vec<String>,
+    /// Where its toolpath goes, in work coordinates.
+    pub extents: super::cam_image::ToolpathExtents,
 }
 
 /// The program as written against its toolpaths.

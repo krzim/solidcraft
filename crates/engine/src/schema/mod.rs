@@ -58,6 +58,7 @@ pub mod appearance;
 pub mod bom;
 pub mod browser;
 pub mod cam;
+pub mod cam_image;
 pub mod canvas;
 pub mod clearance;
 pub mod compare;
