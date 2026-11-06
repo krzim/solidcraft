@@ -14,7 +14,9 @@
 //!   not tracked, so a rapid below the stock's top over it fails), except on a retract straight
 //!   up the tool's axis, which only passes through room the tool already fills. The caller
 //!   may say what is left of it as each operation starts ([`check_rapids_staged`]: a box
-//!   faced all over is lower after the facing). The part does not count against such a
+//!   faced all over is lower after the facing). Nor does the stock count against a rapid
+//!   back down the same line within the same operation, no deeper than that retract started
+//!   (a peck drill going back into its hole). The part does not count against such a
 //!   retract either when the block's operation cuts what the model does not show on purpose
 //!   (`unchecked`, an operation without a gouge check: a deburr of a sharp-edged model): it
 //!   leaves the cut where its own feed moves ended;
@@ -347,6 +349,9 @@ pub fn check_rapids_staged(
     // The tool number of block `i`, when its operation is known.
     let tool_at = |i: usize| owner.as_ref().and_then(|o| o.get(i)).and_then(|&k| tools.get(k)).map(|t| t.number);
     let mut state: Option<State> = None;
+    // The operation and the start of its last retract straight up the tool's axis, which a
+    // rapid may go back down along as far as it started (a peck drill's way back into its hole).
+    let mut withdrawn: Option<(usize, Pose)> = None;
     for (i, b) in blocks.iter().enumerate() {
         let (line, linear, rotary, tcp, rapid) = match b {
             JointWords::Rapid { line, linear, rotary, tcp } => (*line, *linear, rotary, *tcp, true),
@@ -377,7 +382,12 @@ pub fn check_rapids_staged(
                     _ => stock,
                 };
                 let deliberate = owner.is_some() && unchecked.get(k).copied().unwrap_or(false);
+                let back_in = owner.is_some() && withdrawn.as_ref().is_some_and(|(w, bottom)| *w == k && back_down(&poses, bottom));
+                let left = if back_in { None } else { left };
                 check_block(&mut out, &poses, (line, owner.as_ref().map(|_| k)), tool, cutter, obstacles, left, deliberate, tol, step)?;
+                if owner.is_some() && retract(&poses) {
+                    withdrawn = poses.first().map(|p| (k, *p));
+                }
                 let turns = from.is_some_and(|f| f.rotary.iter().zip(&to.rotary).any(|(a, b)| (a - b).abs() > 1e-9));
                 if turns {
                     let deepest = zones
@@ -471,6 +481,16 @@ fn check_block(
         }
     }
     Ok(())
+}
+
+/// Whether `poses` (a rapid's samples) run straight back down the tool axis of `bottom` (the
+/// start of a retract), along its line and no deeper than it.
+fn back_down(poses: &[Pose], bottom: &Pose) -> bool {
+    let (Some(a), Some(b)) = (poses.first(), poses.last()) else { return false };
+    poses.len() > 1
+        && poses.iter().all(|p| p.axis_angle(bottom) <= 1e-9 && (p.tip - bottom.tip).cross(bottom.axis).len() <= 1e-6)
+        && (b.tip - a.tip).dot(bottom.axis) < 0.0
+        && (b.tip - bottom.tip).dot(bottom.axis) >= -1e-9
 }
 
 /// Whether `poses` (a rapid's samples) run straight out along the tool axis of the first,

@@ -375,3 +375,43 @@ fn a_retract_out_of_an_unchecked_cut_is_not_a_crash() {
     // One flag per operation, or none.
     assert!(check_rapids_staged(&text, &across, &post, &machine, &part_and_clamp(), &part(), None, &[], &[true, true], 0.01, RAPID_STEP).is_err());
 }
+
+/// A peck drill rapids out of its hole and back down it to just above the depth it reached:
+/// that way back is through room it has cut, so the stock does not count against it. A rapid
+/// down past where the retract started, or down another line, still does.
+#[test]
+fn a_peck_rapid_back_into_its_own_hole_is_not_in_the_stock() {
+    let machine = Machine::three_axis();
+    let post = Post5::mach3_4axis();
+    let stock = Stock::Box { min: Vec3::new(-12.0, -12.0, -10.0), max: Vec3::new(12.0, 12.0, 0.0) };
+    // The part is far off: only the stock is in the way.
+    let hole = block(Vec3::new(100.0, 100.0, -10.0), Vec3::new(101.0, 101.0, -9.0));
+    let pecks = |back: f64, x: f64| {
+        let moves = vec![
+            Move::Rapid { to: Vec3::new(0.0, 0.0, 10.0) },
+            Move::Rapid { to: Vec3::new(0.0, 0.0, 2.0) },
+            Move::Feed { to: Vec3::new(0.0, 0.0, -3.0), feed: 200.0 },
+            Move::Rapid { to: Vec3::new(0.0, 0.0, 2.0) },
+            Move::Rapid { to: Vec3::new(x, 0.0, 2.0) },
+            Move::Rapid { to: Vec3::new(x, 0.0, back) },
+            Move::Feed { to: Vec3::new(x, 0.0, -6.0), feed: 200.0 },
+            Move::Rapid { to: Vec3::new(x, 0.0, 10.0) },
+        ];
+        let p = program(vec![MachineOperation::Indexed(IndexedOperation {
+            name: "pecks".into(),
+            tool: Tool::new(3, ToolKind::Drill, 5.0, 30.0),
+            spindle_rpm: 6000.0,
+            coolant: false,
+            rotary: Vec::new(),
+            path: Toolpath { moves },
+        })]);
+        let text = emit_program(&p, &post, &machine).unwrap();
+        check_rapids(&text, &p, &post, &machine, &hole, &hole, Some(&stock), 0.01, RAPID_STEP).unwrap()
+    };
+    let ok = pecks(-2.5, 0.0);
+    assert!(ok.pass(), "{ok:?}");
+    let deeper = pecks(-3.5, 0.0);
+    assert!(deeper.hits.iter().any(|h| h.kind == RapidHitKind::Stock && h.depth > 0.4), "{deeper:?}");
+    let elsewhere = pecks(-2.5, 6.0);
+    assert!(elsewhere.hits.iter().any(|h| h.kind == RapidHitKind::Stock), "{elsewhere:?}");
+}
