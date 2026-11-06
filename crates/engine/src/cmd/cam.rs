@@ -545,6 +545,8 @@ struct Resolved {
 
 /// Everything an operation is planned with.
 struct Ctx<'a> {
+    /// What an adaptive operation adds to its report, handed from its planning to the report.
+    adaptive: std::cell::RefCell<Option<(crate::schema::cam_adaptive::AdaptiveReport, Vec<String>)>>,
     cmd: &'a str,
     s: &'a Session,
     machine: &'a Machine,
@@ -643,6 +645,8 @@ fn or_tool(v: Option<f64>, tool: Option<f64>, default: f64) -> f64 {
 /// A 3-axis operation planned in `frame` on `surface` (the part in that frame).
 fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Result<(Toolpath, Resolved, &'static str)> {
     match op {
+        Op3Spec::Adaptive(o) => adaptive::plan(ctx, o, frame),
+        Op3Spec::AdaptiveRoughing(o) => adaptive::plan_roughing(ctx, o, surface),
         Op3Spec::Contour(o) => {
             let c = o.common();
             let r = ctx.resolve(&c)?;
@@ -733,6 +737,8 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
 
 fn common3(op: &Op3Spec) -> Common<'_> {
     match op {
+        Op3Spec::Adaptive(o) => o.common(),
+        Op3Spec::AdaptiveRoughing(o) => o.common(),
         Op3Spec::Contour(o) => o.common(),
         Op3Spec::Pocket(o) => o.common(),
         Op3Spec::Parallel(o) => o.common(),
@@ -853,6 +859,11 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             a_deg,
             ..OperationReport::default()
         };
+        let mut report = report;
+        if let Some((extra, warnings)) = ctx.adaptive.borrow_mut().take() {
+            report.adaptive = Some(extra);
+            report.warnings.extend(warnings);
+        }
         let axes = match a_deg {
             Some(a) => format!("3+1 A{}°", num(a)),
             None => "3-axis".into(),
@@ -875,6 +886,8 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
         Planned { op: MachineOperation::Continuous(op), poses: path, tool: r.tool, gouge_check: c.gouge_check, report, axes: "4-axis".into() }
     };
     match spec {
+        OperationSpec::Adaptive(o) => indexed(&Op3Spec::Adaptive(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::AdaptiveRoughing(o) => indexed(&Op3Spec::AdaptiveRoughing(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Contour(o) => indexed(&Op3Spec::Contour(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Pocket(o) => indexed(&Op3Spec::Pocket(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Parallel(o) => indexed(&Op3Spec::Parallel(o.clone()), vec![0.0; rotaries], None),
@@ -1005,7 +1018,7 @@ fn job(s: &mut Session, p: &Value) -> Result<Value> {
         notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
     }
 
-    let ctx = Ctx { cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, origin, tol };
+    let ctx = Ctx { adaptive: Default::default(), cmd, s, machine: &machine, tools: &tools, part: &surfaces.part, origin, tol };
     let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
     for spec in &job.operations {
         planned.push(plan(&ctx, spec, post.base.arc_tolerance)?);
@@ -1364,6 +1377,8 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
 
+#[path = "cam_adaptive.rs"]
+mod adaptive;
 #[cfg(test)]
 #[path = "cam_tests.rs"]
 mod tests;

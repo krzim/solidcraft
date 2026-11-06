@@ -392,3 +392,124 @@ fn hostile_jobs_are_refused_without_panics() {
     assert!(s.execute("cam.check", &json!({"path": junk, "rapid_rate": -1})).is_err());
     assert!(s.execute("cam.posts", &json!({"name": "nope"})).is_err());
 }
+
+/// A 40 mm block, its top at Z 0, with a 24 mm square pocket 3 mm deep.
+fn pocket_block() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 10, "corner": [-20, -20, -10], "body_name": "Block"}));
+    run(&mut s, "solid.box", json!({"length": 24, "width": 24, "height": 3, "corner": [-12, -12, -3], "operation": "cut"}));
+    s
+}
+
+fn adaptive_job(op: Value) -> Value {
+    json!({"name": "adaptive", "machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 6.0)], "operations": [op]})
+}
+
+fn adaptive_pocket_op() -> Value {
+    json!({"name": "clear", "type": "adaptive", "tool": 1, "polygon": [[-12, -12], [12, -12], [12, 12], [-12, 12]],
+           "heights": {"clearance": 20, "retract": 2, "top": 0, "bottom": -3}, "optimal_load": 0.6, "max_engagement_deg": 60})
+}
+
+/// The adaptive pocket is written, read back and gouge checked, never slots outside its helix,
+/// and is reported beside a plain offset pocket that does.
+#[test]
+fn an_adaptive_pocket_reads_back_and_reports_its_engagement() {
+    let mut s = pocket_block();
+    let r = run(&mut s, "cam.job", json!({"job": adaptive_job(adaptive_pocket_op()), "dry_run": true}));
+    assert_clean(&r);
+    let op = &r["operations"][0];
+    assert_eq!(op["kind"], "adaptive", "{op}");
+    let a = &op["adaptive"];
+    assert!(a["max_engagement_deg"].as_f64().is_some_and(|m| m > 20.0 && m <= 63.0), "{a}");
+    assert_eq!(a["full_slot_share"].as_f64(), Some(0.0), "{a}");
+    assert_eq!(a["limit_deg"].as_f64().map(f64::round), Some(60.0), "{a}");
+    assert!(a["helices"].as_u64().is_some_and(|h| h >= 1), "{a}");
+    let p = &a["pocket"];
+    assert!(p["max_engagement_deg"].as_f64().is_some_and(|m| m >= 170.0), "{a}");
+    assert!(p["full_slot_share"].as_f64().is_some_and(|f| f > 0.0), "{a}");
+    assert!(r["program_lines"].as_u64().is_some_and(|n| n > 100), "{r}");
+}
+
+/// Without engagement keys the limit follows the load (10% of the diameter here: 36.9° on a
+/// straight edge, the limit half as much again); `compare: false` plans no pocket.
+#[test]
+fn an_adaptive_pocket_takes_its_limits_from_the_load() {
+    let mut s = pocket_block();
+    let mut op = adaptive_pocket_op();
+    op.as_object_mut().unwrap().remove("max_engagement_deg");
+    op["compare"] = json!(false);
+    op["stepdown"] = json!(1.5);
+    let r = run(&mut s, "cam.job", json!({"job": adaptive_job(op), "dry_run": true}));
+    assert_clean(&r);
+    let a = &r["operations"][0]["adaptive"];
+    assert!(a["limit_deg"].as_f64().is_some_and(|l| (l - 55.3).abs() < 0.1), "{a}");
+    assert!(a.get("pocket").is_none(), "{a}");
+    assert_eq!(a["levels"].as_u64(), Some(2), "{a}");
+}
+
+/// 3D adaptive roughing of the dome over its block: entered from open air, read back and
+/// gouge checked, within the engagement limit.
+#[test]
+fn adaptive_roughing_of_the_dome_reads_back_and_passes_the_gouge_check() {
+    let mut s = dome();
+    let op = json!({"name": "rough", "type": "adaptive_roughing", "tool": 1,
+                    "heights": {"clearance": 30, "retract": 10, "top": 7, "bottom": 0.25}, "stepdown": 2.5,
+                    "optimal_load": 0.6, "max_engagement_deg": 60, "boundary": {"rect": [[-20, -20], [20, 20]]}});
+    let r = run(&mut s, "cam.job", json!({"job": adaptive_job(op), "dry_run": true}));
+    assert_clean(&r);
+    let op = &r["operations"][0];
+    assert_eq!(op["kind"], "adaptive_roughing", "{op}");
+    let a = &op["adaptive"];
+    assert!(a["max_engagement_deg"].as_f64().is_some_and(|m| m > 10.0 && m <= 63.0), "{a}");
+    assert_eq!(a["full_slot_share"].as_f64(), Some(0.0), "{a}");
+    assert!(a["levels"].as_u64().is_some_and(|l| l >= 3), "{a}");
+    assert_eq!(a["helices"].as_u64(), Some(0), "{a}");
+}
+
+/// Hostile adaptive operations are refused with an error, never a panic or a hang.
+#[test]
+fn hostile_adaptive_operations_are_refused() {
+    let mut s = pocket_block();
+    let with = |key: &str, v: Value| {
+        let mut op = adaptive_pocket_op();
+        op[key] = v;
+        json!({"job": adaptive_job(op), "dry_run": true})
+    };
+    let rough = |extra: Value| {
+        let mut op =
+            json!({"name": "r", "type": "adaptive_roughing", "tool": 1, "heights": {"clearance": 30, "retract": 10, "top": 0, "bottom": -1}});
+        if let (Some(o), Some(e)) = (op.as_object_mut(), extra.as_object()) {
+            o.extend(e.clone());
+        }
+        json!({"job": adaptive_job(op), "dry_run": true})
+    };
+    let cases = [
+        with("optimal_load", json!(-1)),
+        with("optimal_load", json!(7)),
+        with("max_engagement_deg", json!(1)),
+        with("max_engagement_deg", json!(500)),
+        with("min_engagement_deg", json!(90)),
+        with("helix_diameter", json!(20)),
+        with("ramp_angle_deg", json!(0)),
+        with("stepdown", json!(0)),
+        with("tolerance", json!(0)),
+        with("optimal_lode", json!(1)),
+        with("polygon", json!([[-1e5, -1e5], [1e5, -1e5], [1e5, 1e5], [-1e5, 1e5]])),
+        with("polygon", json!([[0, 0], [1, 0]])),
+        rough(json!({"heights": {"clearance": 30, "retract": 0.1, "top": 0, "bottom": -1}})),
+        rough(json!({"boundary": {"rect": [[-1e5, -1e5], [1e5, 1e5]]}})),
+        rough(json!({"flats": "yes"})),
+    ];
+    let start = std::time::Instant::now();
+    for p in &cases {
+        match s.execute("cam.job", p) {
+            Err(EngineError::Internal(_, msg)) => panic!("{p}: panicked: {msg}"),
+            Err(_) => {}
+            Ok(v) => panic!("{p}: accepted: {v}"),
+        }
+    }
+    assert!(start.elapsed().as_secs() < 60, "{:?}", start.elapsed());
+    // A helix with no room is refused, saying so.
+    let e = s.execute("cam.job", &with("polygon", json!([[-12, -3.5], [12, -3.5], [12, 3.5], [-12, 3.5]]))).unwrap_err();
+    assert!(e.to_string().contains("no room for the entry helix"), "{e}");
+}

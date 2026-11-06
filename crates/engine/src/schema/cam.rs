@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::cam_adaptive::{AdaptiveOp, AdaptiveReport, AdaptiveRoughingOp};
 use super::types::SketchRef;
 
 /// Plan and check a CAM job and write its G-code: toolpaths for every operation on the design's
@@ -220,6 +221,7 @@ macro_rules! operation {
         }
     };
 }
+pub(crate) use operation;
 
 /// What every operation has.
 #[derive(Clone, Copy, Debug)]
@@ -501,6 +503,8 @@ operation! {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Op3Spec {
+    Adaptive(AdaptiveOp),
+    AdaptiveRoughing(AdaptiveRoughingOp),
     Contour(ContourOp),
     Pocket(PocketOp),
     Parallel(ParallelOp),
@@ -515,7 +519,8 @@ pub enum Op3Spec {
 pub struct IndexedOp {
     /// The A angle, degrees.
     pub a_deg: f64,
-    /// The 3-axis operation (`contour`, `pocket`, `parallel`, `roughing` or `waterline`).
+    /// The 3-axis operation (`adaptive`, `adaptive_roughing`, `contour`, `pocket`, `parallel`,
+    /// `roughing` or `waterline`).
     pub operation: Box<Op3Spec>,
 }
 
@@ -523,6 +528,8 @@ pub struct IndexedOp {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OperationSpec {
+    Adaptive(AdaptiveOp),
+    AdaptiveRoughing(AdaptiveRoughingOp),
     Contour(ContourOp),
     Pocket(PocketOp),
     Parallel(ParallelOp),
@@ -595,6 +602,9 @@ pub struct OperationReport {
     /// Moves with a holder collision.
     pub holder_collisions: usize,
     pub warnings: Vec<String>,
+    /// Adaptive operations: the engagement measured along the path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive: Option<AdaptiveReport>,
 }
 
 /// The program as written against its toolpaths.

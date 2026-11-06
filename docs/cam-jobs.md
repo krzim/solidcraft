@@ -139,6 +139,8 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `parallel` | `heights` (`bottom` is the floor); `stepover` (tool's, else 10% of its diameter); `angle_deg` (0); `boundary?: {rect?: [[x, y], [x, y]], polygon?}` (the part's extent); `stock_to_leave` (0); `step` (a quarter of the diameter); `tolerance`; `zigzag` (true) |
 | `roughing` | `heights` (`top` is the stock's top); `stepdown`; `stepover`; `angle_deg`; `boundary`; `stock_to_leave` (0.25); `step`; `tolerance`; `zigzag` |
 | `waterline` | `heights` (levels from `top` to `bottom`); `stepdown` (tool's, else a quarter of its diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` (true) |
+| `adaptive` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown` (tool's, else its diameter); `optimal_load` (tool's `stepover`, else 10% of its diameter); `min_engagement_deg`, `max_engagement_deg` (from the load: see [Adaptive clearing](#adaptive-clearing)); `helix_diameter` (80% of the tool's); `ramp_angle_deg` (2); `climb`; `stock_to_leave` (0); `tolerance`; `compare` (true) |
+| `adaptive_roughing` | `heights` (`top` is the stock's top); `stepdown`; `optimal_load`; `min_engagement_deg`, `max_engagement_deg`; `helix_diameter`; `ramp_angle_deg`; `climb`; `boundary` (the stock's extent; the part's extent); `stock_to_leave` (0.25); `flats` (true); `tolerance` |
 | `indexed` | `a_deg` and `operation`: any of the five above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
 | `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}` or `{type: "helix", pitch}`; `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
 | `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
@@ -168,3 +170,43 @@ rotary letter's lowest and highest angle), `bounds` and `errors` (the first line
 cannot read). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
 elsewhere are read on a best-effort basis and stop at the first block it cannot follow
 (incremental coordinates, for one).
+
+## Adaptive clearing
+
+`adaptive` (2D, like `pocket`) and `adaptive_roughing` (3D, like `roughing`) clear material with
+the tool's engagement held down: the share of its circumference in material never goes above
+`max_engagement_deg` outside an entry helix, so the tool never runs in a full slot. This suits a
+small, not very rigid mill best: take a deep `stepdown` (the flute length the tool's data allows)
+with a light `optimal_load` (5% to 15% of the diameter) and the full feed.
+
+The path is planned on a raster of the material a sixteenth of the tool radius fine, with exact
+distances to the path already planned near the edge of the cut. It is walked in short steps,
+turning at most 25° a step, so its corners are rounded; at each step it takes the heading whose
+engagement is nearest the optimal load's (on a straight edge `acos(1 − load / radius)`), with the
+material on the climb (or conventional) side, and never one above the limit. Where a walk can
+cut no more, the next starts where cleared space meets material, reached by a feed through
+cleared material when there is one with the tool down, by lifting to `retract` otherwise.
+
+- **Entry.** Where the tool can reach the material from open air (round the stock in
+  `adaptive_roughing`) it goes down outside it. Material enclosed on every side is entered with
+  a helix of `helix_diameter` at `ramp_angle_deg`, then a circle at the level; with no room for
+  the helix the operation is refused, saying so.
+- **Levels.** `adaptive` cuts the same path at every depth pass. `adaptive_roughing` plans each
+  level where the dropped cutter (grown by `stock_to_leave`) is at or below it; with `flats` it
+  adds a level at every flat area of the part (raised by the stock to leave).
+- **Corners.** An inside corner sharper than the limit allows is not driven into: a fillet
+  somewhat larger than the tool's is left there for a finishing contour (`left_area` in the
+  report).
+
+Defaults: `optimal_load` is the tool's `stepover` (a tool library's adaptive start values), else
+10% of its diameter; `max_engagement_deg` one and a half times the optimal load's engagement and
+at least 15° more than it; `min_engagement_deg` a third of it.
+
+Each adaptive operation's report carries `adaptive`, measured along the path as written,
+independently of the planner (exact containment in the profiles or stock, exact distances to
+every earlier move, the tool's circumference looked at in 1° steps): `max_engagement_deg`,
+`max_entry_engagement_deg`, `mean_engagement_deg`, `full_slot_share` (of the cutting time
+outside entries at 170° or more: 0), `entry_slot_share`, `limit_deg`, `levels`, `helices`,
+`lifts`, `left_area` and, for `adaptive` with `compare`, `pocket`: a plain offset pocket of the
+same profiles (stepover 40% of the diameter) measured the same way (`max_engagement_deg`,
+`full_slot_share`, `cut_length`, `cut_minutes`). Both operations also work inside `indexed`.
