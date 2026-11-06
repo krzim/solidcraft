@@ -84,7 +84,8 @@ pub struct CamJob {
     #[serde(default)]
     pub fixtures: Option<Vec<String>>,
     /// The machining tolerance in mm, 0.0001 to 1: how far a toolpath may be from the part, and
-    /// how deep a cut into it counts as a gouge. The bodies are tessellated at half of it.
+    /// how deep a cut into it counts as a gouge. The bodies are tessellated at a quarter of it,
+    /// and the 3D operations planned within the rest.
     /// Default: 0.01.
     #[serde(default)]
     pub tolerance: Option<f64>,
@@ -332,6 +333,11 @@ operation! {
         /// Every other pass runs back. Default: true.
         #[serde(default)]
         pub zigzag: Option<bool>,
+        /// Moves that go down at least this steeply, degrees from horizontal (0 to 90), are
+        /// plunges, slowed so the tool goes down no faster than the plunge feed; shallower ones
+        /// run at the cut feed. 0 slows every move that goes down. Default: 70.
+        #[serde(default)]
+        pub descent_limit_deg: Option<f64>,
     }
 }
 
@@ -590,8 +596,12 @@ pub struct OperationReport {
     /// The A angle it is indexed at, degrees (indexed operations only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub a_deg: Option<f64>,
-    /// The deepest gouge found, mm beyond the tolerance (0: none).
+    /// How deep its deepest gouge is in the tessellated part, mm (0: none deeper than the check
+    /// allows).
     pub gouge: f64,
+    /// Where that gouge is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gouge_at: Option<GougeAt>,
     /// Moves with a holder collision.
     pub holder_collisions: usize,
     pub warnings: Vec<String>,
@@ -616,15 +626,38 @@ pub struct ReadbackReport {
 /// The gouge check.
 #[derive(Debug, Default, Serialize, JsonSchema)]
 pub struct GougeReport {
-    /// The deepest gouge of any operation, mm (0: none).
+    /// The deepest gouge of any operation, mm into the tessellated part (0: none deeper than
+    /// `allowed`): the deepest point of the part inside the cutter, measured to the cutter.
     pub worst: f64,
-    /// Depths up to this count as touching, mm.
+    /// The job's tolerance, mm.
     pub tolerance: f64,
+    /// How far the tessellated part may be from the exact one, mm.
+    pub tessellation: f64,
+    /// Depths into the tessellated part up to this count as touching, mm: the tolerance less
+    /// the tessellation, so no cut passed is deeper than the tolerance into the exact part.
+    pub allowed: f64,
     /// Moves with a gouge.
     pub hits: usize,
+    /// Where the deepest gouge is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<GougeAt>,
     /// Operations not checked (`gouge_check: false`).
     pub skipped: Vec<String>,
     pub pass: bool,
+}
+
+/// Where a gouge is.
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+pub struct GougeAt {
+    /// The operation's name.
+    pub operation: String,
+    /// The move of the operation's toolpath (counted from 0) along which it is.
+    pub move_index: usize,
+    /// The line of the program (counted from 1) that ends that move, when it is found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    /// The tool tip at the deepest point, work coordinates, mm.
+    pub xyz: [f64; 3],
 }
 
 /// The files `cam.job` wrote.

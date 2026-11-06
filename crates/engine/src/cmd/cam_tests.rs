@@ -194,6 +194,75 @@ fn a_pocket_indexed_at_90_degrees_cuts_the_side_and_keeps_its_arcs() {
     let r = run(&mut solid, "cam.job", json!({"job": side_pocket_job(), "output": out, "allow_unsafe": true}));
     assert_eq!(r["passed"], false);
     assert!(PathBuf::from(&out).exists());
+    // The reply says where: the operation, the move, the line of the program that ends it, and
+    // the tool tip in work coordinates, there and in the failure.
+    let at = &r["gouge"]["at"];
+    assert_eq!(at["operation"], "side pocket", "{r}");
+    let moves = r["operations"][0]["moves"].as_u64().unwrap();
+    assert!(at["move_index"].as_u64().is_some_and(|m| m < moves), "{r}");
+    let line = at["line"].as_u64().unwrap_or_else(|| panic!("no line: {r}")) as usize;
+    let text = std::fs::read_to_string(&out).unwrap();
+    let written = text.lines().nth(line - 1).unwrap();
+    assert!(written.starts_with('G') || written.starts_with('X') || written.starts_with('Y') || written.starts_with('Z'), "line {line}: {written}");
+    // The tip is in the pocket, at its floor 5 mm into the +Y face.
+    let xyz: Vec<f64> = at["xyz"].as_array().unwrap().iter().filter_map(Value::as_f64).collect();
+    assert!(xyz.len() == 3 && xyz[0].abs() <= 6.0 + 1e-6 && (xyz[1] - 10.0).abs() <= 1e-6, "{xyz:?}");
+    assert_eq!(r["operations"][0]["gouge_at"]["move_index"], at["move_index"], "{r}");
+    let failure = r["failures"].as_array().unwrap().iter().filter_map(Value::as_str).find(|f| f.starts_with("gouge")).unwrap();
+    assert!(failure.contains("side pocket") && failure.contains(&format!("G-code line {line}")) && failure.contains("work coordinates"), "{failure}");
+    assert!(r["gouge"]["allowed"].as_f64().is_some_and(|a| (a - 0.0075).abs() < 1e-12), "{r}");
+}
+
+/// A plate with a 6 mm hole through it.
+fn plate_with_a_hole() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 30, "width": 20, "height": 15, "corner": [-15, -10, -15], "body_name": "Plate"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 3, "height": 20, "axis": "Z", "base": [0, 0, -17], "operation": "cut"}));
+    s
+}
+
+/// A 4 mm end mill with a shank of its own diameter, cutting round the inside of a 6 mm hole:
+/// its shank above the flutes runs along the wall the cutter has just cut. That is no holder
+/// collision (it used to be refused, with more collisions than the operation has moves), and a
+/// shank wider than the cutter still is one, counted in moves.
+#[test]
+fn a_shank_as_wide_as_the_cutter_passes_the_hole_it_cuts() {
+    let mut s = plate_with_a_hole();
+    let mut tool = flat(4, 4.0);
+    tool["flute_length"] = json!(12);
+    tool["shank_diameter"] = json!(4);
+    tool["stickout"] = json!(20);
+    tool["holder"] = json!([{"diameter": 34, "length": 4}, {"diameter": 34, "length": 18}]);
+    let mut job = json!({
+        "machine": "3axis",
+        "post": "mach3_4axis",
+        "tools": [tool],
+        "operations": [{
+            "name": "hole", "type": "contour", "tool": 4, "polygon": circle(3.0, 256), "side": "inside",
+            "heights": {"clearance": 10, "retract": 2, "top": 0, "bottom": -15.3}, "stepdown": 1, "ramp_angle_deg": 2
+        }]
+    });
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    assert_eq!(r["holder_collisions"], 0, "{r}");
+    // Wider than the cutter, the shank is into the wall.
+    job["tools"][0]["shank_diameter"] = json!(5);
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_eq!(r["passed"], false, "{r}");
+    let (hits, moves) = (r["operations"][0]["holder_collisions"].as_u64().unwrap(), r["operations"][0]["moves"].as_u64().unwrap());
+    assert!(hits > 0 && hits <= moves, "{hits} collisions in {moves} moves");
+}
+
+/// The points of a circle of radius `r` about the origin, `n` round.
+fn circle(r: f64, n: usize) -> Value {
+    json!(
+        (0..n)
+            .map(|k| {
+                let a = std::f64::consts::TAU * k as f64 / n as f64;
+                [r * a.cos(), r * a.sin()]
+            })
+            .collect::<Vec<_>>()
+    )
 }
 
 #[test]
@@ -355,6 +424,8 @@ fn hostile_jobs_are_refused_without_panics() {
         job(&|j| j["operations"][0]["feeds"] = json!({"cut": 0, "plunge": 100})),
         job(&|j| j["operations"][0]["spindle_rpm"] = json!(-5)),
         job(&|j| j["operations"][0]["step"] = json!(1e-12)),
+        job(&|j| j["operations"][0]["descent_limit_deg"] = json!(91)),
+        job(&|j| j["operations"][0]["descent_limit_deg"] = json!(-1)),
         job(&|j| j["operations"][0]["type"] = json!("rotary_finish")),
         job(
             &|j| j["operations"][0] = json!({"name": "r", "type": "rotary_finish", "tool": 2, "pattern": {"type": "lines", "angle_step_deg": 10}, "clearance": 30, "retract": 20}),

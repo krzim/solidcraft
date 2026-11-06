@@ -120,6 +120,11 @@ impl Toolpath5 {
     /// A 3-axis toolpath given in `frame` (its tool axis the frame's Z), in the frame's outer
     /// coordinates: the tool axis is the frame's Z throughout. Arcs become lines within `tol`.
     pub fn from_frame(path: &Toolpath, frame: &Frame, tol: f64) -> Result<Toolpath5> {
+        Toolpath5::from_frame_mapped(path, frame, tol).map(|(p, _)| p)
+    }
+
+    /// [`Toolpath5::from_frame`], with the index in `path` of the move each move comes from.
+    pub fn from_frame_mapped(path: &Toolpath, frame: &Frame, tol: f64) -> Result<(Toolpath5, Vec<usize>)> {
         frame.validate()?;
         if !(tol > 0.0) || !tol.is_finite() {
             return invalid("the arc tolerance must be above 0");
@@ -129,8 +134,9 @@ impl Toolpath5 {
         }
         let axis = frame.z;
         let mut out = Vec::with_capacity(path.moves.len());
+        let mut from = Vec::with_capacity(path.moves.len());
         let mut pos: Option<Vec3> = None;
-        for m in &path.moves {
+        for (i, m) in path.moves.iter().enumerate() {
             match *m {
                 Move::Rapid { to } => out.push(Move5::Rapid { to: Pose::new(frame.to_world(to), axis) }),
                 Move::Feed { to, feed } => out.push(Move5::Feed { to: Pose::new(frame.to_world(to), axis), feed }),
@@ -148,11 +154,12 @@ impl Toolpath5 {
             if let Some(to) = m.target() {
                 pos = Some(to);
             }
+            from.resize(out.len(), i);
             if out.len() > MAX_MOVES {
                 return Err(CamError::TooLarge(format!("the toolpath has more than {MAX_MOVES} moves")));
             }
         }
-        Ok(Toolpath5 { moves: out })
+        Ok((Toolpath5 { moves: out }, from))
     }
 
     /// A 3-axis toolpath in work coordinates, with the tool vertical throughout.

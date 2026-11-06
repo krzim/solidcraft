@@ -11,6 +11,7 @@ use crate::check::verify;
 use crate::offset::{Shape, reversed};
 use crate::path::{MAX_MOVES, Move, Toolpath};
 use crate::piece::Piece;
+use crate::surface_ops::{ENTRY_GAP, descent_feed};
 use crate::tool::{Tool, ToolKind};
 use crate::{CamError, Result, invalid};
 
@@ -185,6 +186,18 @@ impl Builder {
         Ok(())
     }
 
+    /// Down to `z` where the material left reaches no higher than `top`: at rapid to the
+    /// retract height and on through the air to [`ENTRY_GAP`] above `top` (where that is
+    /// lower), then at the plunge feed.
+    fn descend_to(&mut self, z: f64, top: f64) -> Result<()> {
+        let Some(q) = self.pos else { return Err(CamError::Unsafe("a plunge before the first positioning move".into())) };
+        let air = (top + ENTRY_GAP).max(z).min(self.h.retract);
+        if q.z > air + 1e-9 {
+            self.push(Move::Rapid { to: Vec3::new(q.x, q.y, air) })?;
+        }
+        self.plunge_to(z)
+    }
+
     fn cut_to(&mut self, p: Vec2, z: f64) -> Result<()> {
         if self.at(p) && self.pos.is_some_and(|q| (q.z - z).abs() <= 1e-9) {
             return Ok(());
@@ -193,17 +206,25 @@ impl Builder {
     }
 
     /// Cuts along `piece` from wherever the tool is (within the offsetting's joining tolerance
-    /// of the piece's start), going evenly from depth `z0` to `z1`.
+    /// of the piece's start), going evenly from depth `z0` to `z1`: at the cut feed, slowed
+    /// where it goes down so the tool goes down no faster than the plunge feed.
     fn cut_piece(&mut self, piece: &Piece, z0: f64, z1: f64) -> Result<()> {
+        let drop = z0 - z1;
+        let feed = descent_feed(&self.feeds, piece.length().hypot(drop), drop);
         match *piece {
-            Piece::Line { b, .. } => self.cut_to(b, z1),
+            Piece::Line { b, .. } => {
+                if self.at(b) && self.pos.is_some_and(|q| (q.z - z1).abs() <= 1e-9) {
+                    return Ok(());
+                }
+                self.push(Move::Feed { to: b.extend(z1), feed })
+            }
             Piece::Arc { c, sweep, .. } => {
                 // Halves, so that no arc move comes near a full turn.
                 let parts = if sweep.abs() > PI { 2 } else { 1 };
                 for k in 1..=parts {
                     let t = k as f64 / parts as f64;
                     let to = piece.point_at(t).extend(z0 + (z1 - z0) * t);
-                    self.push(Move::Arc { to, center: c, ccw: sweep > 0.0, feed: self.feeds.cut })?;
+                    self.push(Move::Arc { to, center: c, ccw: sweep > 0.0, feed })?;
                 }
                 Ok(())
             }
@@ -214,9 +235,10 @@ impl Builder {
         lp.iter().try_for_each(|piece| self.cut_piece(piece, z, z))
     }
 
-    /// Goes down to `z` along `lp`, no steeper than `angle`, round as often as that takes; the
-    /// tool ends where the loop starts. Straight down when there is no angle or the loop is too
-    /// short to ramp along.
+    /// Goes down to `z` along `lp` at `angle`, round as often as that takes, then on round at
+    /// `z` to where the loop starts, where the tool ends. Each ramping move goes down no faster
+    /// than the plunge feed. Straight down when there is no angle or the loop is too short to
+    /// ramp along.
     fn ramp_loop(&mut self, lp: &[Piece], z: f64, angle: f64) -> Result<()> {
         let Some(from) = self.pos.map(|p| p.z) else { return Err(CamError::Unsafe("a ramp before the first positioning move".into())) };
         let drop = from - z;
@@ -224,17 +246,28 @@ impl Builder {
             return Ok(());
         }
         let length: f64 = lp.iter().map(Piece::length).sum();
-        let laps = (drop / angle.tan() / length - 1e-9).ceil().max(1.0);
-        if !(angle > 0.0) || !(length > 1e-3) || !(laps <= MAX_RAMP_LAPS) {
+        // The distance along the loop the ramp takes.
+        let run = drop / angle.tan();
+        let laps = (run / length - 1e-9).ceil().max(1.0);
+        if !(angle > 0.0) || !(length > 1e-3) || !(laps <= MAX_RAMP_LAPS) || !(run > 0.0) {
             return self.plunge_to(z);
         }
-        let total = laps * length;
+        let depth_at = |d: f64| from - drop * (d / run).min(1.0);
         let mut done = 0.0;
         for _ in 0..laps as usize {
             for piece in lp {
-                let z0 = from - drop * done / total;
-                done += piece.length();
-                self.cut_piece(piece, z0, from - drop * (done / total).min(1.0))?;
+                let (d0, l) = (done, piece.length());
+                done += l;
+                if d0 >= run || l <= 1e-12 {
+                    self.cut_piece(piece, z, z)?;
+                } else if done <= run {
+                    self.cut_piece(piece, depth_at(d0), depth_at(done))?;
+                } else {
+                    // The ramp reaches the depth part way along this piece.
+                    let t = (run - d0) / l;
+                    self.cut_piece(&piece.sub(0.0, t), depth_at(d0), z)?;
+                    self.cut_piece(&piece.sub(t, 1.0), z, z)?;
+                }
             }
         }
         // Exactly at depth, whatever the rounding of the last step.
@@ -305,8 +338,8 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
         let lp = if params.climb == natural_is_climb { lp.clone() } else { reversed(lp) };
         let Some(first) = lp.first() else { continue };
         b.travel_to(first.start())?;
-        // Down to the last pass (through what it cut), then into the material along the loop.
-        b.plunge_to(cut.heights.top)?;
+        // Down to the top of the material, then into it along the loop.
+        b.descend_to(cut.heights.top, cut.heights.top)?;
         for &z in &levels {
             b.ramp_loop(&lp, z, params.ramp_angle)?;
             b.cut_loop(&lp, z)?;
@@ -381,7 +414,8 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
                 Some(from) if link_is_clear(&shape, from, start, wall, r) => b.cut_to(start, z)?,
                 _ => {
                     b.travel_to(start)?;
-                    b.plunge_to(cleared)?;
+                    // Through the air the levels before cut, then down into this one.
+                    b.descend_to(cleared, cleared)?;
                     b.ramp_loop(&lp, z, params.ramp_angle)?;
                 }
             }

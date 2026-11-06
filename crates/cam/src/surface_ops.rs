@@ -78,6 +78,17 @@ pub(crate) fn descent_feed(feeds: &Feeds, len: f64, drop: f64) -> f64 {
     }
     (feeds.plunge * len / drop).clamp(feeds.plunge.min(feeds.cut), feeds.cut)
 }
+
+/// The steepest a finishing move may go down at the cut feed by default: 70° from horizontal.
+pub const DEFAULT_DESCENT_LIMIT: f64 = 70.0 * std::f64::consts::PI / 180.0;
+
+fn default_descent_limit() -> f64 {
+    DEFAULT_DESCENT_LIMIT
+}
+
+/// How far above the material left the tool stops coming down at rapid before it feeds into it
+/// (mm), where that is below the retract height.
+pub const ENTRY_GAP: f64 = 1.0;
 /// How far above a level a dropped height must be to count as solid there (relative to the
 /// size of the level, at least 1): a surface resting exactly at the level is clear.
 const LEVEL_EPS: f64 = 1e-9;
@@ -117,6 +128,12 @@ pub struct ParallelParams {
     pub tolerance: f64,
     /// Every other pass runs back; otherwise all run the same way.
     pub zigzag: bool,
+    /// Moves that go down steeper than this from horizontal (radians, 0 to a right angle) are
+    /// plunges: they are slowed so the tool goes down no faster than the plunge feed. Moves
+    /// along the surface that go down less steeply run at the cut feed. 0 slows every move that
+    /// goes down. Left out, [`DEFAULT_DESCENT_LIMIT`].
+    #[serde(default = "default_descent_limit")]
+    pub descent_limit: f64,
 }
 
 /// Roughing a stock box in levels: at each level the tool clears what is left above it, raster
@@ -188,6 +205,10 @@ pub(crate) fn check_leave(leave: f64) -> Result<()> {
 
 fn check_stepover(stepover: f64, tool: &Tool) -> Result<()> {
     if stepover > 0.0 && stepover <= tool.diameter { Ok(()) } else { invalid("the stepover must be above 0 and at most the tool diameter") }
+}
+
+fn check_descent_limit(angle: f64) -> Result<()> {
+    if finite_in(angle, 0.0, std::f64::consts::FRAC_PI_2) { Ok(()) } else { invalid("the descent limit must be from 0 to 90 degrees") }
 }
 
 fn check_angle(angle: f64) -> Result<()> {
@@ -487,7 +508,7 @@ impl Boundary {
 }
 
 /// The surface seen by a vertical cutter: what is under it at each point of the plane.
-struct Field<'a> {
+pub(crate) struct Field<'a> {
     surface: &'a Surface,
     /// The cutter grown by the stock to leave.
     cutter: Cutter,
@@ -499,7 +520,7 @@ struct Field<'a> {
 }
 
 impl<'a> Field<'a> {
-    fn new(surface: &'a Surface, cutter: &Cutter, leave: f64, region: Option<&Region2>, tol: f64) -> Result<Field<'a>> {
+    pub(crate) fn new(surface: &'a Surface, cutter: &Cutter, leave: f64, region: Option<&Region2>, tol: f64) -> Result<Field<'a>> {
         let grown = cutter.grown(leave)?;
         Ok(Field {
             surface,
@@ -667,11 +688,21 @@ struct Out3 {
     down: bool,
     h: Heights,
     feeds: Feeds,
+    /// A move that goes down by at least this share of its length is slowed by
+    /// [`descent_feed`]; 0 slows every move that goes down.
+    plunge_slope: f64,
 }
 
+/// How the tool gets from the end of one cut (the first point) to the start of the next (the
+/// second) at feed: the points after where it is, the last the next cut's start; `None` where
+/// it must lift and come down again instead.
+type Link<'a> = &'a dyn Fn(Vec3, Vec3) -> Result<Option<Vec<Vec3>>>;
+
 impl Out3 {
-    fn new(h: Heights, feeds: Feeds) -> Out3 {
-        Out3 { moves: Vec::new(), pos: None, down: false, h, feeds }
+    /// `descent_limit`: moves that go down at least this steeply (radians from horizontal)
+    /// are slowed by [`descent_feed`].
+    fn new(h: Heights, feeds: Feeds, descent_limit: f64) -> Out3 {
+        Out3 { moves: Vec::new(), pos: None, down: false, h, feeds, plunge_slope: descent_limit.sin().max(0.0) }
     }
 
     fn push(&mut self, m: Move) -> Result<()> {
@@ -695,8 +726,10 @@ impl Out3 {
     }
 
     /// Up, across at the retract height (the clearance height for the first move) and down
-    /// to `p`, the last of it at the plunge feed.
-    fn enter(&mut self, p: Vec3) -> Result<()> {
+    /// to `p`, the last of it at the plunge feed: from the retract height, or, where the
+    /// material left over `p` is known to reach no higher than `top`, from [`ENTRY_GAP`] above
+    /// that, coming down through the air above it at rapid.
+    fn enter(&mut self, p: Vec3, top: Option<f64>) -> Result<()> {
         match self.pos {
             None => self.push(Move::Rapid { to: Vec3::new(p.x, p.y, self.h.clearance) })?,
             Some(q) => {
@@ -708,6 +741,12 @@ impl Out3 {
         }
         if self.pos.is_some_and(|q| q.z > self.h.retract) {
             self.push(Move::Rapid { to: Vec3::new(p.x, p.y, self.h.retract) })?;
+        }
+        if let Some(t) = top {
+            let air = (t + ENTRY_GAP).max(p.z);
+            if self.pos.is_some_and(|q| q.z > air + 1e-9) {
+                self.push(Move::Rapid { to: Vec3::new(p.x, p.y, air) })?;
+            }
         }
         if self.pos.is_some_and(|q| q.dist(p) > 1e-12) {
             self.push(Move::Feed { to: p, feed: self.feeds.plunge })?;
@@ -723,20 +762,36 @@ impl Out3 {
         self.push(Move::Feed { to: p, feed })
     }
 
-    /// Cuts along `pts`, getting to the first point by feeding straight to it when `link`
-    /// allows and from above otherwise. Every move that goes down (a link, the tool stepping
-    /// off the part's reach into the stock below, or following a wall down) is slowed by
-    /// [`descent_feed`] so the tool never goes down faster than the plunge feed.
-    fn span(&mut self, pts: &[Vec3], link: &dyn Fn(Vec3, Vec3) -> Result<bool>) -> Result<()> {
+    /// A cut to `p`: at the cut feed, or slowed by [`descent_feed`] where it goes down at
+    /// least as steeply as the plunge slope.
+    fn cut(&mut self, p: Vec3) -> Result<()> {
+        let feed = match self.pos {
+            Some(q) => {
+                let (len, drop) = (q.dist(p), q.z - p.z);
+                if drop > 1e-9 && drop >= self.plunge_slope * len { descent_feed(&self.feeds, len, drop) } else { self.feeds.cut }
+            }
+            None => self.feeds.cut,
+        };
+        self.feed(p, feed)
+    }
+
+    /// Cuts along `pts`, getting to the first point along the way `link` gives when it gives
+    /// one and from above otherwise ([`Out3::enter`], `top` the material left there). A move
+    /// that goes down at least as steeply as the plunge slope (into the material, off the
+    /// part's reach into the stock below, down a wall) is slowed by [`descent_feed`] so the
+    /// tool goes down no faster than the plunge feed.
+    fn span(&mut self, pts: &[Vec3], link: Link<'_>, top: Option<f64>) -> Result<()> {
         let Some(&first) = pts.first() else { return Ok(()) };
-        let from = self.pos.filter(|_| self.down);
-        match from {
-            Some(q) if link(q, first)? => self.feed(first, descent_feed(&self.feeds, q.dist(first), q.z - first.z))?,
-            _ => self.enter(first)?,
+        let way = match self.pos.filter(|_| self.down) {
+            Some(q) => link(q, first)?,
+            None => None,
+        };
+        match way {
+            Some(way) => way.into_iter().try_for_each(|p| self.cut(p))?,
+            None => self.enter(first, top)?,
         }
         for &p in pts.iter().skip(1) {
-            let feed = self.pos.map_or(self.feeds.cut, |q| descent_feed(&self.feeds, q.dist(p), q.z - p.z));
-            self.feed(p, feed)?;
+            self.cut(p)?;
         }
         self.down = true;
         Ok(())
@@ -754,51 +809,76 @@ impl Out3 {
     }
 }
 
-/// Whether the tool can feed straight from `a` to `b` (no longer than `max_len` seen from
-/// above) staying inside the boundary and no more than `tol` below the dropped surface. The
-/// dropped height under the link is sampled every `spacing` and refined like a pass, to half
-/// the tolerance, so a step in it between two samples (the edge of a part beside the passes)
-/// is found; the link must then be within the other half of every point of it. A link that
-/// needs more than [`MAX_LINK_SAMPLES`] points is not taken.
-fn link_clear(field: &Field, a: Vec3, b: Vec3, max_len: f64, spacing: f64, tol: f64) -> Result<bool> {
+/// The way the tool feeds from `a` to `b` (no longer than `max_len` seen from above): the
+/// straight line, raised wherever the cutter resting on the surface (the stock to leave
+/// included) is higher. The dropped height under the link is sampled every `spacing` and
+/// refined like a pass, to half the tolerance, so a step in it between two samples (the edge
+/// of a part beside the passes) is found and followed, and the link is no further into the
+/// part than half the tolerance where the dropped height bends no tighter than the samples
+/// can follow. The points after `a`, the last `b`; `None` where the link leaves the
+/// boundary or needs more than [`MAX_LINK_SAMPLES`] points.
+pub(crate) fn link_path(field: &Field, a: Vec3, b: Vec3, max_len: f64, spacing: f64, tol: f64) -> Result<Option<Vec<Vec3>>> {
     let len = (a.x - b.x).hypot(a.y - b.y);
     if !(len <= max_len) {
-        return Ok(false);
+        return Ok(None);
     }
-    let half = 0.5 * tol;
     if len <= 1e-12 {
-        // Straight up or down: only what is under the cutter there matters.
+        // Straight up or down: both ends are points the tool cuts at, on or above the surface.
         return Ok(match field.at(Vec2::new(a.x, a.y))? {
-            Tip::Out => false,
-            Tip::Clear => true,
-            Tip::At(h) => a.z.min(b.z) >= h - half,
+            Tip::Out => None,
+            _ => Some(vec![b]),
         });
     }
+    // Two samples with nothing under the cutter are not looked between, so they are taken no
+    // farther apart than a stretch is taken as straight, nor than a quarter of the radius: a
+    // corner of the part the link passes over between them is met.
+    let spacing = spacing.min(field.stretch).min(0.25 * field.cutter.radius);
     let n = (len / spacing).ceil().max(1.0);
     if !(n <= MAX_LINK_SAMPLES as f64) {
-        return Ok(false);
+        return Ok(None);
     }
     let xy = |u: f64| Vec2::new(a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u);
     let tip = |u: f64| field.at(xy(u));
     let point = |u: f64, h: f64| xy(u).extend(h);
+    let half = 0.5 * tol;
     let pass = Pass { tip: &tip, point: &point, tol: half };
     let n = n as usize;
-    let profile = pass.sample_within(0.0, 1.0, n, depth_for(len / n as f64, half), field.stretch / len)?;
+    let profile = pass.sample_within(0.0, 1.0, n, depth_for(len / n as f64, half), field.stretch * std::f64::consts::FRAC_1_SQRT_2 / len)?;
     if profile.len() > MAX_LINK_SAMPLES {
-        return Ok(false);
+        return Ok(None);
     }
-    for (u, tip) in profile {
-        match tip {
-            Tip::Out => return Ok(false),
-            Tip::Clear => {}
-            Tip::At(h) => {
-                if a.z + (b.z - a.z) * u < h - half {
-                    return Ok(false);
-                }
+    let line = |u: f64| a.z + (b.z - a.z) * u;
+    let on_line = |u: f64| xy(u).extend(line(u));
+    let mut out: Vec<Vec3> = Vec::new();
+    // The last sample and how far the surface is above the line there (-∞: nothing under it).
+    let mut prev: Option<(f64, f64)> = None;
+    for &(u, tip) in &profile {
+        let above = match tip {
+            Tip::Out => return Ok(None),
+            Tip::Clear => f64::NEG_INFINITY,
+            Tip::At(h) => h - line(u),
+        };
+        if let Some((pu, pa)) = prev
+            && (pa > 1e-9) != (above > 1e-9)
+        {
+            // The way leaves the line or comes back to it between the samples: where the
+            // surface crosses it, or over the edge where nothing is under the cutter.
+            if pa.is_finite() && above.is_finite() {
+                let uc = pu + (u - pu) * (pa / (pa - above));
+                out.push(on_line(uc));
+            } else {
+                out.push(on_line(if above > 1e-9 { pu } else { u }));
             }
         }
+        // Raised samples at either end (the tool rising before it moves across, or moving
+        // across before it goes down) are kept too.
+        if above > 1e-9 {
+            out.push(xy(u).extend(line(u) + above));
+        }
+        prev = Some((u, above));
     }
-    Ok(true)
+    out.push(b);
+    Ok(Some(out))
 }
 
 /// A pass's stretches in the order the tool runs them, as points.
@@ -814,11 +894,13 @@ fn ordered(line: &Line, stretches: Vec<Vec<(f64, f64)>>, backward: bool) -> Vec<
 /// Raster finishing: passes at `angle`, `stepover` apart, each following the surface as the
 /// dropped cutter rests on it. Where nothing is under the cutter the tool lifts out and comes
 /// back in where the surface starts again; where the surface is below the floor it runs at the
-/// floor. Between passes (and across gaps) it feeds straight across when that link is short
-/// (at most twice the stepover or the tool diameter) and stays inside the boundary and above
-/// the surface (checked like a pass, so it does not cut past an edge between two samples);
-/// otherwise it retracts and plunges again. A move that goes down is slowed so the tool never
-/// goes down faster than the plunge feed.
+/// floor. Between passes (and across gaps) it feeds across when that link is short (at most
+/// twice the stepover or the tool diameter) and stays inside the boundary: straight, raised
+/// over the surface wherever the cutter resting on it is higher (sampled and refined like a
+/// pass, so it does not cut past an edge between two samples); otherwise it retracts and
+/// plunges again. A move that goes down at least as steeply as the descent limit is slowed so
+/// the tool goes down no faster than the plunge feed, and so is every entry from above; the
+/// rest runs at the cut feed.
 pub fn parallel(surface: &Surface, tool: &Tool, p: &ParallelParams) -> Result<Toolpath> {
     let cutter = tool_cutter(tool)?;
     p.heights.validate()?;
@@ -828,19 +910,20 @@ pub fn parallel(surface: &Surface, tool: &Tool, p: &ParallelParams) -> Result<To
     check_leave(p.stock_to_leave)?;
     check_step(p.step)?;
     check_tolerance(p.tolerance)?;
+    check_descent_limit(p.descent_limit)?;
     let rect = p.boundary.resolve(surface)?;
     let field = Field::new(surface, &cutter, p.stock_to_leave, p.boundary.region.as_ref(), p.tolerance)?;
     field.check_retract(&rect, p.heights.retract)?;
     let step = p.step.min(cutter.radius);
     let lines = raster(&rect, p.angle, p.stepover, step)?;
     let (max_link, spacing) = ((2.0 * p.stepover).max(tool.diameter), step.min(cutter.radius * 0.5));
-    let link = |a: Vec3, b: Vec3| link_clear(&field, a, b, max_link, spacing, p.tolerance);
-    let mut out = Out3::new(p.heights, p.feeds);
+    let link = |a: Vec3, b: Vec3| link_path(&field, a, b, max_link, spacing, p.tolerance);
+    let mut out = Out3::new(p.heights, p.feeds, p.descent_limit);
     for (k, line) in lines.iter().enumerate() {
         let profile = line.sample(&field, step, p.tolerance)?;
         let stretches = spans(&profile, p.heights.bottom, f64::INFINITY, false, &|t| field.at(line.at(t)))?;
         for s in ordered(line, stretches, p.zigzag && k % 2 == 1) {
-            out.span(&s, &link)?;
+            out.span(&s, &link, None)?;
         }
     }
     out.finish()
@@ -886,10 +969,13 @@ impl TipRange {
 /// `max(level, dropped height + stock to leave)`, only where that is below the level before
 /// (what the earlier levels left), so it never cuts into the part and never cuts air it has
 /// already cleared. Where no part is under the cutter it cuts at the level. Stretches are
-/// linked as in [`parallel`] (a link that goes down is fed at the plunge feed); each new
-/// stretch is entered by plunging straight down at the plunge feed: a ramp or helix entry is
-/// a later improvement, so use a centre-cutting tool. Where a stretch goes down steeply (off
-/// the part's reach into stock no level has cut yet) that move is fed at the plunge feed too.
+/// linked as in [`parallel`]; each new stretch is entered by coming down at rapid through
+/// the air the levels before cleared, to [`ENTRY_GAP`] above the material left there (the
+/// level before, or the top of the stock), and plunging straight down from there at the
+/// plunge feed: a ramp or helix entry is a later improvement, so use a centre-cutting tool.
+/// Every move that goes down (off the part's reach into stock no level has cut yet, down a
+/// slope of the part into the material) is slowed so the tool goes down no faster than the
+/// plunge feed.
 /// A level is skipped for a pass that has nothing to cut at it; an operation whose levels
 /// would visit more than a billion samples between them is refused.
 pub fn roughing(surface: &Surface, tool: &Tool, p: &RoughingParams) -> Result<Toolpath> {
@@ -926,8 +1012,8 @@ pub fn roughing(surface: &Surface, tool: &Tool, p: &RoughingParams) -> Result<To
         )));
     }
     let (max_link, spacing) = ((2.0 * p.stepover).max(tool.diameter), step.min(cutter.radius * 0.5));
-    let link = |a: Vec3, b: Vec3| link_clear(&field, a, b, max_link, spacing, p.tolerance);
-    let mut out = Out3::new(p.heights, p.feeds);
+    let link = |a: Vec3, b: Vec3| link_path(&field, a, b, max_link, spacing, p.tolerance);
+    let mut out = Out3::new(p.heights, p.feeds, 0.0);
     let mut above = p.heights.top;
     for level in levels {
         // Each level starts from above: never a link down into the next level.
@@ -939,7 +1025,8 @@ pub fn roughing(surface: &Surface, tool: &Tool, p: &RoughingParams) -> Result<To
             }
             let stretches = spans(profile, level, above, true, &|t| field.at(line.at(t)))?;
             for s in ordered(line, stretches, p.zigzag && k % 2 == 1) {
-                out.span(&s, &link)?;
+                // Over every point of a stretch the levels before cut down to `above`.
+                out.span(&s, &link, Some(above))?;
             }
         }
         above = level;
@@ -950,7 +1037,8 @@ pub fn roughing(surface: &Surface, tool: &Tool, p: &RoughingParams) -> Result<To
 /// Z-level finishing: for each level from `heights.top` down to `heights.bottom` the
 /// cutter-location contours where the dropped cutter's tip is exactly at the level, traced
 /// over a grid of drop-cutter samples (marching squares) and run at the level. Each crossing of
-/// a grid edge is found by halving to within the tolerance, on the side where the cutter is
+/// a grid edge is found by halving to within an eighth of the tolerance (so a loop round a
+/// round wall lies on a circle closely enough to be written as arcs), on the side where the cutter is
 /// clear, so no point is in the surface. A cell whose opposite corners disagree (a saddle) is
 /// settled by a sample at its centre. Loops are closed; contours that leave the boundary are
 /// open. Where the wall bulges between two points of a contour so that the straight feed
@@ -996,7 +1084,7 @@ pub fn waterline(surface: &Surface, tool: &Tool, p: &WaterlineParams) -> Result<
             "the waterline visits more than {MAX_WORK} grid cells over its levels; use fewer levels, a larger step or a smaller boundary"
         )));
     }
-    let mut out = Out3::new(p.heights, p.feeds);
+    let mut out = Out3::new(p.heights, p.feeds, 0.0);
     for level in levels {
         for chain in grid.contours(level, p.tolerance)? {
             for piece in grid.follow(&chain, level, p.tolerance, p.step)? {
@@ -1006,7 +1094,7 @@ pub fn waterline(surface: &Surface, tool: &Tool, p: &WaterlineParams) -> Result<
                     }
                     let pts: Vec<Vec3> = run.iter().map(|q| q.extend(level)).collect();
                     let Some(&first) = pts.first() else { continue };
-                    out.enter(first)?;
+                    out.enter(first, None)?;
                     for &q in pts.iter().skip(1) {
                         out.feed(q, p.feeds.cut)?;
                     }
@@ -1160,11 +1248,11 @@ impl<'a> Grid<'a> {
     }
 
     /// Where the level is crossed between a solid node and a clear one: the clear end of the
-    /// last halving, within `tol` of it.
+    /// last halving, within an eighth of `tol` of it.
     fn crossing(&self, solid_at: Vec2, clear_at: Vec2, level: f64, tol: f64) -> Result<Vec2> {
         let (mut a, mut b) = (solid_at, clear_at);
         for _ in 0..64 {
-            if a.dist(b) <= tol {
+            if a.dist(b) <= 0.125 * tol {
                 break;
             }
             let m = a.lerp(b, 0.5);
