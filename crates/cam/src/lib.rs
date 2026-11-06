@@ -28,6 +28,7 @@ mod gcode;
 pub mod gcode5;
 pub mod indexed;
 pub mod kinematics;
+mod leads;
 mod multiaxis;
 mod offset;
 mod ops;
@@ -47,6 +48,9 @@ pub use cutter::Cutter;
 pub use dropcutter::{drop_along, drop_triangle, drop_z};
 pub use frame::{Frame, angle_about, rotate, rotate_about};
 pub use gcode::{Operation, Program, emit, parse, work_offset_code};
+pub use leads::{
+    ContourOptions, Entry, Lead, Linking, MAX_FINISH_PASSES, MAX_TABS, MIN_ARC_RADIUS, PocketOptions, TabLayout, Tabs, contour_with, pocket_with,
+};
 pub use multiaxis::{Move5, Operation5, PathStats5, Pose, Program5, Toolpath5, slerp, verify5};
 pub use offset::offset_regions;
 pub use ops::{ContourParams, Cut, Feeds, Heights, PocketParams, Side, contour, pocket};
@@ -91,6 +95,8 @@ mod foundation_tests;
 mod gcode5_tests;
 #[cfg(test)]
 mod kinematics_tests;
+#[cfg(test)]
+mod leads_tests;
 #[cfg(test)]
 mod rotary_tests;
 #[cfg(test)]

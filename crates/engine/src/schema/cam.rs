@@ -14,6 +14,10 @@ use serde_json::{Map, Value};
 
 use super::types::SketchRef;
 
+#[path = "cam_leads.rs"]
+mod leads;
+pub use leads::{EntrySpec, LeadSpec, LinkingSpec, TabsSpec};
+
 /// Plan and check a CAM job and write its G-code: toolpaths for every operation on the design's
 /// bodies, the program written through the job's post for its machine, read back and compared
 /// with the toolpaths, and checked for gouges and holder collisions. Refuses, writing nothing,
@@ -265,6 +269,30 @@ operation! {
         /// Chord error on curved profiles, mm. Default: the job's tolerance.
         #[serde(default)]
         pub tolerance: Option<f64>,
+        /// A tangent arc into and out of each pass. Default: none.
+        #[serde(default)]
+        pub lead: Option<LeadSpec>,
+        /// How the tool goes down into each pass (instead of `ramp_angle_deg`). Default: the ramp
+        /// angle's (0: plunge).
+        #[serde(default)]
+        pub entry: Option<EntrySpec>,
+        /// Where the tool goes between passes it cannot link in the cut. Default: `clearance`.
+        #[serde(default)]
+        pub linking: Option<LinkingSpec>,
+        /// Holding tabs (outside contours only). Default: none.
+        #[serde(default)]
+        pub tabs: Option<TabsSpec>,
+        /// Passes round the final wall at full depth after the depth passes, which leave
+        /// `finish_passes` × `finish_stepover` for them. Default: 0.
+        #[serde(default)]
+        pub finish_passes: Option<u32>,
+        /// Distance between finishing passes, mm, at most half the tool's radius. Default: 5% of
+        /// the tool's diameter.
+        #[serde(default)]
+        pub finish_stepover: Option<f64>,
+        /// Go round the last pass once more. Default: false.
+        #[serde(default)]
+        pub spring_pass: Option<bool>,
     }
 }
 
@@ -296,12 +324,20 @@ operation! {
         /// Material left on the walls, mm. Default: 0.
         #[serde(default)]
         pub stock_to_leave: Option<f64>,
-        /// Steepest ramp into uncut material, degrees; 0 plunges. Default: 0.
+        /// Steepest ramp into uncut material, degrees; 0 plunges. Default: a helix entry.
         #[serde(default)]
         pub ramp_angle_deg: Option<f64>,
         /// Chord error on curved profiles, mm. Default: the job's tolerance.
         #[serde(default)]
         pub tolerance: Option<f64>,
+        /// How the tool goes down into uncut material (instead of `ramp_angle_deg`). Default: a
+        /// helix of 90% of the tool's radius at 2 degrees where it fits, else a ramp round the
+        /// ring at 2 degrees, else a plunge at the plunge feed.
+        #[serde(default)]
+        pub entry: Option<EntrySpec>,
+        /// Where the tool goes between rings it cannot link in the cut. Default: `clearance`.
+        #[serde(default)]
+        pub linking: Option<LinkingSpec>,
     }
 }
 

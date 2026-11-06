@@ -28,7 +28,7 @@ use solidcraft_cam::rotary::{RotaryParams, RotaryPattern, RotaryRoughingParams, 
 use solidcraft_cam::surface_ops::{Boundary, ParallelParams, RoughingParams, WaterlineParams, parallel, roughing, waterline};
 use solidcraft_cam::{
     CamError, ContourParams, Cut, DEFAULT_MAX_ANGLE_STEP, Feeds, Frame, Heights, HolderSection, LineNumbers, Move, Operation5, PocketParams,
-    SafeRetract, Side, Surface, Tool, ToolKind, Toolpath, Toolpath5, arc_sweep, contour, pocket,
+    SafeRetract, Side, Surface, Tool, ToolKind, Toolpath, Toolpath5, arc_sweep, contour_with, pocket_with,
 };
 use solidcraft_geom::Mesh;
 use solidcraft_geom::prelude::*;
@@ -659,7 +659,9 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
                 tolerance: ctx.tolerance(c.name, o.tolerance)?,
                 ramp_angle: ctx.degrees(c.name, o.ramp_angle_deg.unwrap_or(0.0), "`ramp_angle_deg`")?,
             };
-            let path = contour(&regions, &r.tool, &params, &cut).map_err(|e| ctx.bad(c.name, e))?;
+            let opts = leads::contour_options(ctx, c.name, o, &r.tool)?;
+            let above = leads::clear_above(surface, &r.tool);
+            let path = contour_with(&regions, &r.tool, &params, &opts, &cut, &above).map_err(|e| ctx.bad(c.name, e))?;
             Ok((path, r, "contour"))
         }
         Op3Spec::Pocket(o) => {
@@ -674,7 +676,9 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
                 tolerance: ctx.tolerance(c.name, o.tolerance)?,
                 ramp_angle: ctx.degrees(c.name, o.ramp_angle_deg.unwrap_or(0.0), "`ramp_angle_deg`")?,
             };
-            let path = pocket(&regions, &r.tool, &params, &cut).map_err(|e| ctx.bad(c.name, e))?;
+            let opts = leads::pocket_options(ctx, c.name, o, &r.tool)?;
+            let above = leads::clear_above(surface, &r.tool);
+            let path = pocket_with(&regions, &r.tool, &params, &opts, &cut, &above).map_err(|e| ctx.bad(c.name, e))?;
             Ok((path, r, "pocket"))
         }
         Op3Spec::Parallel(o) => {
@@ -1363,6 +1367,9 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
     reply.rapid_minutes = params.rapid_rate.map(|r| reply.rapid_length / r);
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
+
+#[path = "cam_leads.rs"]
+mod leads;
 
 #[cfg(test)]
 #[path = "cam_tests.rs"]

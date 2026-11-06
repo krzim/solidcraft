@@ -134,8 +134,8 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 
 | `type` | Keys (defaults) |
 | --- | --- |
-| `contour` | `sketch` (id or name) + `profiles?` (indices; default every drawn profile) or `polygon: [[x, y], …]`; `heights`; `stepdown` (tool's, else half its diameter); `side`: `outside` \| `inside` \| `on` (outside); `climb` (true); `stock_to_leave` (0); `ramp_angle_deg` (0: plunge); `tolerance` (the job's) |
-| `pocket` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown`; `stepover` (tool's, else 40% of its diameter); `climb`; `stock_to_leave`; `ramp_angle_deg`; `tolerance` |
+| `contour` | `sketch` (id or name) + `profiles?` (indices; default every drawn profile) or `polygon: [[x, y], …]`; `heights`; `stepdown` (tool's, else half its diameter); `side`: `outside` \| `inside` \| `on` (outside); `climb` (true); `stock_to_leave` (0); `ramp_angle_deg` (0: plunge); `tolerance` (the job's); `lead`, `entry`, `linking`, `tabs`, `finish_passes`, `finish_stepover`, `spring_pass` (see [Leads, entries, linking and tabs](#leads-entries-linking-and-tabs)) |
+| `pocket` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown`; `stepover` (tool's, else 40% of its diameter); `climb`; `stock_to_leave`; `ramp_angle_deg`; `tolerance`; `entry` (a helix); `linking` (see [Leads, entries, linking and tabs](#leads-entries-linking-and-tabs)) |
 | `parallel` | `heights` (`bottom` is the floor); `stepover` (tool's, else 10% of its diameter); `angle_deg` (0); `boundary?: {rect?: [[x, y], [x, y]], polygon?}` (the part's extent); `stock_to_leave` (0); `step` (a quarter of the diameter); `tolerance`; `zigzag` (true) |
 | `roughing` | `heights` (`top` is the stock's top); `stepdown`; `stepover`; `angle_deg`; `boundary`; `stock_to_leave` (0.25); `step`; `tolerance`; `zigzag` |
 | `waterline` | `heights` (levels from `top` to `bottom`); `stepdown` (tool's, else a quarter of its diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` (true) |
@@ -168,3 +168,30 @@ rotary letter's lowest and highest angle), `bounds` and `errors` (the first line
 cannot read). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
 elsewhere are read on a best-effort basis and stop at the first block it cannot follow
 (incremental coordinates, for one).
+
+## Leads, entries, linking and tabs
+
+The 2D operations (`contour` and `pocket`, on their own or inside `indexed`) take these keys.
+Without them a contour cuts as before; a pocket goes in by a helix.
+
+```json
+{"name": "outline", "type": "contour", "tool": 1, "polygon": [[-20, -15], [20, -15], [20, 15], [-20, 15]],
+ "heights": {"clearance": 20, "retract": 5, "top": 0, "bottom": -6}, "stepdown": 2,
+ "lead": {"radius": 2, "line": 1}, "entry": {"type": "ramp", "angle_deg": 3},
+ "tabs": {"count": 4, "width": 4, "height": 1.5}, "finish_passes": 1, "finish_stepover": 0.25,
+ "spring_pass": true, "linking": "stay_down"}
+```
+
+| Key | Operations | Meaning |
+| --- | --- | --- |
+| `lead` | contour | `{radius, sweep_deg?, line?}`: a tangent arc into each pass and out of it, `sweep_deg` (90) round, with a straight `line` (0) before the lead-in and after the lead-out. It lies in the plane of the cut (`G2`/`G3`), on the side of the pass away from the part, and the pass starts in the middle of its longest straight piece. A lead that would cut into the part (the far wall of an opening, a second profile) is refused. |
+| `entry` | both | How the tool goes down into each depth pass: `{"type": "plunge"}` (at the plunge feed), `{"type": "ramp", "angle_deg"?}` (2°: a contour along its lead, back and forth, or before its first tab, else round the loop; a pocket round its ring) or `{"type": "helix", "radius"?, "angle_deg"?}` (90% of the tool's radius, at most all of it, so that no core is left standing; 2°), then once round at the depth. A helix that does not fit is made smaller, then replaced by the ramp, then by the plunge. Give `entry` or `ramp_angle_deg`, not both. Default: a contour plunges (or ramps at `ramp_angle_deg`); a pocket goes in by the helix. |
+| `linking` | both | `clearance` (the default) or `stay_down`. Within a level the tool always stays down where the straight link runs where the passes cut so far, or the one it leads to, have taken the material away (tracked by each pass's distance from the boundary); elsewhere it goes up to the clearance height, or with `stay_down` only to the retract height where the cutter, dropped onto the part all along the link, stays 1 mm below it. With `stay_down` a pocket also goes from one level to the next through the level it has cleared. |
+| `tabs` | contour, outside | `{count \| spacing, width, height, ramp_angle_deg?}`: material left `height` above the bottom to hold a part cut out of the stock, each `width` long along the wall, placed evenly on the profile's straight stretches (away from its corners and the start); the tool rises over each on ramps of `ramp_angle_deg` (30°). Refused when they do not fit or are as high as the cut. |
+| `finish_passes` | contour | Passes round the final wall at full depth after the depth passes (0), `finish_stepover` (5% of the tool's diameter, at most half its radius) apart, the last on the wall; the depth passes leave `finish_passes × finish_stepover` for them. Each is linked in the cut, or by its lead. Not with `side: on`. |
+| `spring_pass` | contour | Go round the last pass once more (false). |
+
+Ring by ring a pocket is cut from the inside out: a ring only after the rings next inside it, and
+otherwise the nearest ring first, so that the rooms of a pocket are cleared one after the other.
+The vertical leads some posts write (an arc in the plane of the cut's normal and Z, `G18`/`G19`)
+are not written: the program reader and the read-back follow arcs in the XY plane only.
