@@ -383,7 +383,9 @@ the final retract. At every sample, in work coordinates:
   fails, even where an earlier operation has cut it away, except after a `face` (with its
   default `overhang`) over the whole top of a box stock: the operations after it are held
   against the stock with its top at the face's `bottom`. A retract straight up the tool's
-  axis out of the cut is exempt too: it only passes through room the tool already fills. Keep
+  axis out of the cut is exempt too: it only passes through room the tool already fills; so is
+  a rapid back down that line in the same operation, no deeper than the retract started (a peck
+  drill going back into its hole to `peck_clearance` above the depth reached). Keep
   every retract and clearance height above the stock's top (on a 4th axis, outside its radius);
 - a block that turns the A axis (a table about X) must keep the cutter outside the radius the
   stock sweeps (a box's farthest corner) all through the turn, wherever the stock is level with
