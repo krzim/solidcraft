@@ -120,9 +120,10 @@ is; the reply's notes say so.
 
 ### Tools
 
-`number`, `kind` (`flat_endmill`, `ball_endmill`, `bull_nose`, `drill`), `diameter`,
+`number`, `kind` (`flat_endmill`, `ball_endmill`, `bull_nose`, `drill`, `face_mill`, `chamfer`), `diameter`,
 `flute_length`, and optional `description`, `flutes`, `spindle_rpm`, `feed`, `plunge_feed`,
-`stepdown`, `stepover`, `corner_radius` (bull nose), `shank_diameter`, `stickout`, `holder:
+`stepdown`, `stepover`, `corner_radius` (bull nose; a face mill's inserts), `tip_diameter` and `angle_deg`
+(chamfer mill, below), `shank_diameter`, `stickout`, `holder:
 [{diameter, length}]`. An operation without `spindle_rpm` or `feeds` takes the tool's; its
 stepdown and stepover default to the tool's too.
 
@@ -139,7 +140,8 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `parallel` | `heights` (`bottom` is the floor); `stepover` (tool's, else 10% of its diameter); `angle_deg` (0); `boundary?: {rect?: [[x, y], [x, y]], polygon?}` (the part's extent); `stock_to_leave` (0); `step` (a quarter of the diameter); `tolerance`; `zigzag` (true) |
 | `roughing` | `heights` (`top` is the stock's top); `stepdown`; `stepover`; `angle_deg`; `boundary`; `stock_to_leave` (0.25); `step`; `tolerance`; `zigzag` |
 | `waterline` | `heights` (levels from `top` to `bottom`); `stepdown` (tool's, else a quarter of its diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` (true) |
-| `indexed` | `a_deg` and `operation`: any of the five above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
+| `chamfer` | `sketch` + `profiles?` or `polygon`; `heights: {clearance, retract, top}` (no `bottom`: the depth follows from the width); `width` (across the top); `tip_offset` (0.2); `side`: `outside` \| `inside` (outside); `climb` (true); `tolerance`. A chamfer mill only; see [Chamfers](#chamfers) |
+| `indexed` | `a_deg` and `operation`: any of the six above, run with A held at `a_deg` (3+1). Only these two keys; the inner operation carries the name, tool and feeds. |
 | `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}` or `{type: "helix", pitch}`; `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
 | `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
 | `wrap` | `radius` (of the cylinder the path is drawn on); `points: [[x, y, z], …]` (x along the axis, y the arc length round it, z the depth: 0 on the cylinder, negative into it) or `sketch` + `curve` (a curve id; its sketch x and y are taken as x and arc length) with `depth` (0); `clearance` (5) and `retract` (1) above the cylinder; `max_angle_step_deg` (2) |
@@ -168,3 +170,33 @@ rotary letter's lowest and highest angle), `bounds` and `errors` (the first line
 cannot read). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
 elsewhere are read on a best-effort basis and stop at the first block it cannot follow
 (incremental coordinates, for one).
+
+## Chamfers
+
+A face mill (`kind: "face_mill"`) is a flat end, its inserts' corners rounded by
+`corner_radius` when given; its tool-list name is `FACE MILL`. A chamfer mill (`kind:
+"chamfer"`) has `diameter` (the widest the cone cuts), `tip_diameter` (0 for a pointed tip,
+default 0) and `angle_deg`, the included angle (90 for 45° chamfers, 1 to 179, required); its
+tool-list name is `CHAMFER MILL`. Contours and pockets refuse a chamfer mill. The drop-cutter
+and the gouge check know its true shape, a flat tip and a cone, and so every 3D operation can
+use one.
+
+The `chamfer` operation cuts a chamfer along the top edges of closed profiles in one pass:
+
+```json
+{"name": "deburr", "type": "chamfer", "tool": 7, "sketch": "Outline",
+ "heights": {"clearance": 10, "retract": 2, "top": 0}, "width": 0.5, "side": "outside"}
+```
+
+`width` is the chamfer's leg across the top face; its leg down the wall is `width / tan(angle_deg
+/ 2)` (the same for a 90° tool). The tip runs `tip_offset` below the chamfer so the cone's side,
+not its tip, cuts all of it: `width / tan(angle_deg / 2) + tip_offset` below `top`, its axis
+`tip_diameter / 2 + tip_offset · tan(angle_deg / 2)` out from the edge. A chamfer the cone cannot
+reach, wider than `diameter / 2 − tip_diameter / 2 − tip_offset · tan(angle_deg / 2)`, or deeper
+than the flutes, is refused with the widest it can cut, never cut narrower. `outside` chamfers a
+part's outline, `inside` an opening's; corners of an outside chamfer are rounded by the cone.
+
+The gouge check holds the cone to the model: chamfer edges the model has chamfered (with
+`solid.chamfer` at the tool's angle) and it passes; a chamfer the model does not show cuts into
+it, so a deburr of a sharp-edged model sets `gouge_check: false`. Inside `indexed` a chamfer runs
+in the frame the A angle brings under the tool.

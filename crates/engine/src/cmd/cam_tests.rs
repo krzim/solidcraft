@@ -392,3 +392,147 @@ fn hostile_jobs_are_refused_without_panics() {
     assert!(s.execute("cam.check", &json!({"path": junk, "rapid_rate": -1})).is_err());
     assert!(s.execute("cam.posts", &json!({"name": "nope"})).is_err());
 }
+
+/// A block 30 × 20 × 10, its top at Z 0, with its four top edges chamfered 1 mm at 45° when
+/// `chamfered`.
+fn plate(chamfered: bool) -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 30, "width": 20, "height": 10, "corner": [-15, -10, -10], "body_name": "Plate"}));
+    if chamfered {
+        run(&mut s, "solid.chamfer", json!({"edges": [[0, -10, 0], [15, 0, 0], [0, 10, 0], [-15, 0, 0]], "distance": 1, "tangent_chain": false}));
+    }
+    s
+}
+
+fn chamfer_mill(number: u32) -> Value {
+    json!({"number": number, "kind": "chamfer", "diameter": 6, "tip_diameter": 0, "angle_deg": 90, "flute_length": 10, "flutes": 3,
+           "spindle_rpm": 20000, "feed": 1600, "plunge_feed": 100})
+}
+
+fn face_mill(number: u32) -> Value {
+    json!({"number": number, "kind": "face_mill", "diameter": 10, "corner_radius": 0.2, "flute_length": 6, "flutes": 1,
+           "spindle_rpm": 18000, "feed": 1600, "plunge_feed": 50})
+}
+
+/// Faces the plate's top with a face mill, then chamfers its top edges `width` wide.
+fn chamfer_job(width: f64) -> Value {
+    json!({
+        "machine": "3axis",
+        "post": "mach3_4axis",
+        "tools": [face_mill(1), chamfer_mill(7)],
+        "operations": [
+            {"name": "face", "type": "pocket", "tool": 1, "polygon": [[-14, -9], [14, -9], [14, 9], [-14, 9]],
+             "heights": {"clearance": 10, "retract": 2, "top": 0.5, "bottom": 0}, "stepover": 7},
+            {"name": "deburr", "type": "chamfer", "tool": 7, "polygon": [[-15, -10], [15, -10], [15, 10], [-15, 10]],
+             "heights": {"clearance": 10, "retract": 2, "top": 0}, "width": width}
+        ]
+    })
+}
+
+#[test]
+fn a_chamfer_mill_cuts_the_modelled_chamfer_as_wide_as_asked() {
+    let mut s = plate(true);
+    let dir = Dir::new("chamfer");
+    // The tool list of a post that writes one names both tools as the approved post does.
+    let mut post = run(&mut s, "cam.posts", json!({"name": "mach3_4axis"}))["post"].clone();
+    post["base"]["tool_list"] = json!(true);
+    post["base"]["upper_case_comments"] = json!(true);
+    post["base"]["comment_chars"] = json!(" .,=_-");
+    post["base"]["trailing_decimal"] = json!(true);
+    post["base"]["decimals"] = json!(3);
+    std::fs::write(dir.0.join("mill.post.json"), post.to_string()).unwrap();
+    let mut job = chamfer_job(1.0);
+    job.as_object_mut().unwrap().remove("post");
+    job["post_path"] = json!(dir.file("mill.post.json"));
+    let out = dir.file("plate.tap");
+    let r = run(&mut s, "cam.job", json!({"job": job, "output": out}));
+    assert_clean(&r);
+    assert_eq!(r["operations"][1]["kind"], "chamfer", "{r}");
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.lines().any(|l| l.starts_with("(T1 D=10. CR=0.2 - ZMIN=") && l.ends_with(" - FACE MILL)")), "{text}");
+    assert!(text.contains("(T7 D=6. CR=0. - ZMIN=-1.2 - CHAMFER MILL)"), "{text}");
+    // The width as the program cuts it: along the +X side, the 90° cone's radius at the top,
+    // 1.2 above its tip, less the axis's distance from the wall.
+    let blocks = solidcraft_cam::gcode5::parse5(&text, &[]).unwrap();
+    let cuts: Vec<solidcore_record::Vec3> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            solidcraft_cam::gcode5::JointWords::Feed { linear, .. } => Some(*linear),
+            _ => None,
+        })
+        .collect();
+    let bottom = cuts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+    assert!((bottom + 1.2).abs() < 1e-6, "{bottom}");
+    let side: Vec<f64> =
+        cuts.iter().filter(|p| (p.z - bottom).abs() < 1e-6 && p.x > 7.5 && p.y.abs() <= 10.0 + 1e-6).map(|p| 1.2 - (p.x - 15.0)).collect();
+    assert!(!side.is_empty(), "{text}");
+    for w in side {
+        assert!((w - 1.0).abs() <= 1e-3, "the chamfer is {w} mm wide, not 1");
+    }
+    // A chamfer wider than modelled cuts into the part.
+    let r = run(&mut s, "cam.job", json!({"job": chamfer_job(1.2), "dry_run": true}));
+    assert_eq!(r["passed"], false, "{r}");
+    assert!(r["operations"][1]["gouge"].as_f64().is_some_and(|g| g > 0.1), "{r}");
+}
+
+#[test]
+fn a_chamfer_the_model_does_not_show_is_a_gouge_unless_unchecked() {
+    let mut s = plate(false);
+    let r = run(&mut s, "cam.job", json!({"job": chamfer_job(1.0), "dry_run": true}));
+    assert_eq!(r["passed"], false, "{r}");
+    assert!(r["operations"][1]["gouge"].as_f64().is_some_and(|g| g > 0.5), "the cone cuts the sharp edge 1 mm deep: {r}");
+    assert_eq!(r["operations"][0]["gouge"].as_f64(), Some(0.0), "the face mill stays on the top: {r}");
+    let mut job = chamfer_job(1.0);
+    job["operations"][1]["gouge_check"] = json!(false);
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    assert_eq!(r["gouge"]["skipped"], json!(["deburr"]), "{r}");
+}
+
+#[test]
+fn hostile_chamfers_and_chamfer_mills_are_refused() {
+    let mut s = plate(true);
+    let refused = |s: &mut Session, job: Value, needle: &str| {
+        let e = s.execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
+        assert!(matches!(e, EngineError::BadParams { .. }) && e.to_string().contains(needle), "{needle}: {e}");
+    };
+    // Wider than the cone reaches: it ends 3 out, the axis runs 0.2 out with the default tip offset.
+    refused(&mut s, chamfer_job(2.9), "widest chamfer is 2.8");
+    let mut job = chamfer_job(1.0);
+    job["operations"][1]["side"] = json!("on");
+    refused(&mut s, job, "not `on`");
+    let mut job = chamfer_job(1.0);
+    job["operations"][1]["tool"] = json!(1);
+    refused(&mut s, job, "chamfer mill");
+    let mut job = chamfer_job(1.0);
+    job["operations"][1]["depth"] = json!(1);
+    refused(&mut s, job, "depth");
+    let mut job = chamfer_job(1.0);
+    job["operations"][1]["heights"]["bottom"] = json!(-1);
+    refused(&mut s, job, "bottom");
+    let mut job = chamfer_job(1.0);
+    job["operations"][0]["tool"] = json!(7);
+    refused(&mut s, job, "tapered");
+    for (k, v) in [("angle_deg", json!(180)), ("angle_deg", json!(null)), ("tip_diameter", json!(6)), ("tip_diameter", json!(-1))] {
+        let mut job = chamfer_job(1.0);
+        job["tools"][1][k] = v;
+        refused(&mut s, job, "chamfer mill");
+    }
+    let mut job = chamfer_job(1.0);
+    job["tools"][0]["angle_deg"] = json!(90);
+    refused(&mut s, job, "for chamfer mills");
+    for (w, t) in [(json!(-1), json!(0.2)), (json!(0), json!(0.2)), (json!(1e300), json!(0.2)), (json!(1), json!(-0.5)), (json!(1), json!(1e300))] {
+        let mut job = chamfer_job(1.0);
+        job["operations"][1]["width"] = w;
+        job["operations"][1]["tip_offset"] = t;
+        assert!(s.execute("cam.job", &json!({"job": job, "dry_run": true})).is_err());
+    }
+    // Indexed, the chamfer runs in the frame the A angle brings under the tool.
+    let mut job = chamfer_job(1.0);
+    job["machine"] = json!("4axis_a");
+    let inner = job["operations"][1].take();
+    job["operations"] = json!([{"type": "indexed", "a_deg": 0, "operation": inner}]);
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
+    assert_eq!(r["operations"][0]["kind"], "indexed chamfer", "{r}");
+}

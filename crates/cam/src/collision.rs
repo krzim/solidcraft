@@ -132,8 +132,9 @@ fn for_each_sample(path: &Toolpath5, reach: f64, step: f64, moves: Moves, mut f:
 /// cutter is deeper in it than that.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GougeTest {
-    /// The cutter shrunk all round, its tip `tol` up the axis.
+    /// The cutter shrunk all round, its tip `lift` up the axis.
     inner: Cutter,
+    lift: f64,
     tol: f64,
 }
 
@@ -145,16 +146,15 @@ impl GougeTest {
         }
         // Sideways by at most half the radius, so that a tolerance as large as the cutter still
         // finds it deep in the surface along its axis; the shrunk cutter, raised by the whole
-        // tolerance, stays inside the cutter.
-        let side = tol.min(cutter.radius * 0.5);
-        let inner = Cutter::bull(cutter.radius - side, (cutter.corner - side).max(0.0))?;
-        Ok(GougeTest { inner, tol })
+        // tolerance (a tapered one's side moved in by it), stays inside the cutter.
+        let (inner, lift) = cutter.shrunk(tol)?;
+        Ok(GougeTest { inner, lift, tol })
     }
 
     /// How far the cutter at `pose` is in the surface, where deeper than the tolerance: how much
     /// farther out along the axis it would have to be (see [`Hit::distance`]).
     pub(crate) fn depth(&self, surface: &Surface, pose: &Pose) -> Result<Option<f64>> {
-        Ok(drop_along(surface, &self.inner, pose.up(self.tol), pose.axis)?.filter(|d| *d > 0.0).map(|d| d + self.tol))
+        Ok(drop_along(surface, &self.inner, pose.up(self.lift), pose.axis)?.filter(|d| *d > 0.0).map(|d| d + self.tol))
     }
 }
 
@@ -472,10 +472,10 @@ impl Tilter<'_> {
         }
         let out = drop_along(self.surface, &self.cutter, pose.tip, a)?.filter(|t| *t > 0.0).unwrap_or(0.0);
         // Turned by θ about the tip, no point of the end (none farther from the tip than
-        // hypot(radius, corner)) moves by more than 2·hypot·sin(θ/2); pushing it out along the
+        // hypot(radius, rim height)) moves by more than 2·hypot·sin(θ/2); pushing it out along the
         // new axis clears that from a surface up to 60° from the axis within twice as far.
         let theta = a.cross(pose.axis).len().atan2(a.dot(pose.axis));
-        let limit = 4.0 * self.cutter.radius.hypot(self.cutter.corner) * (theta * 0.5).sin() + self.tol + 1e-9;
+        let limit = 4.0 * self.cutter.radius.hypot(self.cutter.rim_height()) * (theta * 0.5).sin() + self.tol + 1e-9;
         Ok((out <= limit).then(|| Pose::new(pose.tip + a * out, a)))
     }
 

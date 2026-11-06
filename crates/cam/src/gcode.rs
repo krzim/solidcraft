@@ -98,6 +98,7 @@ pub(crate) fn tool_list_line(post: &Post, tool: &Tool, zmin: Option<f64>) -> Str
     let mm = post.units.mm();
     let corner = match tool.kind {
         ToolKind::BallEndmill => tool.diameter / 2.0,
+        ToolKind::Chamfer => 0.0,
         _ => tool.corner_radius.unwrap_or(0.0),
     };
     let mut line =
