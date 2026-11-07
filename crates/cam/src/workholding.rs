@@ -5,7 +5,7 @@
 //! checks ([`crate::machine_model::clearance`]), and reports what is wrong with the setup itself
 //! (the stock too wide for the vise, gripped too shallow, a clamp off the stock, ...).
 //!
-//! Ported from krzim's own G-code simulator (MIT, same author): the vise's placement (quarter turns, the
+//! Ported from the author's own MIT-licensed G-code simulator (MIT, same author): the vise's placement (quarter turns, the
 //! fixed jaw's face, the parallels along the jaws), clamps on the stock's top, parallels under
 //! its long edges, the grip box less the stock, and the setup findings.
 

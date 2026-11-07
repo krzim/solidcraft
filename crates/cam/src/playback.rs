@@ -14,7 +14,7 @@
 //! the shank rubbing (material above the flutes), the tool's shank or holder or a machine part
 //! coming down on the stock, the cutter, holder or a machine part running into the workholding
 //! or the table, and the spindle nose above its travel ([`crate::machine_model`]). Ported from
-//! krzim's own G-code simulator (MIT, same author): stepping the simulation, the holder and machine
+//! the author's own MIT-licensed G-code simulator (MIT, same author): stepping the simulation, the holder and machine
 //! checks against the stock as it is, and the findings they give.
 
 use std::sync::Arc;

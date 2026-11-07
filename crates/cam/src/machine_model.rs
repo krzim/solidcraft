@@ -13,7 +13,7 @@
 //! [`zones`] places the tool's cutting length, its shank, every holder section and every part
 //! for a vertical tool at a tip position (relative to the table, so on a 4th axis the position
 //! of the linear axes); [`clearance`] holds them against the workholding's boxes along a move,
-//! and the part list against the stock. Ported from krzim's own G-code simulator (MIT, same author):
+//! and the part list against the stock. Ported from the author's own MIT-licensed G-code simulator (MIT, same author):
 //! the mounts, the part shapes, the zones and the clearance check.
 
 use serde::{Deserialize, Serialize};

@@ -9,7 +9,7 @@
 //! bar. A tile draws the walls on its far sides (+X and +Y, or +X and round), so it depends on
 //! the cells next to it there: rebuild it when its own version or those neighbours' change.
 //! Every triangle's `tri_face` is its colour class: [`CLASS_UNCUT`], or [`CLASS_TOOL`] plus
-//! the slot of the tool that cut it last. Ported from krzim's own G-code simulator (MIT, same author):
+//! the slot of the tool that cut it last. Ported from the author's own MIT-licensed G-code simulator (MIT, same author):
 //! the stock drawn as tops, walls and skirt.
 
 use std::f64::consts::TAU;

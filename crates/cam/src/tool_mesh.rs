@@ -2,7 +2,7 @@
 //! profile the simulation cuts with (flat, ball, bull nose, drill point, chamfer taper, face
 //! mill corner; a thread mill with its rows of teeth), the rest of its flute length, the plain
 //! shank up to the holder, and every holder section. The tip is at the origin, the axis +Z.
-//! Nothing decides with these meshes. Ported from krzim's own G-code simulator (MIT, same author): the
+//! Nothing decides with these meshes. Ported from the author's own MIT-licensed G-code simulator (MIT, same author): the
 //! tool turned from its profile.
 
 use std::f64::consts::TAU;

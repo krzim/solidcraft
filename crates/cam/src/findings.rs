@@ -2,7 +2,7 @@
 //! and a list to step through), and the events merged by kind (a stable kebab-case code), each
 //! with its count and the first lines it happened at (for a summary).
 //!
-//! Ported from krzim's own G-code simulator (MIT, same author): the merging by code, its severities and
+//! Ported from the author's own MIT-licensed G-code simulator (MIT, same author): the merging by code, its severities and
 //! the cap on the lines kept.
 
 use serde::{Deserialize, Serialize};
