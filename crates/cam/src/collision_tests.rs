@@ -479,3 +479,35 @@ fn the_deepest_gouge_of_a_move_is_measured_whatever_the_quick_test_says() {
     let along = hits.iter().find(|h| h.index == 2).map(|h| h.distance);
     assert!(along.is_some_and(|d| (d - 0.03).abs() < 1e-6), "{hits:?}");
 }
+
+/// The end of a taper turned on a 4th axis, as the part's own tessellation gives it: the end
+/// face in the plane X 30 (some of its corners a rounding off it) with an edge along the radial
+/// line at 45°, and the taper's last facets meeting it at the rim.
+fn taper_end() -> Surface {
+    let v = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+    let (rim, half) = (v(30.0, 4.242640687119286, 4.242640687119286), v(30.0, 2.1213203435596437, 2.1213203435596437));
+    let (f1, f2) = (v(30.000000000000004, 3.283370607972145, 3.0089100015804924), v(30.000000000000004, 3.008910001580494, 3.283370607972145));
+    let (f3, f4) = (v(30.000000000000004, 4.0174348163531635, 4.456480393354539), v(30.000000000000004, 4.456480393354539, 4.0174348163531635));
+    let (t1, t2) = (v(27.142857142857146, 4.765420117686176, 4.5248695640139305), v(27.142857142857146, 4.64670170494017, 4.646701704940169));
+    let t3 = v(27.14285714285714, 4.524869564013933, 4.765420117686174);
+    Surface::new(vec![[rim, half, f1], [rim, f2, half], [rim, f3, f2], [rim, f1, f4], [f4, t1, rim], [rim, t1, t2], [rim, t2, t3], [rim, t3, f3]])
+        .unwrap()
+}
+
+/// A ball resting on the end of the taper, turned with A alone so its axis runs along the end
+/// face's edge, is not in the part: the face, met edge-on by the line down the axis, is no
+/// surface above the tip (a 0.7658 mm gouge was reported there).
+#[test]
+fn a_ball_whose_axis_runs_along_a_face_edge_on_does_not_gouge_it() {
+    let s = taper_end();
+    let ball = Cutter::ball(2.0).unwrap();
+    let to = Pose::new(Vec3::new(30.0, 4.270647634931788, 4.27064763493179), Vec3::new(0.0, 0.7071067811865475, 0.7071067811865477));
+    let from = Pose::new(Vec3::new(30.0, 4.157390151470782, 4.38097511465872), Vec3::new(0.0, 0.6883545756937539, 0.7253743710122877));
+    assert_eq!(depth_at(&s, &ball, &to).unwrap(), 0.0);
+    let path = Toolpath5 { moves: vec![Move5::Feed { to: from, feed: 1000.0 }, Move5::Feed { to, feed: 1000.0 }] };
+    let hits = gouges(&s, &ball, &path, 0.0075, 1.0).unwrap();
+    assert!(hits.is_empty(), "{hits:?}");
+    // The line down the axis meets the part where it really does: the rim, just under the tip.
+    let (t, _) = s.raycast(to.up(50.0), -to.axis).unwrap();
+    assert!((50.0 - t + 0.0396).abs() < 1e-3, "met {} above the tip", 50.0 - t);
+}

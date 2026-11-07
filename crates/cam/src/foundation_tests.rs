@@ -413,3 +413,27 @@ fn near_vertical_faces_far_from_the_origin() {
     let f = Frame::new(Vec3::new(0.0, 0.0, 0.0), z, z + Vec3::new(0.8, -0.6, 0.0) * 1e-3).unwrap();
     assert!(f.is_orthonormal());
 }
+
+/// A ray in a triangle's plane (to rounding) meets it nowhere off the triangle: one along an
+/// edge of an end face, as tessellated, was taken to meet it millimetres off it.
+#[test]
+fn a_ray_in_a_triangles_plane_meets_it_nowhere_off_it() {
+    let tri = [
+        Vec3::new(30.0, 4.242640687119286, 4.242640687119286),
+        Vec3::new(30.0, 2.1213203435596437, 2.1213203435596437),
+        Vec3::new(30.000000000000004, 3.283370607972145, 3.0089100015804924),
+    ];
+    let axis = Vec3::new(0.0, 0.7071067811865475, 0.7071067811865477);
+    let tip = Vec3::new(30.0, 4.270647634931788, 4.27064763493179);
+    for reach in [10.0, 50.0, 97.3, 120.0, 150.0] {
+        let o = tip + axis * reach;
+        if let Some(at) = ray_triangle(o, -axis, &tri) {
+            let p = o - axis * at;
+            let off = p.dist(nearest_on_triangle(p, &tri));
+            assert!(off < 1e-9, "from {reach} mm out: met {} mm off the triangle", off);
+        }
+    }
+    // A ray through it at a slant still meets it.
+    let (o, d) = (Vec3::new(40.0, 3.2158, 3.1243), Vec3::new(-1.0, 0.0, 0.0));
+    assert!(ray_triangle(o, d, &tri).is_some_and(|at| (at - 10.0).abs() < 1e-9));
+}

@@ -17,6 +17,10 @@ use crate::{CamError, Result, invalid};
 pub const MAX_TRIANGLES: usize = 5_000_000;
 /// Largest coordinate accepted (mm).
 pub const MAX_COORD: f64 = 1.0e6;
+/// The smallest sine of the angle between a ray and a triangle's plane at which [`ray_triangle`]
+/// says where the ray meets it: nearer the plane than that, what is left of the arithmetic is
+/// rounding, and the point it gives may be anywhere along the ray.
+pub const PARALLEL_SINE: f64 = 1e-9;
 
 #[derive(Clone, Debug)]
 pub struct Surface {
@@ -162,12 +166,16 @@ pub fn barycentric(t: &[Vec3; 3], p: Vec3) -> Option<[f64; 3]> {
     Some([1.0 - v - w, v, w])
 }
 
-/// Where the ray `o + t·d` (t ≥ 0) meets the triangle (Möller–Trumbore), either side.
+/// Where the ray `o + t·d` (t ≥ 0) meets the triangle (Möller–Trumbore), either side. A ray in
+/// the triangle's plane, to rounding ([`PARALLEL_SINE`]), meets it nowhere: such a ray runs
+/// into the triangles beyond the edges it crosses, which say where.
 pub fn ray_triangle(o: Vec3, d: Vec3, t: &[Vec3; 3]) -> Option<f64> {
     let (e1, e2) = (t[1] - t[0], t[2] - t[0]);
     let p = d.cross(e2);
+    // `d · (e2 × e1)`: the sine of the ray's angle to the plane, times the ray's length and
+    // twice the triangle's area.
     let det = e1.dot(p);
-    if det.abs() <= 1e-300 {
+    if !(det.abs() > PARALLEL_SINE * d.len() * e1.cross(e2).len()) || det.abs() <= 1e-300 {
         return None;
     }
     let inv = 1.0 / det;
