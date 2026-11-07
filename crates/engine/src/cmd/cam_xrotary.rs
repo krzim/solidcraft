@@ -24,38 +24,50 @@ const MAX_PATTERN: usize = MAX_OPERATIONS;
 const WRAP_CLEARANCE: f64 = 5.0;
 const WRAP_RETRACT: f64 = 1.0;
 
-/// Plans the job entry `spec` onto `planned` (an indexed pattern as one operation per angle) and
-/// holds each against the setup check.
-/// `arc_tol`: how closely arcs are followed into the poses the checks run along.
-pub(super) fn plan_into(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5, arc_tol: f64, planned: &mut Vec<Planned>) -> Result<()> {
-    let start = planned.len();
-    let room = |have: usize, more: usize| {
-        if have.saturating_add(more) > MAX_OPERATIONS {
-            Err(bad(ctx.cmd, format!("a job has at most {MAX_OPERATIONS} operations, every angle of its indexed patterns counted")))
-        } else {
-            Ok(())
-        }
-    };
+/// Refuses more than [`MAX_OPERATIONS`] operations in a job, `have` and `more` together.
+fn room(ctx: &Ctx<'_>, have: usize, more: usize) -> Result<()> {
+    if have.saturating_add(more) > MAX_OPERATIONS {
+        Err(bad(ctx.cmd, format!("a job has at most {MAX_OPERATIONS} operations, every angle of its indexed patterns counted")))
+    } else {
+        Ok(())
+    }
+}
+
+/// The operations `spec` plans: itself, or an indexed pattern's at each of its angles, its arcs
+/// followed within `arc_tol` into the poses the checks run along. Each operation is planned on
+/// its own, so operations may be planned side by side; the checks that
+/// need the operation before ([`add_checked`]) come after.
+pub(super) fn plan_op(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Vec<Planned>> {
     match spec {
         OperationSpec::IndexedPattern(o) => {
             let name = common3(&o.operation).name;
             let angles = pattern_angles(ctx, name, o)?;
-            room(planned.len(), angles.len())?;
+            room(ctx, 0, angles.len())?;
+            let mut out = Vec::with_capacity(angles.len());
             for a in angles {
                 let mut op = (*o.operation).clone();
                 rename(&mut op, format!("{name} A{}", num(a)));
-                planned.push(plan(ctx, &OperationSpec::Indexed(IndexedOp { name: None, a_deg: a, operation: Box::new(op) }), arc_tol)?);
+                out.push(plan(ctx, &OperationSpec::Indexed(IndexedOp { name: None, a_deg: a, operation: Box::new(op) }), arc_tol)?);
             }
+            Ok(out)
         }
-        _ => {
-            room(planned.len(), 1)?;
-            planned.push(plan(ctx, spec, arc_tol)?);
-        }
+        _ => Ok(vec![plan(ctx, spec, arc_tol)?]),
     }
+}
+
+/// `ops` (what [`plan_op`] planned for `spec`) after `planned`, each set-up checked against the
+/// operation before it. On an error nothing is added.
+pub(super) fn add_checked(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5, planned: &mut Vec<Planned>, ops: Vec<Planned>) -> Result<()> {
+    room(ctx, planned.len(), ops.len())?;
+    let start = planned.len();
+    planned.extend(ops);
     for k in start..planned.len() {
         let prev = k.checked_sub(1).and_then(|j| planned.get(j));
-        if let Some(p) = planned.get(k) {
-            setup_check(ctx, spec, post, prev, p)?;
+        if let Some(p) = planned.get(k)
+            && let Err(e) = setup_check(ctx, spec, post, prev, p)
+        {
+            planned.truncate(start);
+            return Err(e);
         }
     }
     Ok(())

@@ -72,6 +72,7 @@ pub(super) fn contour_options(ctx: &Ctx<'_>, op: &str, o: &ContourOp, tool: &Too
         finish_stepover: o.finish_stepover.unwrap_or(tool.diameter * FINISH_SHARE),
         spring_pass: o.spring_pass.unwrap_or(false),
         linking: linking(o.linking),
+        vertical_lead: o.vertical_lead,
     })
 }
 

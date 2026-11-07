@@ -104,6 +104,13 @@ pub struct FaceOp {
     /// above, else the part's extent.
     #[serde(default)]
     pub rect: Option<[[f64; 2]; 2]>,
+    /// The radius of a vertical lead arc, mm: each pass is entered down a quarter arc in the
+    /// vertical plane of the passes from this far above and behind its start, and left up one
+    /// beyond its end (`G18`/`G19` arcs when the passes run along X or Y); with `zigzag` the
+    /// passes of a level link round half circles outside the area. Default: none (straight down
+    /// beside the stock, straight links).
+    #[serde(default)]
+    pub lead_radius: Option<f64>,
 }
 
 impl FaceOp {

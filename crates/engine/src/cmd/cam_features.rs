@@ -17,7 +17,6 @@
 //! same parameters give the same ids. `cam.job` operations name them through [`Lazy`], which
 //! finds the features the way `cam.features` does with the job's bodies, origin and machine.
 
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::{PI, TAU};
 
@@ -217,12 +216,12 @@ pub(crate) struct Lazy {
     origin: Vec3,
     tol: f64,
     machine: Machine,
-    cell: OnceCell<std::result::Result<FeatureSet, String>>,
+    cell: std::sync::OnceLock<std::result::Result<FeatureSet, String>>,
 }
 
 impl Lazy {
     pub fn new(bodies: Option<Vec<String>>, fixtures: Vec<String>, origin: Vec3, tol: f64, machine: &Machine) -> Lazy {
-        Lazy { bodies, fixtures, origin, tol, machine: machine.clone(), cell: OnceCell::new() }
+        Lazy { bodies, fixtures, origin, tol, machine: machine.clone(), cell: std::sync::OnceLock::new() }
     }
 
     /// The axis features are found along for `machine`: `a` with one rotary about X, else `z`.

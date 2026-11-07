@@ -98,4 +98,8 @@ pub struct MachineTimeReport {
     pub span_mm: [f64; 3],
     /// What the controller will do differently from what is written (also in the reply's notes).
     pub warnings: Vec<String>,
+    /// Of those, where the program asks for more than the machine's spindle range or top feeds
+    /// allow (the setup sheet states them first).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<String>,
 }

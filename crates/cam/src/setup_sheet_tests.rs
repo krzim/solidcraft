@@ -265,6 +265,7 @@ fn sample(name: &str) -> SetupSheet {
         ],
         warnings: vec![format!("{name} is not checked")],
         notes: vec!["tessellated".into()],
+        ..SetupSheet::default()
     }
 }
 
@@ -436,4 +437,28 @@ fn the_stock_is_described_by_its_size_and_place() {
     let bar = crate::stock::Stock::Cylinder { radius: 12.5, x_min: -40.0, x_max: 35.0 };
     let w = stock_words(&bar);
     assert_eq!(w, "A bar 25 mm in diameter about the X axis (Y0 Z0), from X-40 to X35 (75 mm long).");
+}
+
+/// The fixtures are listed, and the machine's spindle-speed and feed limits the job runs into
+/// come first, before the work zero, in both formats.
+#[test]
+fn fixtures_are_listed_and_the_machines_limits_come_first() {
+    let s = SetupSheet {
+        fixtures: vec!["`Vise jaw` X -40 to 40, Y -30 to -20, Z -20 to 0 <steel>".into()],
+        attention: vec!["operation 0 `drill`: tool 160's 3700 rev/min is held to the spindle's range 10000 to 24000: 10000 rev/min".into()],
+        ..sample("p")
+    };
+    let h = s.html();
+    let first = h.find("Before you start").unwrap();
+    assert!(first < h.find("Work zero").unwrap(), "{h}");
+    assert!(h[first..].contains("held to the spindle"), "{h}");
+    assert!(h.contains("<h2>Fixtures</h2>") && h.contains("`Vise jaw` X -40 to 40") && h.contains("&lt;steel&gt;"), "{h}");
+    let m = s.markdown();
+    let first = m.find("## Before you start").unwrap();
+    assert!(first < m.find("## Work zero").unwrap(), "{m}");
+    assert!(m.contains("## Fixtures") && m.contains("Vise jaw"), "{m}");
+    // Without either, neither section.
+    let plain = sample("p");
+    assert!(!plain.html().contains("Before you start") && !plain.html().contains("Fixtures"));
+    assert!(!plain.markdown().contains("Before you start") && !plain.markdown().contains("## Fixtures"));
 }

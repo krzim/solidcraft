@@ -30,7 +30,7 @@ use solidcraft_cam::rotary::{RotaryParams, RotaryPattern, RotaryRoughingParams, 
 use solidcraft_cam::surface_ops::{Boundary, ParallelParams, RoughingParams, WaterlineParams, parallel, roughing, waterline};
 use solidcraft_cam::{
     CamError, Compaction, ContourParams, Cut, DEFAULT_DESCENT_LIMIT, DEFAULT_MAX_ANGLE_STEP, Feeds, Frame, Heights, HolderSection, LineNumbers, Move,
-    Operation5, PocketParams, SafeRetract, Side, Surface, Tool, ToolKind, Toolpath, Toolpath5, arc_sweep, compact, contour_with, lift_entries,
+    Operation5, PocketParams, SafeRetract, Side, Strategy, Surface, Tool, ToolKind, Toolpath, Toolpath5, compact, contour_with, lift_entries,
     limit_descents, pocket_with,
 };
 use solidcraft_geom::Mesh;
@@ -281,6 +281,18 @@ fn tool_sample() -> Value {
         point_angle_deg: Some(118.0),
         thread_pitch: Some(1.0),
         tooth_height: Some(1.0),
+        surface_speed: Some(1.0),
+        chip_load: Some(1.0),
+        cutting_data: vec![solidcraft_cam::CuttingData {
+            strategy: Strategy::Adaptive,
+            spindle_rpm: Some(1.0),
+            feed: Some(1.0),
+            plunge_feed: Some(1.0),
+            stepdown: Some(1.0),
+            stepover: Some(1.0),
+            surface_speed: Some(1.0),
+            chip_load: Some(1.0),
+        }],
         ..Tool::new(1, ToolKind::BullNose, 1.0, 1.0)
     };
     serde_json::to_value(tool).unwrap_or(Value::Null)
@@ -440,6 +452,7 @@ fn tools_of(cmd: &str, job: &CamJob, base: Option<&Path>) -> Result<Vec<Tool>> {
 }
 
 /// The part, the fixtures and the collision surface (part and fixtures) in work coordinates.
+#[derive(Clone)]
 struct Surfaces {
     part: Surface,
     /// The fixtures alone (`None` without any), which an operation that skips the gouge check
@@ -605,6 +618,83 @@ fn sketch_regions(cmd: &str, s: &Session, key: &str, profiles: Option<&[usize]>,
     };
     let lp = |l: &Loop2| Loop2 { segs: l.segs.iter().map(seg).collect() };
     Ok(regions.iter().map(|r| Region2 { outer: lp(&r.outer), holes: r.holes.iter().map(lp).collect() }).collect())
+}
+
+/// `f` for every item, each on a thread of its own (with the kernel's stack, and the caller's
+/// file scope) natively; one after the other in the browser, for a single item, or where a
+/// thread cannot be had. The results in order; `None` for an item whose thread stopped.
+fn plan_each<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<Option<R>> {
+    if items.len() <= 1 || cfg!(target_arch = "wasm32") {
+        return items.into_iter().map(|t| Some(f(t))).collect();
+    }
+    let scope = solidcraft_io::vfs::current_scope();
+    let (f, scope) = (&f, &scope);
+    std::thread::scope(|threads| {
+        let mut pending = Vec::with_capacity(items.len());
+        for item in items {
+            // The item goes through a slot the thread takes it from, so that it is still here
+            // when no thread can be had.
+            let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(item)));
+            let mine = std::sync::Arc::clone(&slot);
+            let job = move || {
+                let item = mine.lock().ok().and_then(|mut s| s.take());
+                item.map(|t| solidcraft_io::vfs::scoped(scope.clone(), || f(t)))
+            };
+            match solidcraft_kernel::kernel_thread("solidcraft-cam-plan").spawn_scoped(threads, job) {
+                Ok(h) => pending.push(Err(h)),
+                Err(_) => pending.push(Ok(slot.lock().ok().and_then(|mut s| s.take()).map(f))),
+            }
+        }
+        pending
+            .into_iter()
+            .map(|p| match p {
+                Ok(done) => done,
+                Err(h) => h.join().ok().flatten(),
+            })
+            .collect()
+    })
+}
+
+/// What the operations of a job share while they are planned, side by side or not: a
+/// [`Ctx`] each, with an agent of its own ([`Shared::ctx`]).
+#[derive(Clone, Copy)]
+struct Shared<'a> {
+    cmd: &'a str,
+    s: &'a Session,
+    machine: &'a Machine,
+    tools: &'a [Tool],
+    part: &'a Surface,
+    all: &'a Surface,
+    origin: Vec3,
+    tol: f64,
+    stock: Option<&'a solidcraft_cam::stock::Stock>,
+    chord: f64,
+    post: &'a Post5,
+    features: &'a features::Lazy,
+}
+
+impl<'a> Shared<'a> {
+    fn ctx<'b>(&self, agent: &'b agent::Agent) -> Ctx<'b>
+    where
+        'a: 'b,
+    {
+        Ctx {
+            adaptive: Default::default(),
+            cmd: self.cmd,
+            s: self.s,
+            machine: self.machine,
+            tools: self.tools,
+            part: self.part,
+            all: self.all,
+            origin: self.origin,
+            tol: self.tol,
+            stock: self.stock,
+            chord: self.chord,
+            post: self.post,
+            agent,
+            features: self.features,
+        }
+    }
 }
 
 /// What every operation needs, resolved.
@@ -1038,6 +1128,7 @@ fn spec_name(spec: &OperationSpec) -> Option<&str> {
 
 /// One operation planned: what the program holds, its poses in work coordinates (for the
 /// checks and the preview), and its report.
+#[derive(Clone)]
 struct Planned {
     op: MachineOperation,
     poses: Toolpath5,
@@ -1124,7 +1215,48 @@ fn wrap_points(ctx: &Ctx<'_>, o: &crate::schema::cam::WrapOp) -> Result<Vec<Vec3
     }
 }
 
+/// The strategy whose cutting data an operation's tool takes ([`solidcraft_cam::Tool::for_strategy`]).
+fn strategy_of(spec: &OperationSpec) -> Option<Strategy> {
+    let of3 = |op: &Op3Spec| match op {
+        Op3Spec::Adaptive(_) | Op3Spec::AdaptiveRoughing(_) => Some(Strategy::Adaptive),
+        Op3Spec::Contour(_) | Op3Spec::Pocket(_) | Op3Spec::Roughing(_) => Some(Strategy::Slot),
+        Op3Spec::Parallel(_)
+        | Op3Spec::Waterline(_)
+        | Op3Spec::Scallop(_)
+        | Op3Spec::SteepShallow(_)
+        | Op3Spec::Pencil(_)
+        | Op3Spec::RestFinish(_) => Some(Strategy::Finish),
+        Op3Spec::Drill(_) => Some(Strategy::Drill),
+        Op3Spec::Chamfer(_) => Some(Strategy::Chamfer),
+    };
+    match spec {
+        OperationSpec::Adaptive(_) | OperationSpec::AdaptiveRoughing(_) => Some(Strategy::Adaptive),
+        OperationSpec::Contour(_)
+        | OperationSpec::Pocket(_)
+        | OperationSpec::Roughing(_)
+        | OperationSpec::RotaryRoughing(_)
+        | OperationSpec::Bore(_)
+        | OperationSpec::WrapPocket(_)
+        | OperationSpec::WrapContour(_) => Some(Strategy::Slot),
+        OperationSpec::Parallel(_)
+        | OperationSpec::Waterline(_)
+        | OperationSpec::Scallop(_)
+        | OperationSpec::SteepShallow(_)
+        | OperationSpec::Pencil(_)
+        | OperationSpec::RestFinish(_)
+        | OperationSpec::RotaryFinish(_)
+        | OperationSpec::Wrap(_) => Some(Strategy::Finish),
+        OperationSpec::Drill(_) => Some(Strategy::Drill),
+        OperationSpec::Chamfer(_) => Some(Strategy::Chamfer),
+        OperationSpec::Face(_) => Some(Strategy::Face),
+        OperationSpec::ThreadMill(_) => None,
+        OperationSpec::Indexed(o) => of3(&o.operation),
+        OperationSpec::IndexedPattern(o) => of3(&o.operation),
+    }
+}
+
 fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
+    ctx.agent.set_strategy(strategy_of(spec));
     if spec_name(spec).is_some_and(|n| n.trim().is_empty()) {
         return Err(bad(ctx.cmd, "every operation needs a `name` (an `indexed` one may carry it on itself or on its inner `operation`)"));
     }
@@ -1291,13 +1423,14 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
         OperationSpec::ThreadMill(o) => helical::thread_mill_op(ctx, o, arc_tol),
         OperationSpec::WrapPocket(o) => xrotary::plan_wrap_pocket(ctx, o),
         OperationSpec::WrapContour(o) => xrotary::plan_wrap_contour(ctx, o),
-        // `xrotary::plan_into` plans a pattern as its indexed operations.
+        // `xrotary::plan_op` plans a pattern as its indexed operations.
         OperationSpec::IndexedPattern(o) => Err(ctx.bad(common3(&o.operation).name, "an indexed pattern is planned as its indexed operations")),
     }
 }
 
 /// A job planned and its program written in memory: what `cam.job` checks and writes, and what
 /// `cam.view.load` plays.
+#[derive(Clone)]
 struct PlannedJob {
     name: String,
     machine: Machine,
@@ -1357,7 +1490,7 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
     let stock = cam_stock::stock_of(cmd, job, &surfaces, tol, &mut notes)?;
     notes.extend(loaded.notes.iter().cloned());
     let geometry = agent::Geometry::of(s, job, origin, &mut notes)?;
-    let agent = agent::Agent::new(cmd, job, geometry, loaded, &machine, &post)?;
+    let agent = agent::Agent::new(cmd, job, geometry, loaded, &machine, &post, machine_rates.as_ref())?;
     if job.work_offset.is_some() && !post.base.writes_work_offset() {
         notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
     }
@@ -1367,8 +1500,7 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
     // How deep a cut into the tessellated part is allowed: the tolerance less what the
     // tessellation itself may be off by.
     let allowed = tol - chord;
-    let ctx = Ctx {
-        adaptive: Default::default(),
+    let shared = Shared {
         cmd,
         s,
         machine: &machine,
@@ -1380,24 +1512,38 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
         stock: stock.as_ref(),
         chord,
         post: &post,
-        agent: &agent,
         features: &found,
     };
+    let ctx = shared.ctx(&agent);
     let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
     // Arcs are followed far closer than the post's tolerance for the checks, so their chords
     // are not taken for cuts into the part.
     let pose_tol = post.base.arc_tolerance.min(allowed * CHECK_ARC_SHARE).max(1e-6);
     let mut op_of: Vec<usize> = Vec::with_capacity(job.operations.len());
     let mut refused = Vec::new();
-    for (i, spec) in job.operations.iter().enumerate() {
-        agent.start(i);
-        let before = planned.len();
-        match xrotary::plan_into(&ctx, spec, &post, pose_tol, &mut planned) {
-            Ok(()) => op_of.resize(planned.len(), i),
-            Err(e) => {
-                planned.truncate(before);
-                refused.push(agent.refusal_of(e));
+    // Every operation planned on its own with a fork of the agent, side by side natively; then,
+    // in order, what each recorded taken back and its set-up checked against the one before:
+    // the same plan, notes and refusals as one after the other.
+    let work: Vec<(usize, &OperationSpec, agent::Agent)> = job.operations.iter().enumerate().map(|(i, spec)| (i, spec, agent.fork())).collect();
+    let results = plan_each(work, |(i, spec, fork)| {
+        fork.start(i);
+        let r = xrotary::plan_op(&shared.ctx(&fork), spec, pose_tol);
+        (fork, r)
+    });
+    for (i, (spec, result)) in job.operations.iter().zip(results).enumerate() {
+        let r = match result {
+            Some((fork, r)) => {
+                agent.absorb(fork);
+                r.and_then(|ops| xrotary::add_checked(&ctx, spec, &post, &mut planned, ops))
             }
+            None => {
+                agent.start(i);
+                Err(EngineError::Other(format!("operation {i}: its planning stopped")))
+            }
+        };
+        match r {
+            Ok(()) => op_of.resize(planned.len(), i),
+            Err(e) => refused.push(agent.refusal_of(e)),
         }
     }
     if !refused.is_empty() {
@@ -1432,6 +1578,70 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
         op_of,
         agent,
     })
+}
+
+/// The last job planned in a session, kept so that the same job run again (a write after its
+/// dry run, a picture after the write) is not planned again ([`plan_cached`]).
+pub(crate) struct PlanCache {
+    key: PlanKey,
+    plan: PlannedJob,
+    /// How often it was reused.
+    pub(crate) hits: usize,
+}
+
+/// What a planned job depends on: the design (the same document, unchanged since), the job as
+/// loaded (its profile, machine and tool libraries merged in), the folder its files are read
+/// from, and the files planning reads (the post, a tool library, the machine's rates) by their
+/// time and size.
+struct PlanKey {
+    doc: std::sync::Arc<solidcraft_doc::Document>,
+    revision: u64,
+    job: String,
+    base: Option<PathBuf>,
+    files: Vec<(String, Option<(std::time::SystemTime, u64)>)>,
+}
+
+impl PlanKey {
+    fn of(s: &Session, loaded: &agent::Loaded) -> PlanKey {
+        let job = &loaded.job;
+        let base = loaded.base.as_deref();
+        let paths = [&job.post_path, &job.tool_library_path, &job.machine_rates_path].into_iter().flatten();
+        let files = paths
+            .chain(job.tool_library_paths.iter().flatten())
+            .map(|p| beside(base, p))
+            .map(|p| (p.clone(), solidcraft_io::vfs::stamp(&p)))
+            .collect();
+        PlanKey { doc: std::sync::Arc::clone(&s.doc), revision: s.revision, job: format!("{job:?}"), base: loaded.base.clone(), files }
+    }
+
+    fn same(&self, other: &PlanKey) -> bool {
+        std::sync::Arc::ptr_eq(&self.doc, &other.doc)
+            && self.revision == other.revision
+            && self.job == other.job
+            && self.base == other.base
+            && self.files == other.files
+    }
+}
+
+/// [`plan_job`], or the session's last plan of the same job on the same design: a write after
+/// a dry run reuses the dry run's plan. A file planning reads that changed since, or any change
+/// to the design, plans again.
+fn plan_cached(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob> {
+    let key = PlanKey::of(s, loaded);
+    if let Ok(mut cache) = s.cam_plan.lock() {
+        match cache.as_mut() {
+            Some(c) if c.key.same(&key) => {
+                c.hits += 1;
+                return Ok(c.plan.clone());
+            }
+            _ => *cache = None,
+        }
+    }
+    let plan = plan_job(cmd, s, loaded)?;
+    if let Ok(mut cache) = s.cam_plan.lock() {
+        *cache = Some(Box::new(PlanCache { key, plan: plan.clone(), hits: 0 }));
+    }
+    Ok(plan)
 }
 
 /// `cam.job`.
@@ -1492,7 +1702,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         allowed,
         op_of,
         agent,
-    } = plan_job(cmd, s, &loaded)?;
+    } = plan_cached(cmd, s, &loaded)?;
     let rb = readback_program(&text, &program, &post, &machine).map_err(|e| cam_err(cmd, "reading the program back", e))?;
     let machine_time = match &machine_rates {
         Some(r) => Some(rates::time_report(cmd, &text, &machine, &post, r)?),
@@ -1607,7 +1817,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
     gouge.pass = gouge.hits == 0;
     // Every operation's lowest cut against the stock's bottom.
     if let Some(st) = stock.as_ref() {
-        cam_stock::check_below_stock(&planned, st, surfaces.fixtures.as_ref(), &machine, tol, &mut failures);
+        cam_stock::check_below_stock(&planned, st, agent.geo.fixture_low(), &machine, tol, &mut failures);
     }
     // Every rapid of the program as written, and every position against the machine's travel.
     let unchecked: Vec<bool> = planned.iter().map(|p| !p.gouge_check).collect();
@@ -1692,25 +1902,27 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         notes: &notes,
         program_file: if dry_run { None } else { output.as_deref() },
         stock: stock.as_ref(),
+        fixtures: sheet::fixture_words(s, job.fixtures.as_deref().unwrap_or_default(), origin),
+        attention: agent.limits().into_iter().chain(machine_time.iter().flat_map(|t| t.limits.iter().cloned())).collect(),
     });
     let summary = sheet::summary(&setup);
 
     let mut outputs = Outputs::default();
     if !dry_run {
         if let Some(path) = &output {
-            solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            write_file(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
             outputs.gcode = Some(path.clone());
         }
         if let Some(path) = &params.preview {
             let page = preview_page(&name, &surfaces.all, &planned, &text);
-            solidcraft_io::vfs::write(path, page.as_bytes()).map_err(|e| {
+            write_file(path, page.as_bytes()).map_err(|e| {
                 let written = outputs.gcode.as_deref().map_or(String::new(), |g| format!(" (the G-code was written to {g})"));
                 EngineError::Other(format!("{path}: {e}{written}"))
             })?;
             outputs.preview = Some(path.clone());
         }
         if let (Some(path), Some(format)) = (&params.setup_sheet, sheet_format) {
-            solidcraft_io::vfs::write(path, setup.render(format).as_bytes()).map_err(|e| {
+            write_file(path, setup.render(format).as_bytes()).map_err(|e| {
                 let written: Vec<&str> = outputs.gcode.iter().chain(&outputs.preview).map(String::as_str).collect();
                 let written = if written.is_empty() { String::new() } else { format!(" ({} written)", written.join(" and ")) };
                 EngineError::Other(format!("{path}: {e}{written}"))
@@ -1757,6 +1969,15 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
     };
     agent.finish(&mut reply);
     Ok(reply)
+}
+
+/// Writes `bytes` to `path` whole: checked against the folders the caller may use, then to a
+/// temporary file beside it that is renamed over it, so a reader (the controller's share, a
+/// viewer) never sees half a program and a failed write leaves the old file as it was. In the
+/// browser the host stores files, and one write is whole there already.
+pub(super) fn write_file(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    solidcraft_io::vfs::check(path)?;
+    solidcraft_io::write_atomic(Path::new(path), bytes, false)
 }
 
 /// `path` as one file is named whatever its spelling: absolute, its folder resolved (links,
@@ -2099,13 +2320,22 @@ fn check(_: &mut Session, p: &Value) -> Result<Value> {
                 }
                 (*linear, rotary.clone())
             }
-            JointWords::Arc { linear, center, ccw, rotary, f, mm_per_unit, .. } => {
+            JointWords::Arc { linear, rotary, f, mm_per_unit, .. } | JointWords::PlaneArc { linear, rotary, f, mm_per_unit, .. } => {
                 reply.arcs += 1;
-                if let Some((from, _)) = &last {
-                    let r = Vec2::new(from.x, from.y).dist(*center);
-                    let len = (r * arc_sweep(*from, *linear, *center, *ccw)).hypot(linear.z - from.z);
+                // Measured round the arc in its own plane (G17, G18 or G19).
+                if let Some((from, _)) = &last
+                    && let Some(arc) = b.arc_from(*from)
+                {
+                    let len = arc.length();
                     reply.feed_length += len;
                     reply.cut_minutes += len / (f * mm_per_unit);
+                    // A vertical arc can reach past its ends along Z.
+                    if matches!(b, JointWords::PlaneArc { .. }) {
+                        for q in arc.points(1e-3) {
+                            lo = lo.min(q);
+                            hi = hi.max(q);
+                        }
+                    }
                 }
                 (*linear, rotary.clone())
             }

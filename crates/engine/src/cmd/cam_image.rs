@@ -205,7 +205,10 @@ fn written_rotary(machine: &Machine, post: &Post5, program: &MachineProgram) -> 
     let mut ranges = vec![vec![(f64::INFINITY, f64::NEG_INFINITY); machine.rotaries.len()]; starts.len()];
     for w in &words {
         let (line, rotary) = match w {
-            JointWords::Rapid { line, rotary, .. } | JointWords::Feed { line, rotary, .. } | JointWords::Arc { line, rotary, .. } => (*line, rotary),
+            JointWords::Rapid { line, rotary, .. }
+            | JointWords::Feed { line, rotary, .. }
+            | JointWords::Arc { line, rotary, .. }
+            | JointWords::PlaneArc { line, rotary, .. } => (*line, rotary),
             JointWords::Dwell { .. } => continue,
         };
         let Some(op) = starts.iter().rposition(|&s| s < line) else { continue };
@@ -389,7 +392,7 @@ pub(super) fn write(cmd: &str, s: &Session, req: &Request, set: &Setting<'_>, pl
         let cam = camera(view, set, planned, &ops, w, h);
         let (base, renderer) = base_picture(s, &cam, w, h)?;
         let png = picture(base, &cam, set, planned, &ops, view, w, h)?;
-        solidcraft_io::vfs::write(path, &png).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        super::write_file(path, &png).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
         report.image = Some(path.clone());
         report.renderer = renderer.into();
         report.camera = camera_report(&cam);
@@ -401,7 +404,7 @@ pub(super) fn write(cmd: &str, s: &Session, req: &Request, set: &Setting<'_>, pl
         for (i, p) in planned.iter().enumerate() {
             let file = Path::new(dir).join(format!("{:02}-{}.png", i + 1, slug(&p.report.name))).to_string_lossy().into_owned();
             let png = picture(base.clone(), &cam, set, planned, &[i], view, w, h)?;
-            solidcraft_io::vfs::write(&file, &png).map_err(|e| EngineError::Other(format!("{file}: {e}")))?;
+            super::write_file(&file, &png).map_err(|e| EngineError::Other(format!("{file}: {e}")))?;
             report.images.push(file);
         }
         if report.image.is_none() {

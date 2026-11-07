@@ -291,6 +291,19 @@ fn pieces(path: &Toolpath, roles: Option<&[MoveRole]>, ds: f64) -> Result<Vec<Pi
                         a = b;
                     }
                 }
+                Move::PlaneArc { to, center, plane, ccw, feed } => {
+                    let arc = crate::path::PlaneArc { from: p, to, center, plane, ccw };
+                    let n = (arc.length() / ds).ceil().max(1.0);
+                    if !(n <= MAX_PIECES) {
+                        return Err(CamError::TooLarge("the path is too long to measure".into()));
+                    }
+                    let mut a = p;
+                    for k in 1..=n as usize {
+                        let b = arc.at(k as f64 / n);
+                        out.push((a, b, feed, entry, i, false));
+                        a = b;
+                    }
+                }
                 Move::Rapid { .. } | Move::Dwell { .. } => {}
             }
         }
@@ -333,6 +346,7 @@ pub fn engagement(path: &Toolpath, roles: Option<&[MoveRole]>, radius: f64, mate
     for m in &path.moves {
         let out = match *m {
             Move::Arc { to, center, .. } => far(to) || far(center.extend(0.0)),
+            Move::PlaneArc { to, center, .. } => far(to) || far(center),
             _ => m.target().is_some_and(far),
         };
         if out {

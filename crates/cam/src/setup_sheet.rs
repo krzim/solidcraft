@@ -172,6 +172,14 @@ pub struct SetupSheet {
     /// The stock, in words, when the job says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stock: Option<String>,
+    /// What holds the stock (the job's fixtures), each in words with where it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixtures: Vec<String>,
+    /// The machine's spindle-speed and feed limits the job runs into (speeds and feeds held
+    /// to them, blocks the controller slows), stated first so the operator reads them before
+    /// the program runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<String>,
     pub tools: Vec<SheetTool>,
     pub operations: Vec<SheetOperation>,
     pub totals: Totals,
@@ -298,7 +306,9 @@ pub fn program_reach(text: &str, post: &Post5, machine: &Machine, ops: &[(&str, 
     for b in parse5(text, &machine.letters())? {
         let (line, linear, rotary, cut) = match &b {
             JointWords::Rapid { line, linear, rotary, .. } => (*line, *linear, rotary, false),
-            JointWords::Feed { line, linear, rotary, .. } | JointWords::Arc { line, linear, rotary, .. } => (*line, *linear, rotary, true),
+            JointWords::Feed { line, linear, rotary, .. }
+            | JointWords::Arc { line, linear, rotary, .. }
+            | JointWords::PlaneArc { line, linear, rotary, .. } => (*line, *linear, rotary, true),
             JointWords::Dwell { .. } => continue,
         };
         // The blocks come in line order: the operation is the last one started before the line.
@@ -613,6 +623,13 @@ impl SetupSheet {
             h.push_str(&format!("<tr><td>{k}</td><td>{}</td></tr>\n", e(&v)));
         }
         h.push_str("</table>\n");
+        if !self.attention.is_empty() {
+            h.push_str("<h2>Before you start: the machine's limits</h2>\n<ul>\n");
+            for a in &self.attention {
+                h.push_str(&format!("<li class=\"bad\">{}</li>\n", e(a)));
+            }
+            h.push_str("</ul>\n");
+        }
 
         h.push_str("<h2>Work zero</h2>\n<ul>\n");
         for w in &self.work_zero.words {
@@ -628,6 +645,13 @@ impl SetupSheet {
         }
         if let Some(stock) = &self.stock {
             h.push_str(&format!("<h2>Stock</h2>\n<p>{}</p>\n", e(stock)));
+        }
+        if !self.fixtures.is_empty() {
+            h.push_str("<h2>Fixtures</h2>\n<ul>\n");
+            for f in &self.fixtures {
+                h.push_str(&format!("<li>{}</li>\n", e(f)));
+            }
+            h.push_str("</ul>\n");
         }
 
         h.push_str(
@@ -756,6 +780,13 @@ impl SetupSheet {
             m.push_str(&format!("- **Program:** {}\n", e(f)));
         }
         m.push_str(&format!("- **Work offset:** {}\n- **Units:** mm, mm/min\n\n", e(&self.work_offset)));
+        if !self.attention.is_empty() {
+            m.push_str("## Before you start: the machine's limits\n\n");
+            for a in &self.attention {
+                m.push_str(&format!("- **{}**\n", e(a)));
+            }
+            m.push('\n');
+        }
         m.push_str("## Work zero\n\n");
         for w in &self.work_zero.words {
             m.push_str(&format!("- {}\n", e(w)));
@@ -770,6 +801,13 @@ impl SetupSheet {
         }
         if let Some(stock) = &self.stock {
             m.push_str(&format!("## Stock\n\n- {}\n\n", e(stock)));
+        }
+        if !self.fixtures.is_empty() {
+            m.push_str("## Fixtures\n\n");
+            for f in &self.fixtures {
+                m.push_str(&format!("- {}\n", e(f)));
+            }
+            m.push('\n');
         }
         m.push_str("## Tools\n\n| T | Kind | Size | Flutes | Flute length | Shank | Stickout | Holder | Z min | Operations | Description |\n");
         m.push_str("|---:|---|---|---:|---:|---:|---:|---|---:|---|---|\n");

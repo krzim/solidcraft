@@ -9,6 +9,12 @@ use crate::{Result, invalid};
 pub const MAX_TOOL_NUMBER: u32 = 9999;
 /// Largest tool diameter (mm).
 pub const MAX_TOOL_DIAMETER: f64 = 1000.0;
+/// Largest surface speed (m/min).
+pub const MAX_SURFACE_SPEED: f64 = 10_000.0;
+/// Largest chip load (mm a tooth).
+pub const MAX_CHIP_LOAD: f64 = 10.0;
+/// Most cutting data entries on one tool.
+pub const MAX_CUTTING_DATA: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +113,82 @@ pub struct Tool {
     /// the radius. Thread mills only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tooth_height: Option<f64>,
+    /// The cutting speed at the cutting diameter (m/min): without `spindle_rpm`, the spindle
+    /// speed is worked out from it ([`Tool::speeds`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_speed: Option<f64>,
+    /// The feed per tooth (mm): without `feed`, the cutting feed is the spindle speed times the
+    /// flutes times this ([`Tool::speeds`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chip_load: Option<f64>,
+    /// Cutting data for a kind of operation, each over the tool's own values when an operation
+    /// of that strategy uses the tool ([`Tool::for_strategy`]): an adaptive clearing's deep,
+    /// thin cut and a slot's shallow, full-width one want different numbers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cutting_data: Vec<CuttingData>,
+}
+
+/// The kinds of operation a tool's [`CuttingData`] is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Strategy {
+    /// Adaptive clearing: deep, at a small, steady engagement.
+    Adaptive,
+    /// Cutting at up to the tool's whole width: pockets, contours, bores, roughing levels.
+    Slot,
+    /// Facing the stock's top.
+    Face,
+    /// 3D finishing passes.
+    Finish,
+    Chamfer,
+    Drill,
+}
+
+impl Strategy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Strategy::Adaptive => "adaptive",
+            Strategy::Slot => "slot",
+            Strategy::Face => "face",
+            Strategy::Finish => "finish",
+            Strategy::Chamfer => "chamfer",
+            Strategy::Drill => "drill",
+        }
+    }
+}
+
+/// A tool's cutting data for one [`Strategy`]: each value given takes the place of the tool's
+/// own when an operation of that strategy uses it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CuttingData {
+    pub strategy: Strategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spindle_rpm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plunge_feed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepdown: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepover: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_speed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chip_load: Option<f64>,
+}
+
+/// Where a tool's spindle speed and cutting feed come from ([`Tool::speeds`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Speeds {
+    /// Rev/min: the tool's `spindle_rpm`, else from its `surface_speed`.
+    pub spindle_rpm: Option<f64>,
+    /// Whether the spindle speed was worked out from the surface speed.
+    pub rpm_derived: bool,
+    /// Mm/min: the tool's `feed`, else the spindle speed times the flutes times `chip_load`.
+    pub feed: Option<f64>,
+    /// Whether the feed was worked out from the chip load.
+    pub feed_derived: bool,
 }
 
 /// One cylinder of a tool holder.
@@ -151,7 +233,47 @@ impl Tool {
             point_angle_deg: None,
             thread_pitch: None,
             tooth_height: None,
+            surface_speed: None,
+            chip_load: None,
+            cutting_data: Vec::new(),
         }
+    }
+
+    /// The tool as an operation of `strategy` uses it: the values of its cutting data for that
+    /// strategy (the first entry for it) in place of its own; without one, itself.
+    pub fn for_strategy(&self, strategy: Strategy) -> Tool {
+        let mut t = self.clone();
+        if let Some(d) = self.cutting_data.iter().find(|d| d.strategy == strategy) {
+            // Explicit speeds of the data win over the tool's, and so do its rates.
+            if d.spindle_rpm.is_some() || d.surface_speed.is_some() {
+                (t.spindle_rpm, t.surface_speed) = (d.spindle_rpm, d.surface_speed);
+            }
+            if d.feed.is_some() || d.chip_load.is_some() {
+                (t.feed, t.chip_load) = (d.feed, d.chip_load);
+            }
+            t.plunge_feed = d.plunge_feed.or(t.plunge_feed);
+            t.stepdown = d.stepdown.or(t.stepdown);
+            t.stepover = d.stepover.or(t.stepover);
+        }
+        t
+    }
+
+    /// The spindle speed and cutting feed the tool gives, explicit values first: the spindle
+    /// speed from the surface speed (`1000 · vc / (π · D)`) when it has no `spindle_rpm`, the
+    /// feed from the chip load (`rpm · flutes · fz`) when it has no `feed`. `rpm` is the speed
+    /// the feed is worked out at, when the caller has held the spindle speed to a range.
+    pub fn speeds(&self, rpm: Option<f64>) -> Speeds {
+        let (spindle_rpm, rpm_derived) = match (self.spindle_rpm, self.surface_speed) {
+            (Some(r), _) => (Some(r), false),
+            (None, Some(vc)) => (Some(1000.0 * vc / (std::f64::consts::PI * self.diameter)), true),
+            (None, None) => (None, false),
+        };
+        let (feed, feed_derived) = match (self.feed, self.chip_load, rpm.or(spindle_rpm)) {
+            (Some(f), _, _) => (Some(f), false),
+            (None, Some(fz), Some(n)) => (Some(n * f64::from(self.flutes) * fz), true),
+            _ => (None, false),
+        };
+        Speeds { spindle_rpm, rpm_derived, feed, feed_derived }
     }
 
     /// The cutting end's shape. A thread mill is the flat cylinder its teeth sweep, at their
@@ -251,6 +373,25 @@ impl Tool {
         }
         if [self.spindle_rpm, self.feed, self.plunge_feed, self.stepdown, self.stepover].iter().flatten().any(|v| !(*v > 0.0) || !(*v <= 1.0e6)) {
             return invalid("a tool's spindle speed, feeds, stepdown and stepover must be above 0");
+        }
+        if self.cutting_data.len() > MAX_CUTTING_DATA {
+            return invalid(format!("a tool has at most {MAX_CUTTING_DATA} cutting data entries"));
+        }
+        let speeds = |vc: Option<f64>, fz: Option<f64>| {
+            vc.is_some_and(|v| !(v > 0.0) || !(v <= MAX_SURFACE_SPEED)) || fz.is_some_and(|f| !(f > 0.0) || !(f <= MAX_CHIP_LOAD))
+        };
+        if speeds(self.surface_speed, self.chip_load) {
+            return invalid(format!(
+                "a tool's surface speed must be above 0 and at most {MAX_SURFACE_SPEED} m/min, its chip load above 0 and at most {MAX_CHIP_LOAD} mm"
+            ));
+        }
+        for d in &self.cutting_data {
+            let label = d.strategy.label();
+            if [d.spindle_rpm, d.feed, d.plunge_feed, d.stepdown, d.stepover].iter().flatten().any(|v| !(*v > 0.0) || !(*v <= 1.0e6))
+                || speeds(d.surface_speed, d.chip_load)
+            {
+                return invalid(format!("the tool's {label} cutting data must have every value above 0 (and within range)"));
+            }
         }
         Ok(())
     }

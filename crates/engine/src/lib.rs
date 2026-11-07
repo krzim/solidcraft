@@ -605,6 +605,9 @@ pub struct Session {
     /// The CAM simulation view (`cam.view.*`): a program played on the simulated stock. View
     /// state: not part of the design and not an undo step.
     pub cam_view: Option<Box<cam_view::CamView>>,
+    /// The last CAM job planned (`cam.job`), reused while the job and the design stay the same.
+    /// Not part of the design and not an undo step.
+    pub(crate) cam_plan: std::sync::Mutex<Option<Box<cmd::cam::PlanCache>>>,
     /// Oldest active slot first; replacing an effect retains its row position.
     status_order: Vec<status_items::StatusId>,
     /// Successful source activations, independently of row order and sharing policy.
@@ -863,6 +866,7 @@ impl Session {
             isocurves: Vec::new(),
             comb: None,
             cam_view: None,
+            cam_plan: Default::default(),
             status_order: Vec::new(),
             status_activation: Vec::new(),
             single_surface_analysis: true,
@@ -1972,6 +1976,7 @@ impl Session {
             isocurves: Vec::new(),
             comb: None,
             cam_view: None,
+            cam_plan: Default::default(),
             status_order: Vec::new(),
             status_activation: Vec::new(),
             single_surface_analysis: self.single_surface_analysis,

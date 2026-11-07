@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use solidcore_record::Vec2;
 use solidcraft_cam::drill::{Cycle, DrillParams, check_approach, drill};
-use solidcraft_cam::{Frame, Surface, Toolpath};
+use solidcraft_cam::{Frame, Toolpath};
 use solidcraft_geom::prelude::*;
 use solidcraft_sketch::CurveKind;
 
@@ -56,7 +56,7 @@ pub(super) fn plan(ctx: &Ctx<'_>, o: &DrillOp, frame: &Frame) -> Result<(Toolpat
         feed: r.feeds.plunge,
         to_full_diameter: o.to_full_diameter.unwrap_or(false),
         stay_at_retract,
-        part_top: if stay_at_retract { highest(ctx.all, frame) } else { None },
+        part_top: if stay_at_retract { ctx.agent.geo.top_in(frame) } else { None },
     };
     let path = drill(&points, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
     // The tool comes down to R at rapid over every hole: nothing of the part or the fixtures may
@@ -70,11 +70,6 @@ pub(super) fn plan(ctx: &Ctx<'_>, o: &DrillOp, frame: &Frame) -> Result<(Toolpat
     };
     check_approach(all, &r.tool, &points, params.heights.retract, ctx.tol).map_err(|e| ctx.bad(c.name, e))?;
     Ok((path, r))
-}
-
-/// The highest point of `surface` along `frame`'s Z, in its coordinates.
-fn highest(surface: &Surface, frame: &Frame) -> Option<f64> {
-    surface.triangles().iter().flatten().map(|p| frame.to_local(*p).z).reduce(f64::max)
 }
 
 /// The hole positions of `o`, in `frame`'s XY.

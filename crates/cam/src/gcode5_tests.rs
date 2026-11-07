@@ -1488,3 +1488,62 @@ fn a_link_that_only_turns_a_is_one_retract_and_one_turn() {
     let text = emit5(&program, &bare, &machine).unwrap();
     assert_eq!(lines_with(&text, "G0 A").len(), 21, "{text}");
 }
+
+/// A vertical lead as the reference programs write it: the plane word on the arc's own block
+/// (`G19 G2 Y… Z… J… K…`, `G18 … I… K…`), `G17` again on the next XY arc and after the
+/// operation, and every one read back in its own plane.
+#[test]
+fn vertical_arcs_are_written_with_their_plane_word_and_read_back() {
+    let machine = Machine::three_axis();
+    let post = Post5::mach3_4axis();
+    let moves = vec![
+        Move::Rapid { to: Vec3::new(0.0, 10.3, 20.0) },
+        Move::Rapid { to: Vec3::new(0.0, 10.3, 5.0) },
+        Move::Feed { to: Vec3::new(0.0, 10.3, 0.15), feed: 50.0 },
+        // Down a quarter in YZ into the start of a pass along -Y.
+        Move::PlaneArc { to: Vec3::new(0.0, 10.0, -0.15), center: Vec3::new(0.0, 10.0, 0.15), plane: ArcPlane::Yz, ccw: false, feed: 1600.0 },
+        Move::Feed { to: Vec3::new(0.0, 0.0, -0.15), feed: 1600.0 },
+        // Round to the next pass in XY.
+        Move::Arc { to: Vec3::new(5.0, 0.0, -0.15), center: Vec2::new(2.5, 0.0), ccw: true, feed: 1600.0 },
+        Move::Feed { to: Vec3::new(5.0, 10.0, -0.15), feed: 1600.0 },
+        // Up a quarter in YZ beyond its end.
+        Move::PlaneArc { to: Vec3::new(5.0, 10.3, 0.15), center: Vec3::new(5.0, 10.0, 0.15), plane: ArcPlane::Yz, ccw: true, feed: 1600.0 },
+        // And one in XZ.
+        Move::Feed { to: Vec3::new(5.0, 10.3, -0.15), feed: 50.0 },
+        Move::PlaneArc { to: Vec3::new(5.3, 10.3, 0.15), center: Vec3::new(5.3, 10.3, -0.15), plane: ArcPlane::Zx, ccw: true, feed: 1600.0 },
+        Move::Rapid { to: Vec3::new(5.3, 10.3, 20.0) },
+    ];
+    let program = program_of(vec![indexed_op("face", 1, vec![], moves.clone())]);
+    let text = emit_program(&program, &post, &machine).unwrap();
+    assert!(text.contains("\nG19 G2 Y10 Z-0.15 J-0.3 K0 F1600\n"), "{text}");
+    assert!(text.contains("\nG17 G3 X5 Y0 I2.5 J0\n"), "{text}");
+    assert!(text.contains("\nG19 G3 Y10.3 Z0.15 J0 K0.3\n"), "{text}");
+    assert!(text.contains("\nG18 G3 X5.3 Z0.15 I0.3 K0 F1600\n"), "{text}");
+    // Back in G17 after the operation, before its end.
+    let after = text.rsplit("G18 G3").next().unwrap();
+    assert!(after.contains("\nG17\n"), "{text}");
+    // Read as written: each arc in its plane about its own centre.
+    let words = parse5(&text, &machine.letters()).unwrap();
+    let plane_arcs: Vec<_> = words
+        .iter()
+        .filter_map(|w| if let JointWords::PlaneArc { center, plane, ccw, .. } = w { Some((*center, *plane, *ccw)) } else { None })
+        .collect();
+    assert_eq!(plane_arcs.len(), 3, "{plane_arcs:?}");
+    assert_eq!((plane_arcs[0].1, plane_arcs[0].2), (ArcPlane::Yz, false));
+    close3(plane_arcs[0].0, Vec3::new(0.0, 10.0, 0.15), 1e-9);
+    assert_eq!((plane_arcs[2].1, plane_arcs[2].2), (ArcPlane::Zx, true));
+    close3(plane_arcs[2].0, Vec3::new(5.3, 10.3, -0.15), 1e-9);
+    let rb = readback_program(&text, &program, &post, &machine).unwrap();
+    assert!(rb.within(), "{rb:?}");
+    close(rb.cut_length, rb.planned_cut_length, 1e-3);
+    // The quarter arcs are as long as they are round: a quarter of 2π·0.3 each.
+    let planned = Toolpath { moves }.stats();
+    close(planned.cut_length, 3.0 * 0.15 * std::f64::consts::PI + 4.85 + 10.0 + 2.5 * std::f64::consts::PI + 10.0 + 0.3, 1e-9);
+    // A post that writes no arcs writes lines within its tolerance, in G17 throughout.
+    let lines_only = Post5 { base: Post { arcs: false, ..post.base.clone() }, ..post.clone() };
+    let text = emit_program(&program, &lines_only, &machine).unwrap();
+    assert!(!text.contains("G19") && !text.contains("G18") && !text.contains("G2 ") && !text.contains("G3 "), "{text}");
+    assert!(readback_program(&text, &program, &lines_only, &machine).unwrap().within());
+    // An arc without its plane's offsets is refused when read.
+    assert!(parse5("G0 X0 Y0 Z0\nG19 G2 Y1 Z1 I1 F100\n", &[]).is_err());
+}

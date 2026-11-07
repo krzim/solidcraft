@@ -586,6 +586,6 @@ fn export_stock(s: &mut Session, p: &Value) -> Result<Value> {
     let pb = v.playback().ok_or_else(busy)?;
     let mesh = pb.state().grid(pb.plan()).mesh(1024);
     let triangles = mesh.triangles.len();
-    solidcraft_io::vfs::write(&q.path, &solidcraft_io::stl_binary(&[mesh], "stock")).map_err(|e| EngineError::Other(format!("{}: {e}", q.path)))?;
+    super::write_file(&q.path, &solidcraft_io::stl_binary(&[mesh], "stock")).map_err(|e| EngineError::Other(format!("{}: {e}", q.path)))?;
     to_value(CamViewExportStockReply { path: q.path, triangles })
 }

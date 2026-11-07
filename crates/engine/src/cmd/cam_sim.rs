@@ -30,6 +30,13 @@ const STL_SIDE: usize = 1024;
 /// Rapids in material listed in a reply.
 const LISTED: usize = 100;
 
+/// The simulated stock of `report` written to `out` as a binary STL file (export: the stock's
+/// display mesh, never a decision).
+fn export_stock(report: &SimReport, out: &str) -> Result<()> {
+    let mesh = report.stock.mesh(STL_SIDE);
+    super::write_file(out, &solidcraft_io::stl_binary(&[mesh], "stock")).map_err(|e| EngineError::Other(format!("{out}: {e}")))
+}
+
 /// The job of `job` (`raw` as given) or `job_path`, the folder a job file is in, and whether an
 /// operation of it has `gouge_check: false`.
 pub(super) fn load_job(cmd: &str, job: Option<CamJob>, raw: Option<&Value>, job_path: Option<&String>) -> Result<(CamJob, Option<PathBuf>, bool)> {
@@ -215,8 +222,7 @@ pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     reply.notes.extend(surfaces.notes);
     reply.notes.extend(stock_notes);
     if let Some(out) = &params.stock_stl {
-        let mesh = report.stock.mesh(STL_SIDE);
-        solidcraft_io::vfs::write(out, &solidcraft_io::stl_binary(&[mesh], "stock")).map_err(|e| EngineError::Other(format!("{out}: {e}")))?;
+        export_stock(&report, out)?;
         reply.stock_stl = Some(out.clone());
     }
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))

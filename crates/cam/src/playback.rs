@@ -157,7 +157,7 @@ impl Timeline {
                 } else {
                     *f
                 }),
-                JointWords::Arc { f, mm_per_unit, .. } => Some(f * mm_per_unit),
+                JointWords::Arc { f, mm_per_unit, .. } | JointWords::PlaneArc { f, mm_per_unit, .. } => Some(f * mm_per_unit),
                 _ => None,
             };
             moves.push(ViewMove { line: sv.line, kind, op: None, tool: sv.tool, slot: sv.slot, feed, rpm: sv.rpm, t0: t, t1: t + secs });

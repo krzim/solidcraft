@@ -42,6 +42,7 @@ pub mod machine_time;
 mod multiaxis;
 mod offset;
 mod ops;
+mod par;
 mod path;
 mod piece;
 pub mod playback;
@@ -79,7 +80,7 @@ pub use leads::{
 pub use multiaxis::{Move5, Operation5, PathStats5, Pose, Program5, Toolpath5, slerp, verify5};
 pub use offset::offset_regions;
 pub use ops::{ContourParams, Cut, Feeds, Heights, PocketParams, Side, contour, pocket};
-pub use path::{Move, PathStats, Toolpath, arc_sweep};
+pub use path::{ArcPlane, Move, PathStats, PlaneArc, Toolpath, arc_sweep};
 pub use post::{CommentStyle, LineNumbers, Post, SafeRetract, Units};
 pub use readback::{Readback, allowed_deviation, readback};
 pub use rotary::{
@@ -91,7 +92,7 @@ pub use surface_ops::{
     Boundary, DEFAULT_DESCENT_LIMIT, ENTRY_GAP, MAX_GRID_NODES, MAX_SAMPLES, ParallelParams, RoughingParams, WaterlineParams, parallel, roughing,
     waterline,
 };
-pub use tool::{Envelope, HolderSection, Tool, ToolKind};
+pub use tool::{CuttingData, Envelope, HolderSection, Speeds, Strategy, Tool, ToolKind};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CamError {

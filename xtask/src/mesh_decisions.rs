@@ -84,6 +84,7 @@ pub const SKIPPED_FUNCTIONS: &[(&str, &str)] = &[
     ("crates/doc/src/eval.rs:mesh_content_digest", "mesh-body imports: hashes source arrays without geometric classification"),
     ("crates/engine/src/cmd/cam.rs:merged_mesh", "CAM output: the surface toolpaths are cut on, tessellated within half the job's tolerance"),
     ("crates/engine/src/cmd/cam.rs:surfaces_of", "CAM output: the part and fixtures merged into the toolpaths' surface"),
+    ("crates/engine/src/cmd/cam_sim.rs:export_stock", "the simulated stock exported as an STL file"),
     ("crates/engine/src/cmd/cam_view.rs:export_stock", "the simulated stock exported as an STL file"),
     ("crates/engine/src/cmd/cam_view.rs:model_of", "a machine model's display meshes, drawn and never checked"),
     ("crates/engine/src/cmd/file.rs:saved_preview", "the preview picture saved in a design"),

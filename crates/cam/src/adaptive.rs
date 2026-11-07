@@ -1246,6 +1246,13 @@ fn cutting_samples(path: &Toolpath, spacing: f64) -> Vec<Vec3> {
                     }
                 }
             }
+            Move::PlaneArc { to, center, plane, ccw, .. } => {
+                if let Some(from) = pos {
+                    let arc = crate::path::PlaneArc { from, to, center, plane, ccw };
+                    let n = (arc.length() / spacing).ceil().clamp(1.0, 1.0e5) as usize;
+                    out.extend((1..=n).map(|i| arc.at(i as f64 / n as f64)));
+                }
+            }
             _ => {}
         }
         if let Some(to) = m.target() {
