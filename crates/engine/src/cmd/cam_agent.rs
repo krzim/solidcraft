@@ -303,7 +303,11 @@ pub(super) fn load_job_of(cmd: &str, s: &crate::Session, p: &Value, has_job: boo
         }
         Some(_) => return Err(bad(cmd, "`tool_library_paths` is a list of file paths")),
     }
-    let unchecked = job.get("operations").is_some_and(super::sim::unchecked);
+    // Only operations the program holds: one turned off excuses no gouge of the others.
+    let unchecked = job
+        .get("operations")
+        .and_then(Value::as_array)
+        .is_some_and(|ops| ops.iter().filter(|o| crate::cam_job_state::op_enabled(o)).any(super::sim::unchecked));
     let job: CamJob = super::parse(cmd, &Value::Object(job), &what)?;
     let notes = left_out.iter().map(|(_, n)| n.clone()).collect();
     Ok(Loaded { job, base, profile, notes, left_out, unchecked })

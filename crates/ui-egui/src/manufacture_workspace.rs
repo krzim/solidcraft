@@ -410,17 +410,26 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
     if app.manufacture.away.is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
-    if !active(app) {
-        return;
+    keep_up(app, crate::now_ms());
+    if active(app) {
+        ctx.request_repaint_after(std::time::Duration::from_millis(POLL_MS as u64));
+    } else if app.manufacture.save_at.is_some_and(|(at, _)| at.is_finite()) {
+        ctx.request_repaint_after(std::time::Duration::from_millis(SAVE_AFTER_MS as u64));
     }
-    discover(app);
-    let now = crate::now_ms();
-    if now - app.manufacture.polled >= POLL_MS {
-        app.manufacture.polled = now;
-        poll(app);
+}
+
+/// What the workspace keeps up with at `now` (ms): while it shows, the job beside the design
+/// and edits made to its file outside SolidCraft; always, the save after the last change (the
+/// job stays open when the workspace is left, and agents edit it from anywhere).
+pub(crate) fn keep_up(app: &mut SolveApp, now: f64) {
+    if active(app) {
+        discover(app);
+        if now - app.manufacture.polled >= POLL_MS {
+            app.manufacture.polled = now;
+            poll(app);
+        }
     }
     autosave(app, now);
-    ctx.request_repaint_after(std::time::Duration::from_millis(POLL_MS as u64));
 }
 
 fn collect(app: &mut SolveApp) {
@@ -485,7 +494,9 @@ pub fn poll(app: &mut SolveApp) {
     }
 }
 
-/// Saves the job a moment after its last change, when the preference asks for it.
+/// Saves the job a moment after its last change, when the preference asks for it. A save that
+/// is refused (the file changed outside, a folder that cannot be written) is not tried again
+/// until the job changes.
 fn autosave(app: &mut SolveApp, now: f64) {
     let Some(job) = app.session.cam_job.as_deref() else { return };
     if !app.preferences.cam_job_autosave || !job.dirty() || job.path.is_none() || app.manufacture.banner.is_some() {
@@ -500,6 +511,7 @@ fn autosave(app: &mut SolveApp, now: f64) {
             app.manufacture.save_at = None;
             if let Err(e) = app.run("cam.job.save", json!({})) {
                 app.manufacture.error = Some(e);
+                app.manufacture.save_at = Some((f64::INFINITY, revision));
             }
         }
         Some(_) => {}

@@ -1114,7 +1114,9 @@ included.
 
 Keys the open job adds to the job file, each written only when used:
 
-- `enabled` on any operation (default true).
+- `enabled` on any operation (default true). `false` on the operation inside an `indexed` or
+  `indexed_pattern` one turns all of it off, as on the outside. An operation turned off is not
+  in the program, so its `gouge_check: false` excuses no gouge the simulation finds.
 - `workholding` on the job: the workholding written into the job, instead of `workholding_path`.
 - `top` and `bottom` on `stock.around_part`: the material above and below the part, instead of
   `margin`'s Z.

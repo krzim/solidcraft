@@ -1120,7 +1120,7 @@ pub(super) fn op_enabled(spec: &OperationSpec) -> bool {
         OperationSpec::SteepShallow(o) => o.enabled,
         OperationSpec::Pencil(o) => o.enabled,
         OperationSpec::RestFinish(o) => o.enabled,
-        OperationSpec::Indexed(o) => o.enabled,
+        OperationSpec::Indexed(o) => o.enabled.map(|on| on && op3_enabled(&o.operation)).or(Some(op3_enabled(&o.operation))),
         OperationSpec::RotaryFinish(o) => o.enabled,
         OperationSpec::RotaryRoughing(o) => o.enabled,
         OperationSpec::Wrap(o) => o.enabled,
@@ -1130,7 +1130,28 @@ pub(super) fn op_enabled(spec: &OperationSpec) -> bool {
         OperationSpec::Chamfer(o) => o.enabled,
         OperationSpec::WrapPocket(o) => o.enabled,
         OperationSpec::WrapContour(o) => o.enabled,
-        OperationSpec::IndexedPattern(o) => o.enabled,
+        OperationSpec::IndexedPattern(o) => o.enabled.map(|on| on && op3_enabled(&o.operation)).or(Some(op3_enabled(&o.operation))),
+    };
+    enabled.unwrap_or(true)
+}
+
+/// Whether the 3-axis operation inside an indexed one is turned on: `enabled: false` there turns
+/// the whole indexed operation off, as on the outside.
+fn op3_enabled(spec: &Op3Spec) -> bool {
+    let enabled = match spec {
+        Op3Spec::Adaptive(o) => o.enabled,
+        Op3Spec::AdaptiveRoughing(o) => o.enabled,
+        Op3Spec::Contour(o) => o.enabled,
+        Op3Spec::Pocket(o) => o.enabled,
+        Op3Spec::Parallel(o) => o.enabled,
+        Op3Spec::Roughing(o) => o.enabled,
+        Op3Spec::Waterline(o) => o.enabled,
+        Op3Spec::Drill(o) => o.enabled,
+        Op3Spec::Chamfer(o) => o.enabled,
+        Op3Spec::Scallop(o) => o.enabled,
+        Op3Spec::SteepShallow(o) => o.enabled,
+        Op3Spec::Pencil(o) => o.enabled,
+        Op3Spec::RestFinish(o) => o.enabled,
     };
     enabled.unwrap_or(true)
 }

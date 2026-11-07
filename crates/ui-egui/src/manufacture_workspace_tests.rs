@@ -115,7 +115,8 @@ fn the_tree_shows_each_operations_state_and_a_finding_click_goes_to_it() {
     // Headless, Generate runs at once; a failure takes the stage to Check.
     crate::manufacture_ui::generate_now(&mut h.app);
     assert_eq!(h.app.manufacture.stage, Stage::Check);
-    assert_eq!((status(&h, 0), status(&h, 2)), (OpStatus::Ok, OpStatus::Error));
+    // The job was refused: the operation at fault is an error, the others were not planned.
+    assert_eq!((status(&h, 0), status(&h, 2)), (OpStatus::Unplanned, OpStatus::Error));
     h.frames(3);
     let findings = h.app.session.cam_job.as_ref().unwrap().generated.as_ref().unwrap().findings.clone();
     let error = findings.iter().find(|f| f.severity == "error").unwrap();
@@ -175,6 +176,39 @@ fn a_burst_of_edits_is_saved_once_a_moment_after_the_last() {
     autosave(&mut h.app, 5000.0);
     autosave(&mut h.app, 9000.0);
     assert!(h.app.session.cam_job.as_ref().unwrap().dirty());
+}
+
+/// The job stays open when the workspace is left, and agents edit it from anywhere: an edit
+/// made just before leaving, or while another workspace shows, is saved all the same (it used
+/// to wait, unsaved, until the workspace was shown again). A save the file refuses is not tried
+/// again every second, only after the next change.
+#[test]
+fn the_open_job_is_saved_after_an_edit_made_while_another_workspace_shows() {
+    let dir = Dir::new("autosave-away");
+    let mut h = harness(&dir, false);
+    switch(&mut h.app, "manufacture").unwrap();
+    h.app.preferences.cam_job_autosave = true;
+    let path = dir.file("block.cam.json");
+    h.app.run("cam.op.edit", json!({"op": 0, "rename": "left behind"})).unwrap();
+    switch(&mut h.app, "design").unwrap();
+    keep_up(&mut h.app, 0.0);
+    h.app.run("cam.op.edit", json!({"op": 1, "rename": "by an agent"})).unwrap();
+    keep_up(&mut h.app, 500.0);
+    keep_up(&mut h.app, 1600.0);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("left behind") && saved.contains("by an agent"), "{saved}");
+    assert!(!h.app.session.cam_job.as_ref().unwrap().dirty());
+    // The file changed outside under an unsaved edit: the save is refused once, and not again
+    // until the job changes.
+    h.app.run("cam.op.edit", json!({"op": 0, "rename": "mine"})).unwrap();
+    std::fs::write(&path, serde_json::to_string_pretty(&job(false)).unwrap()).unwrap();
+    keep_up(&mut h.app, 2000.0);
+    keep_up(&mut h.app, 3100.0);
+    assert!(h.app.manufacture.error.take().is_some_and(|e| e.contains("changed outside")));
+    keep_up(&mut h.app, 4200.0);
+    keep_up(&mut h.app, 9000.0);
+    assert_eq!(h.app.manufacture.error, None, "not tried again before the next change");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("\"pocket\""), "their file is kept");
 }
 
 #[test]

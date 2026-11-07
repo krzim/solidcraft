@@ -206,6 +206,13 @@ fn operations_move_duplicate_and_go_and_every_edit_undoes() {
     assert!(refused(&mut s, "cam.op.remove", json!({"op": "twin"})).contains("give its index"));
     assert!(refused(&mut s, "cam.op.remove", json!({"op": 9})).contains("not in the job"));
     assert!(refused(&mut s, "cam.op.move", json!({"op": 0, "to": 3})).contains("`to`"));
+    // A name set as a key is checked as a rename is: not another's, not empty, no control characters.
+    let before = ops(&s);
+    assert!(refused(&mut s, "cam.op.edit", json!({"op": 0, "set": {"name": "twin"}})).contains("already named"));
+    for name in [json!(""), json!("a\nG0 Z-50"), json!("x".repeat(201))] {
+        assert!(refused(&mut s, "cam.op.edit", json!({"op": 0, "set": {"name": name}})).contains("characters"), "{name}");
+    }
+    assert_eq!(ops(&s), before, "a refused name changes nothing");
     // Open and close clear the history; unsaved edits are not dropped without `discard`.
     assert!(refused(&mut s, "cam.job.close", json!({})).contains("discard"));
     assert!(refused(&mut s, "cam.job.open", json!({"path": path})).contains("discard"));
@@ -303,6 +310,8 @@ fn generate_finds_each_problem_with_its_place_and_post_writes_from_a_fresh_plan(
     let status: Vec<_> = summary.operations.iter().map(|o| o.status).collect();
     use crate::schema::cam_job_edit::OpStatus;
     assert_eq!(status[2], OpStatus::Error);
+    // The job was refused, so nothing of it was planned: the others are not "ok" (they were).
+    assert_eq!(status[..2], [OpStatus::Unplanned; 2]);
     // Going to it: its operation and place, for the window to follow.
     let index = f["index"].clone();
     let go = run(&mut s, "cam.finding.go", json!({"index": index}));
@@ -363,6 +372,43 @@ fn an_operation_turned_off_is_neither_planned_nor_written() {
     let g = run(&mut s, "cam.generate", json!({}));
     assert_eq!(g["passed"], false);
     assert!(g["findings"][0]["message"].as_str().unwrap().contains("turned off"), "{g}");
+}
+
+/// An operation turned off counts for nothing: its `gouge_check: false` does not make a gouge
+/// the simulation finds in the program a mere warning, and `enabled: false` on the operation
+/// inside an indexed one turns all of it off (it used to be planned and written regardless).
+#[test]
+fn an_operation_turned_off_changes_no_check_and_is_off_inside_a_wrapper_too() {
+    let dir = Dir::new("off-checks");
+    let path = dir.file("block.cam.json");
+    write_script_job(&path, &job());
+    let mut s = block();
+    run(&mut s, "cam.job.open", json!({"path": path}));
+    // A plunge 5 mm into the pocket's floor (Z 15).
+    let bad = dir.file("bad.tap");
+    std::fs::write(&bad, "G21\nT4 M6\nG0 X0. Y0. Z30.\nG1 Z10. F200\nG0 Z30.\n").unwrap();
+    let simulate = |s: &mut Session| run(s, "cam.simulate", json!({"path": bad, "resolution": 0.5}));
+    let c = simulate(&mut s);
+    assert_eq!(c["passed"], false, "{c}");
+    run(&mut s, "cam.op.add", json!({"op": {"name": "engrave", "type": "contour", "tool": 4, "polygon": POCKET, "gouge_check": false}}));
+    run(&mut s, "cam.op.enable", json!({"op": "engrave", "enabled": false}));
+    let c = simulate(&mut s);
+    assert_eq!(c["passed"], false, "an operation turned off does not excuse a gouge: {c}");
+    assert!(c["failures"].as_array().is_some_and(|f| f.iter().any(|m| m.as_str().is_some_and(|m| m.contains("into the part")))), "{c}");
+    // Off inside an indexed operation (as a script may write it): the whole of it is off.
+    let mut j = job();
+    j["operations"][1] = json!({"type": "indexed", "a_deg": 90, "operation": {
+        "name": "side", "type": "pocket", "tool": 4, "polygon": POCKET, "enabled": false
+    }});
+    write_script_job(&path, &j);
+    run(&mut s, "cam.job.open", json!({"path": path, "discard": true}));
+    let summary = crate::cmd::cam::job_edit::summary(&s);
+    assert!(!summary.operations[1].enabled, "{:?}", summary.operations[1]);
+    assert_eq!(summary.operations[1].status, crate::schema::cam_job_edit::OpStatus::Off);
+    let r = run(&mut s, "cam.job", json!({"dry_run": true, "compact": true}));
+    let planned = r["operations"].as_array().unwrap();
+    assert_eq!(r["passed"], true, "{r}");
+    assert!(planned.len() == 1 && planned[0].as_str().is_some_and(|o| o.contains("`pocket`")), "{r}");
 }
 
 #[test]

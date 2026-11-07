@@ -800,6 +800,15 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
         set_path(cmd, &mut inner, "name", json!(new))?;
         name = new.clone();
     }
+    // A name given through `set` or `unset` is held to what `rename` is.
+    let edited = inner.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+    if edited != name {
+        check_name(cmd, "the operation's `name`", &edited)?;
+        if ops.iter().enumerate().any(|(k, o)| k != i && op_name(o) == edited) {
+            return Err(bad(cmd, format!("an operation is already named `{edited}`: give another name")));
+        }
+        name = edited;
+    }
     let inner = inner.as_object().cloned().unwrap_or_default();
     let a = match (&params.a_deg, wrapped) {
         (Some(a), _) => Some(a.clone()),
@@ -902,6 +911,10 @@ fn op_enable(s: &mut Session, p: &Value) -> Result<Value> {
         // On is the default: the key goes rather than being written true.
         if params.enabled {
             m.remove("enabled");
+            // Off inside an indexed operation is off too.
+            if let Some(Value::Object(inner)) = m.get_mut("operation") {
+                inner.remove("enabled");
+            }
         } else {
             m.insert("enabled".into(), json!(false));
         }

@@ -255,7 +255,7 @@ impl OpenJob {
 
     /// An operation's status for the tree: off, or from the last Generate when it was of the job
     /// as it is now and of the same design (`model`: `Session::model_stamp`), else stale
-    /// (unplanned without a Generate).
+    /// (unplanned without a Generate, or when that Generate planned none of it: a job refused).
     pub fn status(&self, index: usize, model_revision: u64) -> OpStatus {
         let Some(op) = self.operations().get(index) else { return OpStatus::Unplanned };
         if !op_enabled(op) {
@@ -266,7 +266,7 @@ impl OpenJob {
             return OpStatus::Stale;
         }
         let mine = g.findings.iter().filter(|f| f.op.as_ref().is_some_and(|o| o.index == index));
-        let mut worst = OpStatus::Ok;
+        let mut worst = if g.minutes.contains_key(&index) { OpStatus::Ok } else { OpStatus::Unplanned };
         for f in mine {
             match f.severity.as_str() {
                 "error" => return OpStatus::Error,
@@ -287,9 +287,11 @@ pub fn hash_bytes(bytes: &[u8]) -> u64 {
     h.finish()
 }
 
-/// Whether an operation's JSON is turned on (`enabled` absent or true).
+/// Whether an operation's JSON is turned on (`enabled` absent or true), and for an indexed
+/// one the operation inside it too.
 pub fn op_enabled(op: &Value) -> bool {
-    op.get("enabled").and_then(Value::as_bool).unwrap_or(true)
+    let on = |v: &Value| v.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    on(op) && op.get("operation").is_none_or(on)
 }
 
 /// An operation's name: its own, or its inner operation's (`indexed`, `indexed_pattern`).
