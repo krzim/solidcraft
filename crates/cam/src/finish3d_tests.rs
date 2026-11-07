@@ -113,6 +113,7 @@ fn scallop_params(h: Heights, b: Boundary, spacing: Spacing) -> ScallopParams {
     ScallopParams {
         heights: h,
         feeds: feeds(),
+        descent_feed: None,
         spacing,
         direction: OffsetDirection::Inward,
         boundary: b,
@@ -138,7 +139,8 @@ fn feed_moves(path: &Toolpath) -> Vec<(Vec3, Vec3)> {
 
 /// No move at feed goes into the surface by more than the tolerance between its ends, and
 /// every move down at least as steeply as the default descent limit (70°) is no faster down
-/// than the plunge feed (shallower ones run down the surface at the cut feed).
+/// than `f.cut` (the descent feed is the cut feed by default; give the descent feed there to
+/// check a slower one).
 fn assert_safe(s: &Surface, tool: &Tool, path: &Toolpath, tol: f64, f: Feeds) {
     let c = tool.cutter().unwrap();
     let mut pos: Option<Vec3> = None;
@@ -152,7 +154,7 @@ fn assert_safe(s: &Surface, tool: &Tool, path: &Toolpath, tol: f64, f: Feeds) {
             }
             let (len, down) = (a.dist(b), a.z - b.z);
             if down > 1e-9 && len > 1e-9 && down >= DEFAULT_DESCENT_LIMIT.sin() * len - 1e-12 {
-                assert!(feed * down / len <= f.plunge + 1e-6, "{a:?} → {b:?} goes down at {}", feed * down / len);
+                assert!(feed * down / len <= f.cut + 1e-6, "{a:?} → {b:?} goes down at {}", feed * down / len);
             }
         }
         pos = m.target().or(pos);
@@ -305,6 +307,10 @@ fn scallop_height_holds_across_a_dome() {
     assert_safe(&s, &tool, &path, p.tolerance, p.feeds);
     // The same parameters give the same path.
     assert_eq!(scallop(&s, &tool, &p).unwrap(), path);
+    // With the plunge feed as the descent feed, no move down the surface at least as steep as
+    // the descent limit goes down faster than it (the check's bound is its `cut`).
+    let slow = ScallopParams { descent_feed: Some(p.feeds.plunge), ..p.clone() };
+    assert_safe(&s, &tool, &scallop(&s, &tool, &slow).unwrap(), p.tolerance, Feeds { cut: p.feeds.plunge, ..p.feeds });
     let ev = Eval::new(Vec2::new(-12.0, -12.0), Vec2::new(12.0, 12.0), 0.1);
     // The dome, away from its foot (a crease no path of this tool reaches into).
     let on_dome = |q: Vec2| q.x.hypot(q.y) < 9.5;
@@ -314,6 +320,7 @@ fn scallop_height_holds_across_a_dome() {
     let par = ParallelParams {
         heights: h,
         feeds: feeds(),
+        descent_feed: None,
         stepover: d,
         angle: 0.0,
         boundary: rect(-14.0, -14.0, 14.0, 14.0),
@@ -376,6 +383,7 @@ fn scallop_and_steep_shallow_on_a_stepped_part() {
     let sp = SteepShallowParams {
         heights: h,
         feeds: feeds(),
+        descent_feed: None,
         spacing: Spacing::ScallopHeight(target),
         threshold: 45f64.to_radians(),
         overlap: 0.5,
@@ -414,6 +422,7 @@ fn steep_shallow_splits_a_bowl_by_slope() {
     let mut sp = SteepShallowParams {
         heights: h,
         feeds: feeds(),
+        descent_feed: None,
         spacing: Spacing::ScallopHeight(target),
         threshold: 40f64.to_radians(),
         overlap: 0.5,
@@ -451,6 +460,7 @@ fn pencil_finds_the_crease_of_a_fillet_joint() {
     let mut p = PencilParams {
         heights: h,
         feeds: feeds(),
+        descent_feed: None,
         min_angle: 30f64.to_radians(),
         passes: 0,
         stepover: 0.5,
@@ -504,6 +514,7 @@ fn rest_finishing_cuts_only_the_corner() {
     let p = RestParams {
         heights: h,
         feeds: feeds(),
+        descent_feed: None,
         previous: big.clone(),
         threshold: 0.01,
         spacing: Spacing::ScallopHeight(0.01),
@@ -539,6 +550,7 @@ fn rest_finishing_cuts_only_the_corner() {
         &ParallelParams {
             heights: h,
             feeds: feeds(),
+            descent_feed: None,
             stepover: 0.5,
             angle: PI / 2.0,
             boundary: b.clone(),
@@ -610,6 +622,7 @@ fn hostile_finishing_params_are_refused() {
     let sp = SteepShallowParams {
         heights: h,
         feeds: feeds(),
+        descent_feed: None,
         spacing: Spacing::Stepover(1.0),
         threshold: 0.7,
         overlap: 0.5,
@@ -644,6 +657,7 @@ fn hostile_finishing_params_are_refused() {
     let pp = PencilParams {
         heights: h,
         feeds: feeds(),
+        descent_feed: None,
         min_angle: 0.3,
         passes: 1,
         stepover: 0.5,
@@ -674,6 +688,7 @@ fn hostile_finishing_params_are_refused() {
     let rp = RestParams {
         heights: h,
         feeds: feeds(),
+        descent_feed: None,
         previous: ball(10.0),
         threshold: 0.01,
         spacing: Spacing::Stepover(0.5),
@@ -759,6 +774,7 @@ fn pencil_offset_passes_climb_towards_the_crease() {
         let p = PencilParams {
             heights: h,
             feeds: feeds(),
+            descent_feed: None,
             min_angle: 30f64.to_radians(),
             passes: 2,
             stepover: 0.5,
@@ -791,6 +807,7 @@ fn shallow_rasters_too_dense_to_cut_are_refused_before_they_are_built() {
     let sp = SteepShallowParams {
         heights: heights(8.0),
         feeds: feeds(),
+        descent_feed: None,
         spacing: Spacing::Stepover(5e-4),
         threshold: 0.7,
         overlap: 0.5,

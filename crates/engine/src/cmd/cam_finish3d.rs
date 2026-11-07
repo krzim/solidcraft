@@ -35,6 +35,7 @@ pub(super) fn plan_scallop(ctx: &Ctx<'_>, o: &ScallopOp, surface: &Surface) -> R
     let params = ScallopParams {
         heights: heights(&o.heights),
         feeds: r.feeds,
+        descent_feed: r.descent,
         spacing: spacing(ctx, c.name, o.scallop_height, o.stepover, &r.tool)?,
         direction: match o.direction.unwrap_or(DirectionSpec::Inward) {
             DirectionSpec::Inward => OffsetDirection::Inward,
@@ -66,6 +67,7 @@ pub(super) fn plan_steep_shallow(ctx: &Ctx<'_>, o: &SteepShallowOp, surface: &Su
     let params = SteepShallowParams {
         heights: heights(&o.heights),
         feeds: r.feeds,
+        descent_feed: r.descent,
         spacing: spacing(ctx, c.name, o.scallop_height, o.stepover, &r.tool)?,
         threshold: ctx.degrees(c.name, o.threshold_deg.unwrap_or(40.0), "`threshold_deg`")?,
         overlap: o.overlap.unwrap_or(r.tool.diameter * 0.1),
@@ -88,6 +90,7 @@ pub(super) fn plan_pencil(ctx: &Ctx<'_>, o: &PencilOp, surface: &Surface) -> Res
     let params = PencilParams {
         heights: heights(&o.heights),
         feeds: r.feeds,
+        descent_feed: r.descent,
         min_angle: ctx.degrees(c.name, o.min_angle_deg.unwrap_or(30.0), "`min_angle_deg`")?,
         passes: o.passes.unwrap_or(0),
         stepover: or_tool(o.stepover, r.tool.stepover, r.tool.diameter * 0.1),
@@ -112,6 +115,7 @@ pub(super) fn plan_rest_finish(ctx: &Ctx<'_>, o: &RestFinishOp, surface: &Surfac
     let params = RestParams {
         heights: heights(&o.heights),
         feeds: r.feeds,
+        descent_feed: r.descent,
         previous: previous.clone(),
         threshold: o.threshold.unwrap_or(2.0 * ctx.tolerance(c.name, o.tolerance)?),
         spacing: spacing(ctx, c.name, o.scallop_height, o.stepover, &r.tool)?,

@@ -79,6 +79,16 @@ pub(crate) fn descent_feed(feeds: &Feeds, len: f64, drop: f64) -> f64 {
     (feeds.plunge * len / drop).clamp(feeds.plunge.min(feeds.cut), feeds.cut)
 }
 
+/// The feed a finishing pass goes down the surface at, steeper than its descent limit: `given`,
+/// else the cut feed (see [`ParallelParams::descent_feed`]).
+pub(crate) fn descent_of(feeds: &Feeds, given: Option<f64>) -> Result<f64> {
+    match given {
+        None => Ok(feeds.cut),
+        Some(f) if f.is_finite() && f > 0.0 && f <= 1.0e6 => Ok(f),
+        Some(_) => invalid("the descent feed must be above 0"),
+    }
+}
+
 /// The steepest a finishing move may go down at the cut feed by default: 70° from horizontal.
 pub const DEFAULT_DESCENT_LIMIT: f64 = 70.0 * std::f64::consts::PI / 180.0;
 
@@ -129,11 +139,18 @@ pub struct ParallelParams {
     /// Every other pass runs back; otherwise all run the same way.
     pub zigzag: bool,
     /// Moves that go down steeper than this from horizontal (radians, 0 to a right angle) are
-    /// plunges: they are slowed so the tool goes down no faster than the plunge feed. Moves
+    /// descents: they are slowed so the tool goes down no faster than the descent feed. Moves
     /// along the surface that go down less steeply run at the cut feed. 0 slows every move that
-    /// goes down. Left out, [`DEFAULT_DESCENT_LIMIT`].
+    /// goes down; a right angle none. Left out, [`DEFAULT_DESCENT_LIMIT`].
     #[serde(default = "default_descent_limit")]
     pub descent_limit: f64,
+    /// Feed for the moves inside a pass that go down the surface at least as steeply as the
+    /// descent limit (mm/min); entries from above always come down at the plunge feed. Left out,
+    /// the cut feed: the pass runs over material a roughing left (the stock to leave), so going
+    /// down a wall is a side cut, not a plunge. Give the plunge feed for the old behaviour
+    /// (finishing straight from uncut stock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descent_feed: Option<f64>,
 }
 
 /// Roughing a stock box in levels: at each level the tool clears what is left above it, raster
@@ -697,8 +714,11 @@ pub(crate) struct Out3 {
     h: Heights,
     feeds: Feeds,
     /// A move that goes down by at least this share of its length is slowed by
-    /// [`descent_feed`]; 0 slows every move that goes down.
+    /// [`descent_feed`]; 0 slows every move that goes down, infinity none.
     plunge_slope: f64,
+    /// The feed such a move goes down no faster than: the plunge feed, or a finishing pass's
+    /// descent feed ([`Out3::descending`]).
+    descent: f64,
 }
 
 /// How the tool gets from the end of one cut (the first point) to the start of the next (the
@@ -710,7 +730,16 @@ impl Out3 {
     /// `descent_limit`: moves that go down at least this steeply (radians from horizontal)
     /// are slowed by [`descent_feed`].
     pub(crate) fn new(h: Heights, feeds: Feeds, descent_limit: f64) -> Out3 {
-        Out3 { moves: Vec::new(), pos: None, down: false, h, feeds, plunge_slope: descent_limit.sin().max(0.0) }
+        // A right angle (or more): no move inside a pass is slowed.
+        let plunge_slope = if descent_limit >= std::f64::consts::FRAC_PI_2 - 1e-12 { f64::INFINITY } else { descent_limit.sin().max(0.0) };
+        Out3 { moves: Vec::new(), pos: None, down: false, h, feeds, plunge_slope, descent: feeds.plunge }
+    }
+
+    /// Moves inside a pass that go down at least as steeply as the descent limit are slowed to
+    /// go down no faster than `feed` (entries from above still come down at the plunge feed).
+    pub(crate) fn descending(mut self, feed: f64) -> Out3 {
+        self.descent = feed;
+        self
     }
 
     fn push(&mut self, m: Move) -> Result<()> {
@@ -776,7 +805,11 @@ impl Out3 {
         let feed = match self.pos {
             Some(q) => {
                 let (len, drop) = (q.dist(p), q.z - p.z);
-                if drop > 1e-9 && drop >= self.plunge_slope * len { descent_feed(&self.feeds, len, drop) } else { self.feeds.cut }
+                if drop > 1e-9 && drop >= self.plunge_slope * len {
+                    descent_feed(&Feeds { plunge: self.descent, ..self.feeds }, len, drop)
+                } else {
+                    self.feeds.cut
+                }
             }
             None => self.feeds.cut,
         };
@@ -933,6 +966,7 @@ pub fn parallel(surface: &Surface, tool: &Tool, p: &ParallelParams) -> Result<To
     check_step(p.step)?;
     check_tolerance(p.tolerance)?;
     check_descent_limit(p.descent_limit)?;
+    let descent = descent_of(&p.feeds, p.descent_feed)?;
     let rect = p.boundary.resolve(surface)?;
     let field = Field::new(surface, &cutter, p.stock_to_leave, p.boundary.region.as_ref(), p.tolerance)?;
     field.check_retract(&rect, p.heights.retract)?;
@@ -940,7 +974,7 @@ pub fn parallel(surface: &Surface, tool: &Tool, p: &ParallelParams) -> Result<To
     let lines = raster(&rect, p.angle, p.stepover, step)?;
     let (max_link, spacing) = ((2.0 * p.stepover).max(tool.diameter), step.min(cutter.radius * 0.5));
     let link = |a: Vec3, b: Vec3| link_path(&field, a, b, max_link, spacing, p.tolerance);
-    let mut out = Out3::new(p.heights, p.feeds, p.descent_limit);
+    let mut out = Out3::new(p.heights, p.feeds, p.descent_limit).descending(descent);
     for (k, line) in lines.iter().enumerate() {
         let profile = line.sample(&field, step, p.tolerance)?;
         let stretches = spans(&profile, p.heights.bottom, f64::INFINITY, false, &|t| field.at(line.at(t)))?;

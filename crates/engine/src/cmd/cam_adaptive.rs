@@ -3,16 +3,23 @@
 //! planned, and its engagement measured against the material (and, for `adaptive`, against a
 //! plain offset pocket of the same profiles) for the report.
 
-use solidcore_record::Vec3;
-use solidcore_record::{Loop2, Region2, Seg2, Vec2};
-use solidcraft_cam::adaptive::{AdaptiveParams, AdaptivePath, AdaptiveRoughingParams, StockModel, adaptive_in, adaptive_roughing};
+use std::sync::Arc;
+
+use solidcore_record::{Loop2, Region2, Seg2, Vec2, Vec3};
+use solidcraft_cam::adaptive::{
+    AdaptiveParams, AdaptivePath, AdaptiveRoughingParams, HeightMap, REST_TOLERANCE, StockModel, adaptive_in, adaptive_roughing,
+};
 use solidcraft_cam::engagement::{Engagement, Material, engagement};
+use solidcraft_cam::gcode5::{MachineProgram, emit_program_report};
+use solidcraft_cam::sim::{SimParams, StockGrid, StockShape, simulate};
 use solidcraft_cam::stock::Stock;
 use solidcraft_cam::{Cut, Frame, PocketParams, Surface, Toolpath, pocket};
 
 use super::{Ctx, Resolved, heights, or_tool};
+use super::{Planned, spec_name};
 use crate::Result;
-use crate::schema::cam_adaptive::{AdaptiveOp, AdaptiveReport, AdaptiveRoughingOp, ComparedPath};
+use crate::schema::cam::CamJob;
+use crate::schema::cam_adaptive::{AdaptiveOp, AdaptiveReport, AdaptiveRoughingOp, ComparedPath, RestFromSpec};
 
 /// The engagement limits from the optimal load and what the operation gives: `(least, most)`
 /// in degrees. The default least stays below the most the operation gives.
@@ -128,6 +135,88 @@ fn stock_in(stock: Option<&Stock>, frame: &Frame) -> StockModel {
     StockModel { rect: Some([Vec2::new(lo.x, lo.y), Vec2::new(hi.x, hi.y)]), top: Some(hi.z), ..Default::default() }
 }
 
+/// What the earlier operations `from` picks left of the job's stock box: the program they
+/// write simulated as `cam.simulate` does, the stock it leaves taken as a height map in work
+/// coordinates; and how many operations those were. `planned` are the operations planned so
+/// far, `op_of` the index in the job of the operation each comes from.
+pub(super) fn rest_map(
+    ctx: &Ctx<'_>,
+    job: &CamJob,
+    name: &str,
+    from: &RestFromSpec,
+    planned: &[Planned],
+    op_of: &[usize],
+) -> Result<(Arc<HeightMap>, usize)> {
+    let Some(&Stock::Box { min, max }) = ctx.stock else {
+        return Err(ctx.bad(name, "`rest_from` needs the job's `stock` box: what the earlier operations cut is simulated from it"));
+    };
+    if !ctx.machine.rotaries.is_empty() {
+        return Err(ctx.bad(name, "`rest_from` works on a 3-axis machine"));
+    }
+    let (names, tool) = match from {
+        RestFromSpec::Previous(k) if k == "previous" => (None, None),
+        RestFromSpec::Previous(k) => {
+            return Err(ctx.bad(name, format!("`rest_from` is \"previous\", {{\"operations\": [names]}} or {{\"tool\": n}}, not \"{k}\"")));
+        }
+        RestFromSpec::Some(p) if p.operations.is_none() && p.tool.is_none() => {
+            return Err(ctx.bad(name, "`rest_from` needs `operations` or `tool`"));
+        }
+        RestFromSpec::Some(p) => (p.operations.as_deref(), p.tool),
+    };
+    let earlier: Vec<&str> = op_of.iter().filter_map(|k| job.operations.get(*k).and_then(spec_name)).collect();
+    if let Some(ns) = names
+        && let Some(unknown) = ns.iter().find(|n| !earlier.contains(&n.as_str()))
+    {
+        return Err(
+            ctx.bad(name, format!("`rest_from` names `{unknown}`, which is not an operation before this one (those are: {})", earlier.join(", ")))
+        );
+    }
+    let picked: Vec<_> = planned
+        .iter()
+        .zip(op_of)
+        .filter(|(p, k)| {
+            let n = job.operations.get(**k).and_then(spec_name);
+            names.is_none_or(|ns| ns.iter().any(|x| Some(x.as_str()) == n)) && tool.is_none_or(|t| p.tool.number == t)
+        })
+        .map(|(p, _)| p.op.clone())
+        .collect();
+    if picked.is_empty() {
+        return Err(ctx.bad(name, "`rest_from` picks no operation before this one"));
+    }
+    let count = picked.len();
+    let program = MachineProgram { name: format!("{name}: rest"), operations: picked, work_offset: None };
+    let (text, _) =
+        emit_program_report(&program, ctx.post, ctx.machine).map_err(|e| ctx.bad(name, format!("writing the earlier operations: {e}")))?;
+    let report =
+        simulate(&text, ctx.machine, ctx.tools, &StockShape::Box { min, max }, ctx.part, &SimParams { tolerance: ctx.tol, resolution: None })
+            .map_err(|e| ctx.bad(name, format!("simulating the earlier operations: {e}")))?;
+    let StockGrid::Heights { x0, y0, dx, dy, nx, ny, heights, .. } = report.stock else {
+        return Err(ctx.bad(name, "the simulation of the earlier operations left no height map"));
+    };
+    let map = HeightMap { x0, y0, dx, dy, nx, ny, heights };
+    map.validate().map_err(|e| ctx.bad(name, e))?;
+    Ok((Arc::new(map), count))
+}
+
+/// The map of what earlier operations left ([`rest_map`], work coordinates) in the operation's
+/// frame, which must look straight down along work X and Y (a 3-axis operation's does), and
+/// how thick a skin it leaves unchased: the simulation's cell and the tolerance.
+fn rest_in(ctx: &Ctx<'_>, name: &str, frame: &Frame) -> Result<Option<(HeightMap, f64, String)>> {
+    let Some((map, count)) = &ctx.rest else { return Ok(None) };
+    let square = |a: Vec3, b: Vec3| (a.x - b.x).abs().max((a.y - b.y).abs()).max((a.z - b.z).abs()) <= 1e-9;
+    if !(square(frame.x, Vec3::new(1.0, 0.0, 0.0)) && square(frame.y, Vec3::new(0.0, 1.0, 0.0)) && square(frame.z, Vec3::new(0.0, 0.0, 1.0))) {
+        return Err(ctx.bad(name, "`rest_from` works in an operation that looks straight down along work X and Y"));
+    }
+    let o = frame.origin;
+    let local = HeightMap { x0: map.x0 - o.x, y0: map.y0 - o.y, heights: map.heights.iter().map(|z| z - o.z).collect(), ..HeightMap::clone(map) };
+    let skin = REST_TOLERANCE.max(2.0 * ctx.tol);
+    let note = format!(
+        "rest machining: planned on what the {count} operation(s) before it left of the stock, simulated on cells of {:.3} mm; material up to {skin:.3} mm thick is left; the engagement is not measured (the measure knows only the whole stock)",
+        map.dx.max(map.dy)
+    );
+    Ok(Some((local, skin, note)))
+}
+
 /// `adaptive`: 2D adaptive clearing of profiles.
 pub(super) fn plan(ctx: &Ctx<'_>, o: &AdaptiveOp, frame: &Frame) -> Result<(Toolpath, Resolved, &'static str)> {
     let c = o.common();
@@ -149,12 +238,19 @@ pub(super) fn plan(ctx: &Ctx<'_>, o: &AdaptiveOp, frame: &Frame) -> Result<(Tool
             o.tolerance,
         ),
     )?;
-    let stock = if o.from_stock.unwrap_or(true) { stock_in(ctx.stock, frame) } else { StockModel::default() };
+    let mut stock = if o.from_stock.unwrap_or(true) { stock_in(ctx.stock, frame) } else { StockModel::default() };
+    let rest = rest_in(ctx, c.name, frame)?;
+    if let Some((map, skin, _)) = &rest {
+        stock.heights = Some(map.clone());
+        stock.rest_tolerance = *skin;
+    }
     let a = adaptive_in(&regions, &r.tool, &p, &cut, &stock).map_err(|e| ctx.bad(c.name, e))?;
     let mut warnings = a.warnings.clone();
+    let resting = rest.is_some();
+    warnings.extend(rest.map(|(_, _, note)| note));
     let material = Material { regions: regions.clone(), top: stock.top.map_or(cut.heights.top, |t| t.min(cut.heights.top)), within: stock.rect };
     let radius = r.tool.radius();
-    let e = measure(&a.path, Some(&a.roles), radius, &material, &mut warnings);
+    let e = if resting { None } else { measure(&a.path, Some(&a.roles), radius, &material, &mut warnings) };
     let mut rep = report(&a, e, p.max_engagement.to_degrees());
     warnings.extend(engagement_warnings(&rep));
     if o.compare.unwrap_or(true) {
@@ -185,7 +281,7 @@ pub(super) fn plan(ctx: &Ctx<'_>, o: &AdaptiveOp, frame: &Frame) -> Result<(Tool
 }
 
 /// `adaptive_roughing`: 3D adaptive roughing of a stock box.
-pub(super) fn plan_roughing(ctx: &Ctx<'_>, o: &AdaptiveRoughingOp, surface: &Surface) -> Result<(Toolpath, Resolved, &'static str)> {
+pub(super) fn plan_roughing(ctx: &Ctx<'_>, o: &AdaptiveRoughingOp, frame: &Frame, surface: &Surface) -> Result<(Toolpath, Resolved, &'static str)> {
     let c = o.common();
     let r = ctx.resolve(&c)?;
     let p = params(
@@ -213,8 +309,12 @@ pub(super) fn plan_roughing(ctx: &Ctx<'_>, o: &AdaptiveRoughingOp, surface: &Sur
         adaptive: p,
         rest: None,
     };
+    let rest = rest_in(ctx, c.name, frame)?;
+    let rp = AdaptiveRoughingParams { rest: rest.as_ref().map(|(m, _, _)| m.clone()), ..rp };
     let a = adaptive_roughing(surface, &r.tool, &rp).map_err(|e| ctx.bad(c.name, e))?;
     let mut warnings = a.warnings.clone();
+    let resting = rest.is_some();
+    warnings.extend(rest.map(|(_, _, note)| note));
     // The stock as the operation took it: the boundary's rectangle, else the part's extent, and
     // inside the boundary's polygon too when there is one.
     let stock = match boundary.rect {
@@ -225,12 +325,12 @@ pub(super) fn plan_roughing(ctx: &Ctx<'_>, o: &AdaptiveRoughingOp, surface: &Sur
         }
     };
     let e = match stock {
-        Some((lo, hi)) => {
+        Some((lo, hi)) if !resting => {
             let regions = vec![boundary.region.clone().unwrap_or_else(|| rect_region(lo, hi))];
             let material = Material { regions, top: rp.heights.top, within: Some([lo, hi]) };
             measure(&a.path, Some(&a.roles), r.tool.radius(), &material, &mut warnings)
         }
-        None => None,
+        _ => None,
     };
     let rep = report(&a, e, p.max_engagement.to_degrees());
     warnings.extend(engagement_warnings(&rep));

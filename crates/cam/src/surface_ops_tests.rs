@@ -42,6 +42,7 @@ fn par(heights: Heights, boundary: Boundary) -> ParallelParams {
         tolerance: 0.01,
         zigzag: true,
         descent_limit: DEFAULT_DESCENT_LIMIT,
+        descent_feed: None,
     }
 }
 
@@ -688,9 +689,10 @@ fn levels_times_samples_are_bounded() {
     assert!(roughing(&high, &flat(6.0), &r).unwrap().moves.is_empty());
 }
 
-/// With no descent limit no cutting move goes down faster than the plunge feed: a move that
-/// descends is slowed in proportion, so a ramp just under 45° is not taken at the full cut feed
-/// (and the feed does not jump between the two on near-45° slivers). Roughing always works so.
+/// With no descent limit and the plunge feed as the descent feed, no cutting move goes down
+/// faster than the plunge feed: a move that descends is slowed in proportion, so a ramp just
+/// under 45° is not taken at the full cut feed (and the feed does not jump between the two on
+/// near-45° slivers). Roughing always works so.
 #[test]
 fn descents_never_go_down_faster_than_the_plunge_feed() {
     let s = sphere(Vec3::new(0.0, 0.0, 0.0), 10.0, 32);
@@ -718,13 +720,15 @@ fn descents_never_go_down_faster_than_the_plunge_feed() {
         check(&roughing(&s, &tool, &rough(h, rect(-15.0, -15.0, 15.0, 15.0))).unwrap());
         let mut p = par(h, rect(-15.0, -15.0, 15.0, 15.0));
         p.descent_limit = 0.0;
+        p.descent_feed = Some(f.plunge);
         check(&parallel(&s, &tool, &p).unwrap());
     }
 }
 
-/// Finishing runs down the surface at the cut feed: only moves at least as steep as the
-/// descent limit (70° by default) and entries from above are slowed to the plunge feed's rate
-/// of descent. On a sphere a 45° flank used to run at about a fifth of the cut feed.
+/// Finishing runs down the surface at the cut feed: with the plunge feed as the descent feed,
+/// only moves at least as steep as the descent limit (70° by default) and entries from above
+/// are slowed to the plunge feed's rate of descent. On a sphere a 45° flank used to run at
+/// about a fifth of the cut feed.
 #[test]
 fn finishing_runs_down_the_surface_at_the_cut_feed() {
     let s = sphere(Vec3::new(0.0, 0.0, 0.0), 10.0, 64);
@@ -733,6 +737,7 @@ fn finishing_runs_down_the_surface_at_the_cut_feed() {
     for limit in [DEFAULT_DESCENT_LIMIT, 45f64.to_radians()] {
         let mut p = par(h, rect(-12.0, -12.0, 12.0, 12.0));
         p.descent_limit = limit;
+        p.descent_feed = Some(f.plunge);
         let path = parallel(&s, &ball(4.0), &p).unwrap();
         verify(&path, &h).unwrap();
         let (mut shallow, mut steep) = (0, 0);
@@ -762,6 +767,50 @@ fn finishing_runs_down_the_surface_at_the_cut_feed() {
     let mut v = serde_json::to_value(par(h, rect(0.0, 0.0, 1.0, 1.0))).unwrap();
     v.as_object_mut().unwrap().remove("descent_limit");
     assert_eq!(serde_json::from_value::<ParallelParams>(v).unwrap().descent_limit, DEFAULT_DESCENT_LIMIT);
+}
+
+/// A parallel finish over a block's vertical wall: the plunge feed is for entries from above,
+/// and the moves inside a pass that run down the wall go at the descent feed, the cut feed by
+/// default (they used to run at the plunge feed: on a domed block with 20 mm walls that was 11.8
+/// of its 18.8 minutes). A descent limit of a right angle never slows them.
+#[test]
+fn moves_down_a_wall_run_at_the_descent_feed_and_entries_at_the_plunge_feed() {
+    // A block 10 mm high from X -10 to 10, standing on a floor at Z 0.
+    let s = extruded(&[(-20.0, 0.0), (-10.0, 0.0), (-10.0, 10.0), (10.0, 10.0), (10.0, 0.0), (20.0, 0.0)], true);
+    let h = Heights { clearance: 25.0, retract: 15.0, top: 11.0, bottom: 0.0 };
+    let f = feeds();
+    // (descent feed, descent limit, the feed down the wall)
+    for (given, limit, want) in [(None, DEFAULT_DESCENT_LIMIT, f.cut), (Some(300.0), DEFAULT_DESCENT_LIMIT, 300.0), (Some(300.0), PI / 2.0, f.cut)] {
+        let mut p = par(h, rect(-18.0, -5.0, 18.0, 5.0));
+        p.descent_feed = given;
+        p.descent_limit = limit;
+        let path = parallel(&s, &flat(4.0), &p).unwrap();
+        verify(&path, &h).unwrap();
+        let (mut walls, mut entries) = (0, 0);
+        let mut pos: Option<Vec3> = None;
+        for m in &path.moves {
+            if let (Move::Feed { to, feed }, Some(q)) = (*m, pos)
+                && q.z - to.z > 5.0
+                && (q.x - to.x).hypot(q.y - to.y) < 1e-6
+            {
+                if q.z >= h.retract - 1e-9 {
+                    entries += 1;
+                    assert_eq!(feed, f.plunge, "an entry from {q:?}");
+                } else {
+                    walls += 1;
+                    assert_eq!(feed, want, "down the wall from {q:?} with {given:?}");
+                }
+            }
+            pos = m.target().or(pos);
+        }
+        assert!(walls > 3 && entries >= 1, "{walls} down the wall, {entries} entries");
+    }
+    // A descent feed that is not a feed is refused.
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let mut p = par(h, rect(-18.0, -5.0, 18.0, 5.0));
+        p.descent_feed = Some(bad);
+        assert!(parallel(&s, &flat(4.0), &p).is_err(), "{bad}");
+    }
 }
 
 /// A link between passes is never further into the part than half the tolerance: it follows the

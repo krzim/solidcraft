@@ -7,7 +7,9 @@ use std::f64::consts::PI;
 use solidcore_record::{Loop2, Region2, Seg2, Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
-use crate::adaptive::{AdaptiveParams, AdaptivePath, AdaptiveRoughingParams, MoveRole, StockModel, adaptive, adaptive_in, adaptive_roughing};
+use crate::adaptive::{
+    AdaptiveParams, AdaptivePath, AdaptiveRoughingParams, HeightMap, MoveRole, StockModel, adaptive, adaptive_in, adaptive_roughing,
+};
 use crate::dropcutter::drop_z;
 use crate::engagement::{Material, engagement};
 use crate::ops::{Cut, Feeds, Heights, PocketParams, pocket};
@@ -674,4 +676,67 @@ fn a_closed_pocket_path_is_not_much_longer_than_its_area_over_the_load() {
     eprintln!("closed square: {:.0} mm, {ratio:.2} x area/load", a.path.stats().cut_length);
     assert!(ratio <= 2.1, "{ratio}");
     assert_cleared(&[square(40.0)], &a.path, 3.0, 0.0, -1.0, 0.4);
+}
+
+/// A height map over `lo..hi` in cells of `cell` mm, its tops from `top(x, y)`.
+fn height_map(lo: Vec2, hi: Vec2, cell: f64, top: &dyn Fn(f64, f64) -> f64) -> HeightMap {
+    let (nx, ny) = (((hi.x - lo.x) / cell).ceil() as usize, ((hi.y - lo.y) / cell).ceil() as usize);
+    let heights = (0..nx * ny).map(|k| top(lo.x + ((k % nx) as f64 + 0.5) * cell, lo.y + ((k / nx) as f64 + 0.5) * cell)).collect();
+    HeightMap { x0: lo.x, y0: lo.y, dx: cell, dy: cell, nx, ny, heights }
+}
+
+/// The length of the cutting moves (not links or entries) whose ends are both where `inside`.
+fn cut_length_where(a: &AdaptivePath, inside: &dyn Fn(Vec3) -> bool) -> f64 {
+    let mut len = 0.0;
+    let mut prev: Option<Vec3> = None;
+    for (m, role) in a.path.moves.iter().zip(&a.roles) {
+        if let (Some(p), Some(t), MoveRole::Cut) = (prev, m.target(), role)
+            && inside(p)
+            && inside(t)
+        {
+            len += p.dist(t);
+        }
+        prev = m.target().or(prev);
+    }
+    len
+}
+
+/// Rest machining: with a height map of what earlier cuts left, the levels clear only what is
+/// still above them. The plate's half at X < 0 already cut down to the stock to leave, a 3D
+/// roughing cuts the other half; with everything cut it cuts nothing. A 2D clearing does the
+/// same with what the map leaves inside its profiles.
+#[test]
+fn rest_machining_clears_only_what_earlier_cuts_left() {
+    let surface = Surface::new(plate_and_boss()).unwrap();
+    let tool = flat(6.0);
+    let full = adaptive_roughing(&surface, &tool, &roughing_params()).unwrap();
+    let (lo, hi) = (Vec2::new(-25.0, -25.0), Vec2::new(25.0, 25.0));
+    let half = height_map(lo, hi, 0.5, &|x, _| if x < 0.0 { 0.25 } else { 6.0 });
+    let p = AdaptiveRoughingParams { rest: Some(half), ..roughing_params() };
+    let rest = adaptive_roughing(&surface, &tool, &p).unwrap();
+    let (lf, lr) = (full.path.stats().cut_length, rest.path.stats().cut_length);
+    eprintln!("whole stock {lf:.0} mm, half of it left {lr:.0} mm");
+    assert!(lr < 0.65 * lf, "{lr} of {lf}");
+    // Nothing is cut well inside the half already cut (the tool's radius and a cell off).
+    let cut_left = cut_length_where(&rest, &|q| q.x < -3.0 - 1.0 - 0.5 * 6.0 && q.z < 6.0);
+    assert!(cut_left < 0.02 * lr, "{cut_left} of {lr}");
+    // All cut: nothing to do.
+    let none = height_map(lo, hi, 0.5, &|_, _| 0.25);
+    let p = AdaptiveRoughingParams { rest: Some(none), ..roughing_params() };
+    let a = adaptive_roughing(&surface, &tool, &p).unwrap();
+    assert_eq!(a.levels, 0, "{a:?}");
+    // Hostile maps are refused.
+    let bad = HeightMap { heights: vec![0.0; 3], ..height_map(lo, hi, 0.5, &|_, _| 0.0) };
+    assert!(adaptive_roughing(&surface, &tool, &AdaptiveRoughingParams { rest: Some(bad), ..roughing_params() }).is_err());
+    let nan = height_map(lo, hi, 0.5, &|x, _| if x < 0.0 { f64::NAN } else { 0.0 });
+    assert!(adaptive_roughing(&surface, &tool, &AdaptiveRoughingParams { rest: Some(nan), ..roughing_params() }).is_err());
+    // 2D: a square pocket whose half at X < 15 is already cut to its floor.
+    let map = height_map(Vec2::new(-5.0, -5.0), Vec2::new(35.0, 35.0), 0.25, &|x, _| if x < 15.0 { -3.0 } else { 0.0 });
+    let stock = StockModel { heights: Some(map), rest_tolerance: 0.02, ..Default::default() };
+    let whole = adaptive(&[square(30.0)], &tool, &params(), &cut(0.0, -3.0)).unwrap();
+    let a = adaptive_in(&[square(30.0)], &tool, &params(), &cut(0.0, -3.0), &stock).unwrap();
+    let (lw, la) = (whole.path.stats().cut_length, a.path.stats().cut_length);
+    eprintln!("2D: whole pocket {lw:.0} mm, half left {la:.0} mm");
+    assert!(la < 0.65 * lw, "{la} of {lw}");
+    assert!(cut_length_where(&a, &|q| q.x < 15.0 - 3.0 - 1.5 && q.z < 0.0) < 0.02 * la);
 }

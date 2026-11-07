@@ -586,24 +586,15 @@ impl HeightMap {
         Ok(())
     }
 
-    /// The highest top of the cell `q` is in and the cells next to it (the material could be
-    /// anywhere in a cell); `None` off the map.
-    pub fn top_near(&self, q: Vec2) -> Option<f64> {
+    /// The top of the cell `q` is in, as the simulation that made the map has it (a cell is cut
+    /// where the tool covered its centre); `None` off the map.
+    pub fn top_at(&self, q: Vec2) -> Option<f64> {
         let fi = (q.x - self.x0) / self.dx;
         let fj = (q.y - self.y0) / self.dy;
         if !(fi >= 0.0 && fj >= 0.0 && fi < self.nx as f64 && fj < self.ny as f64) {
             return None;
         }
-        let (i, j) = (fi as usize, fj as usize);
-        let mut most = f64::NEG_INFINITY;
-        for jj in j.saturating_sub(1)..=(j + 1).min(self.ny - 1) {
-            for ii in i.saturating_sub(1)..=(i + 1).min(self.nx - 1) {
-                if let Some(z) = self.heights.get(jj * self.nx + ii) {
-                    most = most.max(*z);
-                }
-            }
-        }
-        most.is_finite().then_some(most)
+        self.heights.get(fj as usize * self.nx + fi as usize).copied()
     }
 
     /// The highest top over the disc of radius `rad` about `c` (and a cell round it); `None`
@@ -680,7 +671,7 @@ impl StockModel {
     fn material_at(&self, q: Vec2, z: f64) -> bool {
         self.in_rect(q)
             && self.top.is_none_or(|t| t > z + self.rest_tolerance)
-            && self.heights.as_ref().and_then(|m| m.top_near(q)).is_none_or(|t| t > z + self.rest_tolerance)
+            && self.heights.as_ref().and_then(|m| m.top_at(q)).is_none_or(|t| t > z + self.rest_tolerance)
     }
 
     /// The highest the stock reaches over the disc of radius `rad` about `c`, at most `cap`.

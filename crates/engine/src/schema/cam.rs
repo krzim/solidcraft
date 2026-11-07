@@ -225,8 +225,13 @@ pub type HeightsPartial = HeightsInput;
 pub struct FeedsSpec {
     /// The cutting feed.
     pub cut: f64,
-    /// The feed going down into the material.
+    /// The feed going down into the material: entries from above, ramps, plunges.
     pub plunge: f64,
+    /// A 3D finishing pass's feed for moves inside it that go down the surface at least as
+    /// steeply as its descent limit (a ball running down a roughed wall). Default: the cut
+    /// feed; give the plunge feed to slow them as before (finishing straight from uncut stock).
+    #[serde(default)]
+    pub descent: Option<f64>,
 }
 
 /// Where a 3D operation's cutter centre may go, seen along the tool axis, in the operation's

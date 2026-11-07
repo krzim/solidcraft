@@ -37,7 +37,7 @@ use crate::path::{MAX_MOVES, Toolpath};
 use crate::surface::Surface;
 use crate::surface_ops::{
     Boundary, DEFAULT_DESCENT_LIMIT, Fence, Field, MAX_GRID_NODES, Out3, Pass, Profile, Rect, Tip, check_angle, check_leave, check_step,
-    check_stepdown, check_tolerance, depth_for, levels, link_path, spans, tool_cutter,
+    check_stepdown, check_tolerance, depth_for, descent_of, levels, link_path, spans, tool_cutter,
 };
 use crate::tool::Tool;
 use crate::{CamError, Result, invalid};
@@ -99,6 +99,13 @@ pub struct ScallopParams {
     /// `bottom` is the floor: where the surface is lower the tool runs at it. `top` is not used.
     pub heights: Heights,
     pub feeds: Feeds,
+    /// Feed for the moves inside a pass that go down the surface at least as steeply as the
+    /// descent limit (mm/min); entries from above always come down at the plunge feed. Left out,
+    /// the cut feed: the pass runs over material a roughing left (the stock to leave), so going
+    /// down a wall is a side cut, not a plunge. Give the plunge feed for the old behaviour
+    /// (finishing straight from uncut stock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descent_feed: Option<f64>,
     pub spacing: Spacing,
     #[serde(default)]
     pub direction: OffsetDirection,
@@ -133,6 +140,13 @@ pub struct SteepShallowParams {
     /// The z-levels run from `top` down to `bottom`; `bottom` is the floor too.
     pub heights: Heights,
     pub feeds: Feeds,
+    /// Feed for the moves inside a pass that go down the surface at least as steeply as the
+    /// descent limit (mm/min); entries from above always come down at the plunge feed. Left out,
+    /// the cut feed: the pass runs over material a roughing left (the stock to leave), so going
+    /// down a wall is a side cut, not a plunge. Give the plunge feed for the old behaviour
+    /// (finishing straight from uncut stock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descent_feed: Option<f64>,
     /// The spacing on shallow ground, and on steep ground too unless `stepdown` is given.
     pub spacing: Spacing,
     /// Ground steeper than this (radians from horizontal, 1° to 89°) is steep, as the cutter
@@ -159,6 +173,13 @@ pub struct PencilParams {
     /// `bottom` is the floor. `top` is not used.
     pub heights: Heights,
     pub feeds: Feeds,
+    /// Feed for the moves inside a pass that go down the surface at least as steeply as the
+    /// descent limit (mm/min); entries from above always come down at the plunge feed. Left out,
+    /// the cut feed: the pass runs over material a roughing left (the stock to leave), so going
+    /// down a wall is a side cut, not a plunge. Give the plunge feed for the old behaviour
+    /// (finishing straight from uncut stock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descent_feed: Option<f64>,
     /// Least turn of the tip's path across a crease for it to count (radians, 1° to 170°): where
     /// the cutter touches two faces the tip's height bends sharply, where it rolls over one
     /// surface it bends no more than the surface does.
@@ -184,6 +205,13 @@ pub struct RestParams {
     /// `bottom` is the floor. `top` is not used.
     pub heights: Heights,
     pub feeds: Feeds,
+    /// Feed for the moves inside a pass that go down the surface at least as steeply as the
+    /// descent limit (mm/min); entries from above always come down at the plunge feed. Left out,
+    /// the cut feed: the pass runs over material a roughing left (the stock to leave), so going
+    /// down a wall is a side cut, not a plunge. Give the plunge feed for the old behaviour
+    /// (finishing straight from uncut stock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descent_feed: Option<f64>,
     /// The tool that cut before, usually larger than this one; not of the same shape.
     pub previous: Tool,
     /// Least material the previous tool left, measured square to the surface, for a place to be
@@ -653,6 +681,8 @@ struct Plan<'a> {
     map: Map,
     heights: Heights,
     feeds: Feeds,
+    /// The feed the passes go down the surface at ([`ParallelParams::descent_feed`]).
+    descent: f64,
     /// The base sample step along a pass.
     step: f64,
     tol: f64,
@@ -674,7 +704,7 @@ fn prepare<'a>(surface: &'a Surface, tool: &Tool, h: &Heights, feeds: &Feeds, b:
     let all = Field::new(surface, &cutter, leave, None, tol)?;
     let fence = b.region.as_ref().map(|r| Fence::new(r, tol.min(1e-3)));
     let map = Map::build(&all, fence.as_ref(), rect, step, h.bottom)?;
-    Ok(Plan { field, all, map, heights: *h, feeds: *feeds, step: step.min(cutter.radius), tol, link_len: tool.diameter })
+    Ok(Plan { field, all, map, heights: *h, feeds: *feeds, descent: feeds.cut, step: step.min(cutter.radius), tol, link_len: tool.diameter })
 }
 
 impl Plan<'_> {
@@ -914,7 +944,7 @@ impl Plan<'_> {
     fn cut(&self, groups: Vec<Vec<Run>>) -> Result<Toolpath> {
         let spacing = self.step.min(self.cutter().radius * 0.5);
         let link = |a: Vec3, b: Vec3| link_path(&self.field, a, b, self.link_len, spacing, self.tol);
-        let mut out = Out3::new(self.heights, self.feeds, DEFAULT_DESCENT_LIMIT);
+        let mut out = Out3::new(self.heights, self.feeds, DEFAULT_DESCENT_LIMIT).descending(self.descent);
         let mut at: Option<Vec2> = None;
         for group in groups {
             for run in nearest_first(group, at) {
@@ -1001,6 +1031,7 @@ fn runs_at(lines: Vec<Vec<Vec2>>, level: f64, climb: bool, ahead_further: bool) 
 /// runs down) are left out: finish those with [`steep_shallow`] or a waterline.
 pub fn scallop(surface: &Surface, tool: &Tool, p: &ScallopParams) -> Result<Toolpath> {
     let mut plan = prepare(surface, tool, &p.heights, &p.feeds, &p.boundary, p.stock_to_leave, p.step, p.tolerance)?;
+    plan.descent = descent_of(&p.feeds, p.descent_feed)?;
     let (d, by_height) = plan.spacing(p.spacing, tool)?;
     plan.link_len = (2.0 * d).max(tool.diameter);
     let weight = plan.weights(by_height, d, tool.diameter);
@@ -1031,6 +1062,7 @@ fn flat_distance(map: &Map, from: &dyn Fn(usize) -> bool, limit: f64) -> Vec<f64
 /// ground, scallop passes are offset from the boundary and from the edge of the steep ground.
 pub fn steep_shallow(surface: &Surface, tool: &Tool, p: &SteepShallowParams) -> Result<Toolpath> {
     let mut plan = prepare(surface, tool, &p.heights, &p.feeds, &p.boundary, p.stock_to_leave, p.step, p.tolerance)?;
+    plan.descent = descent_of(&p.feeds, p.descent_feed)?;
     let (d, by_height) = plan.spacing(p.spacing, tool)?;
     if !finite_in(p.threshold, 1f64.to_radians(), 89f64.to_radians()) {
         return invalid("the steep threshold must be from 1° to 89°");
@@ -1244,6 +1276,7 @@ fn creases(map: &Map, min_angle: f64) -> Vec<Vec<usize>> {
 /// (outermost first), then the crease itself.
 pub fn pencil(surface: &Surface, tool: &Tool, p: &PencilParams) -> Result<Toolpath> {
     let mut plan = prepare(surface, tool, &p.heights, &p.feeds, &p.boundary, p.stock_to_leave, p.step, p.tolerance)?;
+    plan.descent = descent_of(&p.feeds, p.descent_feed)?;
     if !finite_in(p.min_angle, 1f64.to_radians(), 170f64.to_radians()) {
         return invalid("the least crease angle must be from 1° to 170°");
     }
@@ -1342,6 +1375,7 @@ fn settle(height: &dyn Fn(Vec2) -> Result<Option<f64>>, q: Vec2, n: Vec2, g: f64
 /// has no moves.
 pub fn rest_finish(surface: &Surface, tool: &Tool, p: &RestParams) -> Result<Toolpath> {
     let mut plan = prepare(surface, tool, &p.heights, &p.feeds, &p.boundary, p.stock_to_leave, p.step, p.tolerance)?;
+    plan.descent = descent_of(&p.feeds, p.descent_feed)?;
     let (d, by_height) = plan.spacing(p.spacing, tool)?;
     let big = tool_cutter(&p.previous)?.grown(p.stock_to_leave)?;
     let small = plan.cutter();

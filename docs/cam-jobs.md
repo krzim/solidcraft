@@ -237,7 +237,7 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | --- | --- |
 | `contour` | `sketch` (id or name) + `profiles?` (indices; default every drawn profile) or `polygon: [[x, y], …]`; `heights`; `stepdown` (tool's, else half its diameter); `side`: `outside` \| `inside` \| `on` (outside); `climb` (true); `stock_to_leave` (0); `ramp_angle_deg` (0: plunge); `tolerance` (the job's); `lead`, `entry`, `linking`, `tabs`, `finish_passes`, `finish_stepover`, `spring_pass` (see [Leads, entries, linking and tabs](#leads-entries-linking-and-tabs)) |
 | `pocket` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown`; `stepover` (tool's, else 40% of its diameter); `climb`; `stock_to_leave`; `ramp_angle_deg`; `tolerance`; `entry` (a helix); `linking` (see [Leads, entries, linking and tabs](#leads-entries-linking-and-tabs)) |
-| `parallel` | `heights` (`bottom` is the floor); `stepover` (tool's, else 10% of its diameter); `angle_deg` (0); `boundary?: {rect?: [[x, y], [x, y]], polygon?}` (the part's extent); `stock_to_leave` (0); `step` (a quarter of the diameter); `tolerance`; `zigzag` (true); `descent_limit_deg` (70: see Feeds) |
+| `parallel` | `heights` (`bottom` is the floor); `stepover` (tool's, else 10% of its diameter); `angle_deg` (0); `boundary?: {rect?: [[x, y], [x, y]], polygon?}` (the part's extent); `stock_to_leave` (0); `step` (a quarter of the diameter); `tolerance`; `zigzag` (true); `descent_limit_deg` (70: see Feeds); `feeds.descent` (the cut feed: see Feeds) |
 | `roughing` | `heights` (`top` is the stock's top); `stepdown`; `stepover`; `angle_deg`; `boundary`; `stock_to_leave` (0.25); `step`; `tolerance`; `zigzag` |
 | `waterline` | `heights` (levels from `top` to `bottom`); `stepdown` (tool's, else a quarter of its diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` (true) |
 | `scallop` | `heights` (`bottom` is the floor); `scallop_height` or `stepover` (tool's, else 10% of its diameter; along the surface); `direction`: `inward` \| `outward` (inward); `boundary`; `stock_to_leave` (0); `step` (a tenth of the diameter: the grid and the samples); `tolerance`; `climb` (true). See "3D finishing strategies". |
@@ -245,8 +245,8 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `pencil` | `heights`; `min_angle_deg` (30); `passes` (0: the crease alone); `stepover` (tool's, else 10% of its diameter); `min_length` (the tool's radius); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` |
 | `rest_finish` | `heights`; `previous_tool` (a tool number of the job); `threshold` (twice the tolerance); `scallop_height` or `stepover`; `overlap` (a quarter of the diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` |
 | `drill` | `sketch` (circle centres, `circles` (true), filtered by `diameter_range: [min, max]`, and lone points, `sketch_points` (true)) or `points: [[x, y], …]`; `heights` (`retract` is the R height, `top` the hole's top, `bottom` its depth); `cycle`: `simple` \| `dwell` \| `peck` \| `chip_break` (simple); `peck` (tool's stepdown, else its diameter); `peck_clearance` (0.5); `back_off` (0.5); `dwell_seconds` (0.5); `to_full_diameter` (false); `stay_at_retract` (false). See [Drilling](#drilling). |
-| `adaptive` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown` (tool's, else its diameter); `optimal_load` (tool's `stepover`, else 10% of its diameter); `min_engagement_deg`, `max_engagement_deg` (from the load: see [Adaptive clearing](#adaptive-clearing)); `helix_diameter` (80% of the tool's); `ramp_angle_deg` (2); `climb`; `stock_to_leave` (0); `tolerance`; `compare` (true); `from_stock` (true: see [Adaptive clearing](#adaptive-clearing)) |
-| `adaptive_roughing` | `heights` (`top` is the stock's top); `stepdown`; `optimal_load`; `min_engagement_deg`, `max_engagement_deg`; `helix_diameter`; `ramp_angle_deg`; `climb`; `boundary` (the stock's extent; the part's extent); `stock_to_leave` (0.25); `flats` (true); `tolerance` |
+| `adaptive` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown` (tool's, else its diameter); `optimal_load` (tool's `stepover`, else 10% of its diameter); `min_engagement_deg`, `max_engagement_deg` (from the load: see [Adaptive clearing](#adaptive-clearing)); `helix_diameter` (80% of the tool's); `ramp_angle_deg` (2); `climb`; `stock_to_leave` (0); `tolerance`; `compare` (true); `from_stock` (true: see [Adaptive clearing](#adaptive-clearing)); `rest_from` (none: see Rest machining there) |
+| `adaptive_roughing` | `heights` (`top` is the stock's top); `stepdown`; `optimal_load`; `min_engagement_deg`, `max_engagement_deg`; `helix_diameter`; `ramp_angle_deg`; `climb`; `boundary` (the stock's extent; the part's extent); `stock_to_leave` (0.25); `flats` (true); `tolerance`; `rest_from` (none) |
 | `chamfer` | `sketch` + `profiles?` or `polygon`; `heights: {clearance, retract, top}` (no `bottom`: the depth follows from the width); `width` (across the top); `tip_offset` (0.2); `side`: `outside` \| `inside` (outside); `climb` (true); `tolerance`. A chamfer mill only; see [Chamfers](#chamfers) |
 | `indexed` | `a_deg` and `operation`: any of the 3-axis operations above, run with A held at `a_deg` (3+1); optionally `name`, used when the inner operation has none. The inner operation carries the tool and feeds. |
 | `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}`, `{type: "helix", pitch}` or `{type: "rings", stepover, zigzag?}` (below); `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
@@ -281,7 +281,7 @@ polygon (which lie on a circle too) is not.
 ### Feeds
 
 Every move runs at the operation's cut feed except these, which go down no faster than the
-plunge feed:
+plunge feed (the descents of a 3D finish: no faster than its descent feed):
 
 - **Entries.** Each cut is entered from above, the last of the way at the plunge feed. A
   `roughing` level comes down at rapid through the air the levels before it cleared, to 1 mm
@@ -291,10 +291,16 @@ plunge feed:
   A `parallel`, `waterline`, `scallop`, `steep_shallow`, `pencil` or `rest_finish` cut is
   entered from the retract height, and the links between its passes follow the part as
   `parallel`'s do.
-- **Plunges.** A `parallel` move that goes down at least `descent_limit_deg` from horizontal
-  (default 70°; `scallop`, `steep_shallow`, `pencil` and `rest_finish` always 70°) is slowed so the tool goes down no faster than the plunge feed; a move down the
-  surface less steeply than that runs at the cut feed. 0 slows every move that goes down. In
-  `roughing` every move that goes down is slowed so: it goes into material no level has cut.
+- **Descents.** Inside a pass of a 3D finish, a move that goes down at least
+  `descent_limit_deg` from horizontal (default 70°; `scallop`, `steep_shallow`, `pencil` and
+  `rest_finish` always 70°) is slowed so the tool goes down no faster than the descent feed,
+  `feeds.descent`: by default the cut feed, so a ball running down a roughed wall keeps the
+  cut feed (the finish runs over the stock to leave a roughing left, a side cut, not a plunge).
+  Give the plunge feed as `feeds.descent` to slow them as before, as when finishing straight
+  from uncut stock. A move down the surface less steeply runs at the cut feed. A
+  `descent_limit_deg` of 0 slows every move that goes down, 90 none. The plunge feed stays
+  for the entries from above. In `roughing` every move that goes down is slowed to the plunge
+  feed: it goes into material no level has cut.
 - **Ramps.** A `contour` or `pocket` with `ramp_angle_deg` goes down along the profile at
   exactly that angle (the last lap only part of the way round, then on round at the depth),
   each ramping move slowed so the tool goes down no faster than the plunge feed.
@@ -499,8 +505,9 @@ the final retract. At every sample, in work coordinates:
   `gouge_check: false` (it cuts what the model does not show, a deburr of a sharp-edged
   model), a retract straight up the tool's axis is not held against the part: it leaves the
   cut its own feed moves made;
-- with a stock, the cutter must not be in the stock. Nothing tracks what earlier operations
-  removed, so the stock as given is the bound: a rapid below the stock's top over the stock
+- with a stock, the cutter must not be in the stock. The rapid check does not track what
+  earlier operations removed (only rest machining plans on it), so the stock as given is the
+  bound: a rapid below the stock's top over the stock
   fails, even where an earlier operation has cut it away, except after a `face` (with its
   default `overhang`) over the whole top of a box stock: the operations after it are held
   against the stock with its top at the face's `bottom`. A retract straight up the tool's
@@ -600,6 +607,20 @@ the narrower width the limit allows, which takes more steps.
   warns: a blank larger than that would be cut into from the side at the level's full depth, so
   give the blank's extent as `boundary.rect`. Nothing round the stock is modelled: keep the
   levels that go down outside it above the vise jaws and clamps.
+
+- **Rest machining.** With `rest_from`, an `adaptive` or `adaptive_roughing` clears only what
+  earlier operations of the job left: `"previous"` (every operation before it),
+  `{"operations": [names]}` or `{"tool": n}` (those before it with tool n, a larger tool that
+  roughed first). Those operations' program is simulated as `cam.simulate` does, from the job's
+  `stock` box (required, on a 3-axis machine), and the levels are planned on the stock it
+  leaves (a height map in cells of the simulation's size): material is where a cell's top is
+  above the level by more than twice the tolerance (at least 0.02 mm). The tool goes down
+  where the earlier operations cleared and cuts in from there, so a smaller tool after a larger
+  one clears the corners and the skin it left instead of the whole area again (a 4 mm tool
+  after a 10 mm one in a 24 mm square pocket: 841 mm of path against 2241 mm). The report
+  says so, and its engagement is not measured (`measured` false: the measure knows only the
+  whole stock). The operations from the first with `rest_from` on are planned one after the
+  other.
 
 Each adaptive operation's report carries `adaptive`, measured along the path as written,
 independently of the planner (exact containment in the profiles or stock, exact distances to

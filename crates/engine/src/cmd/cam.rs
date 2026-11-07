@@ -649,6 +649,7 @@ impl<'a> Shared<'a> {
     {
         Ctx {
             adaptive: Default::default(),
+            rest: None,
             cmd: self.cmd,
             s: self.s,
             machine: self.machine,
@@ -671,12 +672,17 @@ struct Resolved {
     tool: Tool,
     rpm: f64,
     feeds: Feeds,
+    /// `feeds.descent`, for the 3D finishes.
+    descent: Option<f64>,
 }
 
 /// Everything an operation is planned with.
 struct Ctx<'a> {
     /// What an adaptive operation adds to its report, handed from its planning to the report.
     adaptive: std::cell::RefCell<Option<(crate::schema::cam_adaptive::AdaptiveReport, Vec<String>)>>,
+    /// For an operation with `rest_from`: what the earlier operations it names left of the
+    /// stock, in work coordinates, and how many they were.
+    rest: Option<(std::sync::Arc<solidcraft_cam::adaptive::HeightMap>, usize)>,
     cmd: &'a str,
     s: &'a Session,
     machine: &'a Machine,
@@ -875,7 +881,7 @@ fn plan3_raw(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> R
     let unmerged = |(path, r, kind): (Toolpath, Resolved, &'static str)| (path, r, kind, None);
     match op {
         Op3Spec::Adaptive(o) => adaptive::plan(ctx, o, frame).map(unmerged),
-        Op3Spec::AdaptiveRoughing(o) => adaptive::plan_roughing(ctx, o, surface).map(unmerged),
+        Op3Spec::AdaptiveRoughing(o) => adaptive::plan_roughing(ctx, o, frame, surface).map(unmerged),
         Op3Spec::Contour(o) => {
             let c = o.common();
             let (leave, tol) = (o.stock_to_leave.unwrap_or(0.0), ctx.tolerance(c.name, o.tolerance)?);
@@ -974,6 +980,7 @@ fn plan3_raw(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> R
             let params = ParallelParams {
                 heights: agent::heights(ctx, c.name, o.heights.as_ref(), agent::Region::Part, frame, tol)?,
                 feeds: r.feeds,
+                descent_feed: r.descent,
                 stepover: or_tool(o.stepover, r.tool.stepover, r.tool.diameter * 0.1),
                 angle: ctx.degrees(c.name, o.angle_deg.unwrap_or(0.0), "`angle_deg`")?,
                 boundary: ctx.boundary(c.name, o.boundary.as_ref())?,
@@ -1072,6 +1079,15 @@ fn name3_mut(op: &mut Op3Spec) -> &mut String {
         Op3Spec::SteepShallow(o) => &mut o.name,
         Op3Spec::Pencil(o) => &mut o.name,
         Op3Spec::RestFinish(o) => &mut o.name,
+    }
+}
+
+/// An adaptive operation's name and `rest_from`, when it has one.
+fn rest_from(spec: &OperationSpec) -> Option<(&str, &crate::schema::cam_adaptive::RestFromSpec)> {
+    match spec {
+        OperationSpec::Adaptive(o) => o.rest_from.as_ref().map(|r| (o.name.as_str(), r)),
+        OperationSpec::AdaptiveRoughing(o) => o.rest_from.as_ref().map(|r| (o.name.as_str(), r)),
+        _ => None,
     }
 }
 
@@ -1506,7 +1522,9 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
     // the same plan, notes and refusals as one after the other. Only the operations that fit
     // in the job whatever those before them plan are planned side by side; the rest one after
     // the other, each refused before it is planned when the job has no room for it.
-    let side_by_side = xrotary::fitting(&job.operations);
+    // An operation with `rest_from` plans on what those before it left: it and those after it
+    // are planned one after the other.
+    let side_by_side = xrotary::fitting(&job.operations).min(job.operations.iter().position(|op| rest_from(op).is_some()).unwrap_or(usize::MAX));
     let work: Vec<(usize, &OperationSpec, std::sync::Mutex<Option<agent::Agent>>)> =
         job.operations.iter().take(side_by_side).enumerate().map(|(i, spec)| (i, spec, std::sync::Mutex::new(Some(agent.fork())))).collect();
     let scope = solidcraft_io::vfs::current_scope();
@@ -1525,7 +1543,12 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
         } else {
             let fork = agent.fork();
             fork.start(i);
-            let r = xrotary::plan_op(&shared.ctx(&fork), spec, pose_tol, planned.len());
+            let mut c = shared.ctx(&fork);
+            let r = match rest_from(spec) {
+                Some((name, from)) => adaptive::rest_map(&c, job, name, from, &planned, &op_of).map(|m| c.rest = Some(m)),
+                None => Ok(()),
+            };
+            let r = r.and_then(|()| xrotary::plan_op(&c, spec, pose_tol, planned.len()));
             Some((fork, r))
         };
         let r = match result {

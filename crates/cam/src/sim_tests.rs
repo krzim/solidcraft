@@ -428,6 +428,7 @@ fn a_fifty_millimetre_part_at_a_twentieth_of_a_millimetre() {
         &ParallelParams {
             heights,
             feeds: Feeds { cut: 1500.0, plunge: 300.0 },
+            descent_feed: None,
             stepover: 0.5,
             angle: 0.0,
             boundary: Boundary { rect: Some([Vec2::new(0.0, 0.0), Vec2::new(50.0, 50.0)]), region: None },

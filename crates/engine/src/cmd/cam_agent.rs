@@ -1520,7 +1520,7 @@ pub(super) fn resolve_for(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&To
         return Err(refuse_op(ctx, op, "feeds", e.to_string(), None, "give `feeds: {cut, plunge}` above 0".into()));
     }
     ag.choices.borrow_mut().push(ToolChoice { op_index: ag.index.get(), op: op.to_string(), tool: tool.number, description: tool_label(tool), why });
-    Ok(Resolved { tool: tool.clone(), rpm, feeds })
+    Ok(Resolved { tool: tool.clone(), rpm, feeds, descent: c.feeds.and_then(|f| f.descent) })
 }
 
 /// The distance from `p` to the segment `a`–`b`.

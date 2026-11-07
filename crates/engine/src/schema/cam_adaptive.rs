@@ -66,6 +66,13 @@ operation! {
         /// are full of material. Default: true.
         #[serde(default)]
         pub from_stock: Option<bool>,
+        /// Rest machining: clear only what earlier operations of the job left, as the job's
+        /// simulation of their program leaves its `stock` box (a height map of it). `"previous"`:
+        /// every operation before this one; `{"operations": [names]}`: those; `{"tool": n}`: those
+        /// before this one with tool n (a larger tool that roughed first). Needs the job's
+        /// `stock` box on a 3-axis machine. Default: none (the whole stock).
+        #[serde(default)]
+        pub rest_from: Option<RestFromSpec>,
     }
 }
 
@@ -111,7 +118,36 @@ operation! {
         /// Chord error, mm. Default: the job's tolerance.
         #[serde(default)]
         pub tolerance: Option<f64>,
+        /// Rest machining: clear only what earlier operations of the job left, as the job's
+        /// simulation of their program leaves its `stock` box (a height map of it). `"previous"`:
+        /// every operation before this one; `{"operations": [names]}`: those; `{"tool": n}`: those
+        /// before this one with tool n (a larger tool that roughed first). Needs the job's
+        /// `stock` box on a 3-axis machine. Default: none (the whole stock).
+        #[serde(default)]
+        pub rest_from: Option<RestFromSpec>,
     }
+}
+
+/// Which earlier operations a rest machining clears after (`rest_from`).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum RestFromSpec {
+    /// `"previous"`: every operation before this one.
+    Previous(String),
+    /// Some of them.
+    Some(RestPickSpec),
+}
+
+/// Earlier operations by name, or by the tool they cut with.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RestPickSpec {
+    /// The earlier operations, by name.
+    #[serde(default)]
+    pub operations: Option<Vec<String>>,
+    /// The earlier operations with this tool.
+    #[serde(default)]
+    pub tool: Option<u32>,
 }
 
 /// What an adaptive operation adds to its report: the engagement measured along the path

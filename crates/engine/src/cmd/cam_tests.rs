@@ -67,6 +67,40 @@ fn dome_job() -> Value {
     })
 }
 
+/// A parallel finish over a 20 mm square boss 10 mm high on a plate: the moves down the boss's
+/// walls inside a pass run at `feeds.descent`, the cut feed by default (they ran at the plunge
+/// feed, most of the time of such a job); at the plunge feed again when that is given as the
+/// descent feed; and never slowed with `descent_limit_deg` 90.
+#[test]
+fn a_parallel_finish_runs_down_walls_at_the_descent_feed() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 10, "corner": [-20, -20, -10], "body_name": "Plate"}));
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 10, "corner": [-10, -10, 0], "operation": "join"}));
+    let job = |feeds: Value, limit: Option<f64>| {
+        let mut j = dome_job();
+        let op = &mut j["operations"][0];
+        op["heights"] = json!({"clearance": 30, "retract": 15, "top": 10, "bottom": -1});
+        op["boundary"] = json!({"rect": [[-16, -16], [16, 16]]});
+        op["feeds"] = feeds;
+        if let Some(l) = limit {
+            op["descent_limit_deg"] = json!(l);
+        }
+        json!({"job": j, "dry_run": true})
+    };
+    let minutes = |r: &Value| r["operations"][0]["cut_minutes"].as_f64().unwrap();
+    let fast = run(&mut s, "cam.job", job(json!({"cut": 900, "plunge": 250}), None));
+    assert_clean(&fast);
+    let slow = run(&mut s, "cam.job", job(json!({"cut": 900, "plunge": 250, "descent": 250}), None));
+    assert_clean(&slow);
+    let never = run(&mut s, "cam.job", job(json!({"cut": 900, "plunge": 250, "descent": 250}), Some(90.0)));
+    assert_clean(&never);
+    eprintln!("down the walls at the cut feed {:.3} min, at the plunge feed {:.3} min", minutes(&fast), minutes(&slow));
+    assert!(minutes(&slow) > minutes(&fast) * 1.2, "{} {}", minutes(&slow), minutes(&fast));
+    assert!((minutes(&never) - minutes(&fast)).abs() < 1e-9, "{} {}", minutes(&never), minutes(&fast));
+    let e = s.execute("cam.job", &job(json!({"cut": 900, "plunge": 250, "descent": 0}), None)).unwrap_err();
+    assert!(e.to_string().contains("descent feed"), "{e}");
+}
+
 /// A block 40 × 30 × 30 about the X axis with a 12 × 12 pocket 5 mm deep in its +Y face.
 fn pocketed_block() -> Session {
     let mut s = Session::default();
@@ -1663,6 +1697,53 @@ fn a_2d_adaptive_clearing_takes_the_jobs_stock() {
     let r = run(&mut s, "cam.job", job(false));
     assert_clean(&r);
     assert!(r["operations"][0]["adaptive"]["helices"].as_u64().is_some_and(|h| h >= 1), "{r}");
+}
+
+/// Rest machining: after a 10 mm tool has cleared a 24 mm square pocket, a 4 mm tool with
+/// `rest_from` clears only what it left (the corners and a skin along the walls), planned on the
+/// job's simulation of the operations before it; without `rest_from` it clears the whole pocket
+/// again. Hostile picks are refused.
+#[test]
+fn rest_machining_clears_what_the_operations_before_left() {
+    let mut s = pocket_block();
+    let op = |name: &str, tool: u32, rest: Option<Value>| {
+        let mut o = json!({"name": name, "type": "adaptive", "tool": tool, "polygon": [[-12, -12], [12, -12], [12, 12], [-12, 12]],
+                           "heights": {"clearance": 20, "retract": 2, "top": 0, "bottom": -3}, "optimal_load": 0.6, "compare": false});
+        if let Some(r) = rest {
+            o["rest_from"] = r;
+        }
+        o
+    };
+    let job = |ops: Value| {
+        json!({"job": {"name": "rest", "machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 10.0), flat(2, 4.0)],
+                       "stock": {"box": {"min": [-20, -20, -10], "max": [20, 20, 0]}}, "operations": ops},
+               "dry_run": true})
+    };
+    let again = run(&mut s, "cam.job", job(json!([op("big", 1, None), op("small", 2, None)])));
+    assert_clean(&again);
+    let length = |r: &Value| r["operations"][1]["cut_length"].as_f64().unwrap();
+    for pick in [json!("previous"), json!({"operations": ["big"]}), json!({"tool": 1})] {
+        let r = run(&mut s, "cam.job", job(json!([op("big", 1, None), op("small", 2, Some(pick.clone()))])));
+        assert_clean(&r);
+        eprintln!("{pick}: {:.0} mm against {:.0} mm", length(&r), length(&again));
+        assert!(length(&r) < 0.5 * length(&again), "{pick}: {} of {}", length(&r), length(&again));
+        let w = r["operations"][1]["warnings"].as_array().unwrap();
+        assert!(w.iter().any(|w| w.as_str().is_some_and(|w| w.contains("rest machining"))), "{w:?}");
+    }
+    for (pick, why) in [
+        (json!("all"), "\"previous\""),
+        (json!({"operations": ["nope"]}), "not an operation before this one"),
+        (json!({"tool": 7}), "picks no operation"),
+        (json!({}), "needs `operations` or `tool`"),
+    ] {
+        let e = s.execute("cam.job", &job(json!([op("big", 1, None), op("small", 2, Some(pick.clone()))]))).unwrap_err();
+        assert!(e.to_string().contains(why), "{pick}: {e}");
+    }
+    // Without the job's stock there is nothing to simulate from.
+    let mut j = job(json!([op("big", 1, None), op("small", 2, Some(json!("previous")))]));
+    j["job"].as_object_mut().unwrap().remove("stock");
+    let e = s.execute("cam.job", &j).unwrap_err();
+    assert!(e.to_string().contains("`stock` box"), "{e}");
 }
 
 /// A block 30 × 20 × 10, its top at Z 0, with its four top edges chamfered 1 mm at 45° when
