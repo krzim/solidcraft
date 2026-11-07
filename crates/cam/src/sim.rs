@@ -2569,6 +2569,13 @@ const MAX_CROSSINGS: usize = 64;
 /// measured from its middle to the part's surface, and the column's end when it is inside the
 /// material. Air between the part's surfaces, as down a hole or a pocket, is no gouge however
 /// far it is from them; a stretch of material, however thin, is as deep as its middle.
+///
+/// Where the crossings do not pair up that way (a part whose triangles face inwards, bodies
+/// that overlap, more crossings than are followed), the
+/// material cannot be told from the air, and the column is measured as if it were all
+/// material: from its end, and from the middle of its stretch past the first crossing, to the
+/// part's surface. That never passes a gouge as air. A column that starts inside the part (the
+/// surface behind its start faces against it) starts in its material.
 pub(crate) fn column_depth(part: &Surface, from: Vec3, to: Vec3, cap: f64) -> f64 {
     let d = to - from;
     let len = d.len();
@@ -2577,21 +2584,42 @@ pub(crate) fn column_depth(part: &Surface, from: Vec3, to: Vec3, cap: f64) -> f6
     }
     let step = 1e-9 / len;
     let measure = |a: f64, b: f64| distance_within(part, from + d * (0.5 * (a + b)), cap);
+    let facing = |i: usize| part.triangle(i).map_or(0.0, |tri| (tri[1] - tri[0]).cross(tri[2] - tri[0]).dot(d));
     let (mut t0, mut inside, mut start, mut worst) = (0.0f64, false, 0.0f64, 0.0f64);
+    let (mut first, mut paired, mut ended) = (None, true, false);
+    // A column that starts inside the part: the surface behind its start faces against it.
+    if let Some((_, i)) = part.raycast(from, -d)
+        && facing(i) < 0.0
+    {
+        (inside, first) = (true, Some(0.0));
+    }
     for _ in 0..MAX_CROSSINGS {
-        let Some((t, i)) = part.raycast(from + d * t0, d) else { break };
+        let Some((t, i)) = part.raycast(from + d * t0, d) else {
+            ended = true;
+            break;
+        };
         let at = t0 + t;
         if !(at <= 1.0) {
+            ended = true;
             break;
         }
-        let facing = part.triangle(i).map_or(0.0, |tri| (tri[1] - tri[0]).cross(tri[2] - tri[0]).dot(d));
+        let facing = facing(i);
+        if facing != 0.0 {
+            first.get_or_insert(at);
+        }
         if facing < 0.0 && !inside {
             (inside, start) = (true, at);
         } else if facing > 0.0 && inside {
             inside = false;
             worst = worst.max(measure(start, at));
+        } else if facing != 0.0 {
+            paired = false;
+            break;
         }
         t0 = at + step;
+    }
+    if !(paired && ended) {
+        return distance_within(part, to, cap).max(measure(first.unwrap_or(0.0), 1.0)).min(cap);
     }
     if inside {
         worst = worst.max(measure(start, 1.0)).max(distance_within(part, to, cap));

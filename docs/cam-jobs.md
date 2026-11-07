@@ -918,6 +918,9 @@ part's surface, the cut's end too when it is inside the part. A cut beside a ste
 the tolerance of the wall is not a gouge, and neither is a column down the air of a hole or a
 pocket, however far its middle is from their walls (such columns slant into a radial hole or an
 indexed pocket's edge on a 4th axis, and whether a cell's column does depends on the cell's size).
+Where a column's crossings do not pair up that way (a part whose facets face inwards, bodies that
+overlap), the whole column past its first crossing counts as material, so a gouge is never passed
+as air.
 A thread mill cuts as the core inside its teeth, as deep as its `thread_mill` operation's thread
 (as the gouge check takes it), since the thread is not in the model.
 Leftover is measured along Z (along the ray), so material beside a steep wall counts its full

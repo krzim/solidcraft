@@ -794,3 +794,30 @@ fn a_gouge_is_measured_over_the_material_a_column_cuts() {
     // Ending inside a block: as deep as its end.
     close(crate::sim::column_depth(&part, Vec3::new(-6.0, 0.0, 5.0), Vec3::new(-6.0, 0.0, -3.0), 20.0), 3.0, 1e-9);
 }
+
+/// The gouge measure does not depend on which way the part's triangles face: a part whose
+/// triangles all face inwards (an STL wound the other way), or merged bodies that overlap, or a
+/// column that starts inside the part, still have their gouges measured, never passed as air.
+#[test]
+fn a_gouge_is_found_in_a_part_whose_triangles_face_inwards() {
+    let part = block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(40.0, 40.0, -5.0));
+    let inside_out = Surface::new(part.triangles().iter().map(|t| [t[0], t[2], t[1]]).collect()).unwrap();
+    // A column down into the part by a millimetre.
+    let (from, to) = (Vec3::new(20.0, 20.0, 5.0), Vec3::new(20.0, 20.0, -6.0));
+    close(crate::sim::column_depth(&part, from, to, 20.0), 1.0, 1e-9);
+    let d = crate::sim::column_depth(&inside_out, from, to, 20.0);
+    assert!(d > 1.0 - 1e-9, "{d}");
+    // Two bodies overlapping, merged: the column ends inside both.
+    let other = block(Vec3::new(10.0, 10.0, -12.0), Vec3::new(30.0, 30.0, -7.0));
+    let merged = Surface::new(part.triangles().iter().chain(other.triangles()).copied().collect()).unwrap();
+    let d = crate::sim::column_depth(&merged, from, Vec3::new(20.0, 20.0, -9.0), 20.0);
+    assert!(d > 1.0 - 1e-9, "{d}");
+    // A column that starts inside the part (a part reaching above where it starts).
+    let d = crate::sim::column_depth(&part, Vec3::new(20.0, 20.0, -5.5), to, 20.0);
+    assert!(d > 1.0 - 1e-9, "{d}");
+    // The whole simulation: the deep pass gouges the inside-out part as it does the part.
+    let text = program("G0 X5. Y20.\nG0 Z1.\nG1 Z-6. F200\nG1 X35. F800\nG0 Z10.");
+    let deep = run(&text, &flat(6.0), &inside_out, 0.1);
+    assert!(deep.gouge_cells > 1000, "{}", deep.gouge_cells);
+    close(deep.gouge_worst, 1.0, 1e-6);
+}
