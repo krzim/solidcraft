@@ -4657,6 +4657,26 @@ fn a_suggestion_reads_the_jobs_profile_and_picks_carbide_drills_faces_adaptive_a
 }
 
 #[test]
+fn the_smallest_tool_a_suggestion_falls_back_to_is_carbide_before_hss() {
+    // The bar's pockets have sharp inside corners, so their walls are finished with the
+    // smallest tool that fits: the carbide one, not the HSS one of the same size.
+    let mut s = pocketed_bar();
+    let mut hss = flat(3, 2.0);
+    hss["description"] = json!("2mm 4F HSS-TiN");
+    let mut carbide = flat(22, 2.0);
+    carbide["description"] = json!("2mm 4F steel carbide");
+    let sug = run(&mut s, "cam.suggest", json!({"tools": [flat(6, 6.0), hss, carbide], "axis": "a", "material": "steel"}));
+    let walls: Vec<u64> = sug["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| o["name"].as_str().is_some_and(|n| n.ends_with("walls")))
+        .filter_map(|o| o["tool"].as_u64())
+        .collect();
+    assert!(!walls.is_empty() && walls.iter().all(|t| *t == 22), "{sug}");
+}
+
+#[test]
 fn feature_and_suggest_refusals_say_what_to_change() {
     let mut s = feature_plate();
     let dir = Dir::new("suggest");

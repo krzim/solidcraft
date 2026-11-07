@@ -250,6 +250,17 @@ fn message(e: EngineError) -> String {
     }
 }
 
+/// The smallest of `tools` among those that suit `material` best ([`suits`]): never an HSS tool
+/// where a carbide one would do.
+fn smallest<'a>(tools: impl Iterator<Item = &'a Pick>, material: Option<MaterialSpec>) -> Option<&'a Pick> {
+    tools.min_by(|a, b| {
+        suits(&a.tool, material)
+            .cmp(&suits(&b.tool, material))
+            .then(a.tool.diameter.total_cmp(&b.tool.diameter))
+            .then(a.tool.number.cmp(&b.tool.number))
+    })
+}
+
 /// `tools` of `kind`, those that suit `material` best first ([`suits`]), then the largest (the
 /// lower number first among equals).
 fn largest(tools: &[Pick], kind: ToolKind, material: Option<MaterialSpec>) -> Vec<&Pick> {
@@ -719,7 +730,7 @@ fn operations(
             .copied()
             .filter(|t| t.tool.radius() <= corner + 1e-9)
             .find(|t| takes(t))
-            .or_else(|| flats.iter().rev().copied().find(|t| takes(t)));
+            .or_else(|| smallest(flats.iter().copied().filter(|t| takes(t)), material));
         let Some(finish) = finish else {
             plan.skipped.push(format!("{}: no flat end mill fits round its walls for a finishing pass", pk.id));
             continue;
@@ -866,11 +877,11 @@ fn operations(
         let balls = largest(tools, ToolKind::BallEndmill, material);
         let pick = balls
             .iter()
-            .find(|t| t.tool.radius() <= limit + 1e-9)
-            .or(balls.last())
             .copied()
-            .or_else(|| largest(tools, ToolKind::BullNose, material).last().copied())
-            .or_else(|| flats.last().copied());
+            .find(|t| t.tool.radius() <= limit + 1e-9)
+            .or_else(|| smallest(balls.iter().copied(), material))
+            .or_else(|| smallest(largest(tools, ToolKind::BullNose, material).into_iter(), material))
+            .or_else(|| smallest(flats.iter().copied(), material));
         if let Some(t) = pick {
             if t.tool.kind != ToolKind::BallEndmill {
                 plan.check.push(format!(
@@ -903,7 +914,7 @@ fn operations(
     // 7. Turned diameters on a 4th axis.
     if axis == AxisSpec::A && !r.turned.is_empty() {
         let balls = largest(tools, ToolKind::BallEndmill, material);
-        let pick = balls.last().copied().or_else(|| flats.last().copied());
+        let pick = smallest(balls.iter().copied(), material).or_else(|| smallest(flats.iter().copied(), material));
         let swing = first.and_then(|su| su.swing).unwrap_or(top);
         if let Some(t) = pick {
             let x0 = r.turned.iter().map(|x| x.x_min).fold(f64::INFINITY, f64::min);
