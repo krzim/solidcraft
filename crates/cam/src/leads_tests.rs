@@ -503,6 +503,7 @@ fn hostile_options_are_errors_never_panics() {
         finish_stepover: 0.3,
         spring_pass: true,
         linking: Linking::StayDown,
+        vertical_lead: None,
     };
     let path = contour_with(&circle, &tool(6.0), &outside(true), &opts, &c, &always).unwrap();
     assert!(cutting_points(&path, 0.0).iter().all(|p| v(p.x, p.y).len() >= 11.0 - 1e-6));
@@ -521,6 +522,15 @@ fn fastest_descent(path: &Toolpath) -> f64 {
                 Move::Arc { to, center, ccw, feed } if to.z < p.z - 1e-9 => {
                     let run = v(p.x, p.y).dist(center) * arc_sweep(p, to, center, ccw);
                     fastest = fastest.max(feed * (p.z - to.z) / run.hypot(p.z - to.z));
+                }
+                // A vertical arc goes down fastest where it is steepest: straight down at the
+                // start of a quarter arc into a cut.
+                Move::PlaneArc { to, center, plane, ccw, feed } => {
+                    let arc = crate::path::PlaneArc { from: p, to, center, plane, ccw };
+                    for k in 0..=64 {
+                        let down = arc.tangent(f64::from(k) / 64.0).map_or(0.0, |t| -t.z);
+                        fastest = fastest.max(feed * down);
+                    }
                 }
                 _ => {}
             }
@@ -554,6 +564,14 @@ fn no_cut_goes_down_faster_than_the_plunge_feed() {
             assert!(fastest <= feeds.plunge * (1.0 + 1e-9), "{entry:?} {lead:?} {tabs:?}: down at {fastest} mm/min");
             // Only the descents are slowed: the passes themselves go at the cutting feed.
             assert!(path.moves.iter().any(|m| matches!(m, Move::Feed { feed, .. } if *feed == feeds.cut)));
+        }
+        // A vertical lead's quarter arc starts straight down.
+        for vertical in [1.0, 2.5] {
+            let opts = ContourOptions { vertical_lead: Some(vertical), finish_passes: 1, finish_stepover: 0.2, ..ContourOptions::default() };
+            let path = contour_with(&regions, &tool(3.0), &outside(climb), &opts, &c, &never).unwrap();
+            assert!(path.moves.iter().any(|m| matches!(m, Move::PlaneArc { .. })));
+            let fastest = fastest_descent(&path);
+            assert!(fastest <= feeds.plunge * (1.0 + 1e-6), "vertical lead {vertical}: down at {fastest} mm/min");
         }
         let params = PocketParams { climb, ..lanes(1.2) };
         for entry in [Entry::Helix { radius: 1.4, angle }, Entry::Ramp { angle }] {
@@ -717,4 +735,53 @@ fn finishing_passes_deeper_than_the_flutes_step_down_within_them() {
     // The depth passes alone are not stepped this way (each is a stepdown deep).
     let rough = ContourOptions::default();
     assert!(contour_with(&regions, &short, &outside(true), &rough, &c, &never).is_ok());
+}
+
+/// A vertical lead comes down a quarter arc in the vertical plane of the pass's start into it,
+/// and goes up one out of its end: `G18`/`G19` where that runs along X or Y, lines otherwise.
+#[test]
+fn a_vertical_lead_arcs_down_into_the_pass_and_up_out_of_it() {
+    let c = cut(0.0, -4.0, 2.0);
+    let square = [rect(-10.0, -10.0, 10.0, 10.0)];
+    let opts = ContourOptions { vertical_lead: Some(1.5), ..ContourOptions::default() };
+    let path = contour_with(&square, &tool(6.0), &outside(true), &opts, &c, &never).unwrap();
+    assert!(verify(&path, &c.heights).is_ok());
+    let arcs: Vec<&Move> = path.moves.iter().filter(|m| matches!(m, Move::PlaneArc { .. })).collect();
+    // Into and out of each of the two levels; the square's sides run along X and Y.
+    assert_eq!(arcs.len(), 4, "{arcs:?}");
+    // Nothing is cut inside the square, the leads included.
+    assert!(cutting_points(&path, 0.0).iter().all(|p| outside_rect(v(p.x, p.y), -10.0, -10.0, 10.0, 10.0) >= 3.0 - 1e-6));
+    // With a horizontal lead, the vertical one comes down into the lead's start.
+    let both = ContourOptions { lead: Some(Lead { radius: 2.0, sweep: PI / 2.0, line: 0.0 }), vertical_lead: Some(1.0), ..ContourOptions::default() };
+    let path = contour_with(&square, &tool(6.0), &outside(true), &both, &c, &never).unwrap();
+    assert!(verify(&path, &c.heights).is_ok());
+    assert!(path.moves.iter().any(|m| matches!(m, Move::PlaneArc { .. })));
+    // A circle starts along neither axis: its vertical leads are lines.
+    let circle = [Region2 {
+        outer: Loop2 { segs: vec![solidcore_record::Seg2::Arc { center: v(0.0, 0.0), radius: 10.0, start: 0.3, sweep: 2.0 * PI }] },
+        holes: vec![],
+    }];
+    let path = contour_with(&circle, &tool(6.0), &outside(true), &opts, &c, &never).unwrap();
+    assert!(verify(&path, &c.heights).is_ok());
+    // A ramp or helix with it, a bad radius, or a lead into the part are refused.
+    let ramp = ContourOptions { entry: Some(Entry::Ramp { angle: 0.1 }), ..opts };
+    assert!(contour_with(&square, &tool(6.0), &outside(true), &ramp, &c, &never).is_err());
+    for bad in [0.0, -1.0, f64::NAN, 1e9] {
+        let o = ContourOptions { vertical_lead: Some(bad), ..ContourOptions::default() };
+        assert!(contour_with(&square, &tool(6.0), &outside(true), &o, &c, &never).is_err(), "{bad}");
+    }
+    let inside = ContourParams { side: Side::Inside, ..outside(true) };
+    let big = ContourOptions { vertical_lead: Some(30.0), ..ContourOptions::default() };
+    assert!(contour_with(&square, &tool(6.0), &inside, &big, &c, &never).is_err());
+    // A finishing pass whose vertical lead starts where the depth passes did not cut would
+    // plunge into the material down to the arc's start, as a plain plunge would: refused,
+    // unless the arc starts above the top.
+    // Round a circle the lead's start, along the tangent, is well away from the depth passes.
+    let deep = cut(0.0, -20.0, 10.0);
+    let finish =
+        |vertical: f64| ContourOptions { vertical_lead: Some(vertical), finish_passes: 1, finish_stepover: 0.25, ..ContourOptions::default() };
+    let e = contour_with(&circle, &tool(6.0), &outside(true), &finish(12.0), &deep, &never).unwrap_err();
+    assert!(e.to_string().contains("did not cut"), "{e}");
+    let path = contour_with(&circle, &tool(6.0), &outside(true), &finish(20.0), &deep, &never).unwrap();
+    assert!(verify(&path, &deep.heights).is_ok());
 }

@@ -192,6 +192,24 @@ and for a thread mill `thread_pitch` and `tooth_height` (see
 `spindle_rpm` or `feeds` takes the tool's; its
 stepdown and stepover default to the tool's too.
 
+A tool's speed and feed may come from its cutting data instead of being given: `surface_speed`
+(m/min at the cutting diameter) gives the spindle speed `1000 · vc / (π · D)` when it has no
+`spindle_rpm`, and `chip_load` (mm a tooth) gives the cutting feed `rpm · flutes · fz` when it
+has no `feed`, at the spindle speed as held to the machine's range. Explicit values win; the
+reply's notes say what was worked out. `cutting_data: [{strategy, spindle_rpm?, feed?,
+plunge_feed?, stepdown?, stepover?, surface_speed?, chip_load?}]` holds values for a kind of
+operation, each over the tool's own when an operation of that strategy uses the tool:
+`adaptive` (`adaptive`, `adaptive_roughing`), `slot` (`contour`, `pocket`, `roughing`, `bore`,
+`rotary_roughing`, `wrap_pocket`, `wrap_contour`), `face`, `finish` (the 3D and rotary
+finishes, `wrap`), `chamfer` and `drill` (`indexed` operations by the operation inside them).
+An adaptive clearing's deep, thin cut and a slot's shallow, full-width one want different
+numbers: a tool library keeps the general values on the tool and the adaptive ones in its
+`adaptive` entry. The spindle speed is held to the machine's range and the feeds to its top
+feeds, with a note: the profile's `default_feeds` limits, and for a speed or feed worked out
+from `surface_speed` or `chip_load`, the job's `machine_rates` where the profile gives none
+(a plunge that follows such a feed, the tool giving no `plunge_feed`, is held to the machine's
+top Z feed). The setup sheet states every such hold first.
+
 ### Which tool for which operation
 
 Every operation refuses a tool that cannot do its cut, with the reason, before planning:
@@ -322,7 +340,8 @@ Feed per minute (`G94`) always comes back before a rapid after a cut in inverse 
 `rapid_length`, `feed_length`, `cut_minutes` (as the controller times it: inverse-time blocks by
 their `F`), `rapid_minutes` (with `rapid_rate`), `arcs`, `g93_blocks`, `rotary_ranges` (each
 rotary letter's lowest and highest angle), `bounds` and `errors` (the first line the reader
-cannot read). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
+cannot read). Arcs are measured round in their own plane: `G17` with `I J`, `G18` with `I K`,
+`G19` with `J K` (a `G18`/`G19` arc's lowest point counts in `bounds`). It reads the absolute-coordinate G-code SolidCraft's posts write; programs from
 elsewhere are read on a best-effort basis and stop at the first block it cannot follow
 (incremental coordinates, for one).
 
@@ -457,6 +476,14 @@ With a stock, a `face` is refused where a descent or a link between passes would
 stock (a `rect` that stops short of the stock's edges along the passes would take the tool
 straight down into it: give one that reaches past them, or turn the passes), and where its
 `bottom` is below the stock's (whatever holds the stock is there).
+
+With `lead_radius` (mm) each level is entered as the reference facing programs do: the tool
+goes down beside the stock to the radius above the level, the radius behind the pass's start,
+and comes down a quarter arc into it; with `zigzag` the passes of the level link round half
+circles outside the area (`G2`/`G3`), and the level's last pass goes out up a quarter arc
+beyond its end. The arcs are `G18` for passes along X (`angle_deg` 0) and `G19` along Y (90),
+lines along the arc at other angles; see [Vertical leads](#vertical-leads). The lead's radius is
+at most ten times the tool's diameter.
 
 ### The rapid check
 
@@ -623,6 +650,7 @@ Without them a contour cuts as before; a pocket goes in by a helix.
 | `tabs` | contour, outside | `{count \| spacing, width, height, ramp_angle_deg?}`: material left `height` above the bottom to hold a part cut out of the stock, each `width` long along the wall, placed evenly on the profile's straight stretches (away from its corners and the start); the tool rises over each on ramps of `ramp_angle_deg` (30°). Refused when they do not fit or are as high as the cut. |
 | `finish_passes` | contour | Passes round the final wall at full depth after the depth passes (0), `finish_stepover` (5% of the tool's diameter, at most half its radius) apart, the last on the wall; the depth passes leave `finish_passes × finish_stepover` for them. Each is linked in the cut, or by its lead. Not with `side: on`. Refused where a finishing pass would reach into a notch, a neck or a gap between parts that the pass before it did not fit in (it would cut a full slot at full depth). On a wall deeper than the tool's `flute_length` each finishing pass goes down in steps no deeper than the flutes, evenly from `top`, the last at `bottom` (a tool whose shank is wider than its cutter is refused there); the spring pass stays at the bottom. |
 | `spring_pass` | contour | Go round the last pass once more (false). |
+| `vertical_lead` | contour | The radius of a quarter arc in the vertical plane of the pass's start down into each pass and up out of it, mm ([Vertical leads](#vertical-leads)). Default: none. |
 
 No cut of a contour or a pocket goes down faster than the plunge feed: a ramp, a helix and the
 way down off a tab are slowed to the feed that takes the tool down at the plunge feed (a 30° tab
@@ -630,8 +658,25 @@ ramp at 2880 mm/min would otherwise go down at 1440 mm/min).
 
 Ring by ring a pocket is cut from the inside out: a ring only after the rings next inside it, and
 otherwise the nearest ring first, so that the rooms of a pocket are cleared one after the other.
-The vertical leads some posts write (an arc in the plane of the cut's normal and Z, `G18`/`G19`)
-are not written: the program reader and the read-back follow arcs in the XY plane only.
+
+### Vertical leads
+
+`vertical_lead` (a contour's radius, mm) and a face's `lead_radius` enter a cut the way the
+reference facing programs do: down a quarter arc in the vertical plane of the cut's direction,
+from the radius above and behind its start, and out of its end up a quarter arc beyond it. The
+post writes each as a `G18` (passes along X) or `G19` (along Y) arc, the plane word on the arc's
+own block before its motion code (`G19 G2 Y174.148 Z-0.15 J-0.3 K0. F1600.`) with both centre
+offsets of the plane (`I K` or `J K`), `G17` again on the next arc in XY and after the
+operation, so a canned cycle that follows is in the plane the header set. Where the cut's
+direction runs along neither axis the arc goes out as lines within 0.001 mm of it; a post with
+`arcs: false` writes lines within its arc tolerance. The program reader, the read-back,
+`cam.check`, the machine time and the simulation all follow `G17`, `G18` and `G19`. On a
+contour a vertical lead comes down into the start of its `lead` (or the pass) and takes the
+place of the entry (no ramp or helix with it); it is refused where the ground behind the start
+or beyond the end is the part. Like every way down, the arc into the cut is slowed so it goes
+down no faster than the plunge feed where it is steepest (a quarter arc into a cut starts
+straight down). A finishing pass whose vertical lead would start where the depth passes did not
+cut is refused, as a plunge there is, unless the arc starts above `top`.
 
 ## 3D finishing strategies
 
@@ -1047,6 +1092,11 @@ It holds, in order:
 
 - **The job:** its name, the machine, the post, the G-code file's name and the work offset it
   runs in (`G54` to `G59`, or a note that the post writes none).
+- **Before you start: the machine's limits**, when the job runs into any: each spindle speed
+  held to the machine's range, each feed held to its top feed, and the blocks the controller
+  will run slower than written (an axis asked for more than its top feed or rate, a spindle
+  speed outside its range, by the job's `machine_rates`). They are in the notes and warnings
+  too; here they come first, so the operator reads them before the program runs.
 - **Work zero:** the design point that is X0 Y0 Z0 and the part's extent from it, with each axis
   in words (on the part's left side, in the middle, on its top, so many mm below its bottom). On
   a 4th axis set up the usual way (`4axis_a`) Y0 Z0 is the A axis centreline, and the sheet says
@@ -1057,6 +1107,8 @@ It holds, in order:
   rises, and its travel limits when the machine has them.
 - **Stock**, when the job gives one: a block by its size and its corners from work zero (and
   the height of its top), a bar by its diameter and its ends along X.
+- **Fixtures**, when the job names any: each body that holds the stock by name, with the box
+  it fills in work coordinates.
 - **Tools:** only those the operations use, by number: kind, diameter (and corner radius),
   flutes, flute length, shank, stickout, holder, the lowest Z the program sends the tip to
   (Z min, in program coordinates: on a 4th axis that is the distance from the A axis), the

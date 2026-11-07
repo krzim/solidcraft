@@ -71,7 +71,7 @@ use crate::gcode::words;
 use crate::gcode5::{JointWords, parse5};
 use crate::kinematics::{Joints, Machine, forward, tool_axis};
 use crate::multiaxis::Pose;
-use crate::path::arc_sweep;
+use crate::path::{ArcPlane, arc_sweep};
 use crate::surface::{Surface, nearest_on_triangle};
 use crate::tool::{Tool, ToolKind};
 use crate::{CamError, Result, invalid};
@@ -1370,9 +1370,6 @@ struct Scan {
     changes: Vec<(usize, u32)>,
     /// The lines that lose the position (a return home or a move in machine coordinates).
     gaps: Vec<usize>,
-    /// Lines in the XZ or YZ plane (`G18`, `G19`), with their `I J K` words (0 when not
-    /// written, in the program's units), in line order.
-    planes: Vec<(usize, Plane, [f64; 3])>,
     /// The spindle after each line that changes it (`S`, `M3`, `M4`, `M5`, `M2`, `M30`), in line
     /// order: its speed when it turns, 0 when it is stopped. Before the first `M3`/`M4`/`M5` it is
     /// not known (a program that never says is not taken as cutting with it stopped).
@@ -1383,13 +1380,11 @@ impl Scan {
     fn of(text: &str) -> Result<Scan> {
         let mut scan = Scan::default();
         let mut pending: Option<u32> = None;
-        let mut plane = Plane::Xy;
         let (mut rpm, mut on): (f64, Option<bool>) = (0.0, None);
         for (i, line) in text.lines().enumerate() {
             let n = i + 1;
             let ws = words(line, n)?;
             let mut m6 = false;
-            let mut ijk = [0.0; 3];
             let was = (rpm, on);
             for &(c, v) in &ws {
                 match c {
@@ -1405,19 +1400,10 @@ impl Scan {
                     'M' if (v - 6.0).abs() < 1e-9 => m6 = true,
                     'G' => match (v * 10.0).round() as i64 {
                         280 | 300 | 530 => scan.gaps.push(n),
-                        170 => plane = Plane::Xy,
-                        180 => plane = Plane::Zx,
-                        190 => plane = Plane::Yz,
                         _ => {}
                     },
-                    'I' => ijk[0] = v,
-                    'J' => ijk[1] = v,
-                    'K' => ijk[2] = v,
                     _ => {}
                 }
-            }
-            if plane != Plane::Xy {
-                scan.planes.push((n, plane, ijk));
             }
             if (rpm, on) != was
                 && let Some(turning) = on
@@ -1436,11 +1422,6 @@ impl Scan {
     fn rpm_at(&self, line: usize) -> Option<f64> {
         let k = self.spindle.partition_point(|(l, _)| *l <= line).checked_sub(1)?;
         self.spindle.get(k).map(|(_, r)| *r)
-    }
-
-    /// The plane and `I J K` of `line`, when it is not XY.
-    fn plane_at(&self, line: usize) -> Option<(Plane, [f64; 3])> {
-        self.planes.binary_search_by_key(&line, |(n, _, _)| *n).ok().and_then(|k| self.planes.get(k)).map(|(_, p, ijk)| (*p, *ijk))
     }
 }
 
@@ -2361,9 +2342,9 @@ pub fn plan_sim(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
     for b in &blocks {
         let (line, linear, rotary, tcp, rapid) = match b {
             JointWords::Rapid { line, linear, rotary, tcp } => (*line, *linear, rotary.clone(), *tcp, true),
-            JointWords::Feed { line, linear, rotary, tcp, .. } | JointWords::Arc { line, linear, rotary, tcp, .. } => {
-                (*line, *linear, rotary.clone(), *tcp, false)
-            }
+            JointWords::Feed { line, linear, rotary, tcp, .. }
+            | JointWords::Arc { line, linear, rotary, tcp, .. }
+            | JointWords::PlaneArc { line, linear, rotary, tcp, .. } => (*line, *linear, rotary.clone(), *tcp, false),
             JointWords::Dwell { seconds, .. } => {
                 minutes += seconds / 60.0;
                 continue;
@@ -2401,21 +2382,24 @@ pub fn plan_sim(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
                 };
                 feed_length += length;
             }
-            JointWords::Arc { .. } => feed_length += length,
+            JointWords::Arc { .. } | JointWords::PlaneArc { .. } => feed_length += length,
             JointWords::Dwell { .. } => {}
         }
-        let (how, travel) = match (b, &from, scan.plane_at(line)) {
-            // An arc in the XZ or YZ plane: the reader takes `I J` as in XY, so its centre and
-            // turn are found again from the block's own words.
-            (JointWords::Arc { ccw, f, mm_per_unit, .. }, Some(f0), Some((plane, ijk))) => {
-                let center = f0.linear + Vec3::new(ijk[0], ijk[1], ijk[2]) * *mm_per_unit;
-                let arc = PlaneArc::new(f0.linear, to.linear, center, plane, *ccw);
+        let (how, travel) = match (b, &from) {
+            // An arc in the XZ or YZ plane.
+            (JointWords::PlaneArc { center, plane, ccw, f, mm_per_unit, .. }, Some(f0)) => {
+                let plane = match plane {
+                    ArcPlane::Xy => Plane::Xy,
+                    ArcPlane::Zx => Plane::Zx,
+                    ArcPlane::Yz => Plane::Yz,
+                };
+                let arc = PlaneArc::new(f0.linear, to.linear, *center, plane, *ccw);
                 let travel = arc.length();
                 minutes += travel / (f * mm_per_unit);
                 let chords = if kind == Kind::Three { arc.chords(tol * 0.25)? } else { 0 };
                 (How::Tilted { arc, chords, rotary: to.rotary.clone(), tcp }, travel)
             }
-            (JointWords::Arc { center, ccw, f, mm_per_unit, .. }, Some(f0), None) => {
+            (JointWords::Arc { center, ccw, f, mm_per_unit, .. }, Some(f0)) => {
                 let st = Vec2::new(f0.linear.x, f0.linear.y) - *center;
                 let sweep = arc_turn(f0.linear, to.linear, *center, *ccw);
                 let travel = (st.len() * sweep).hypot(to.linear.z - f0.linear.z);
@@ -2432,15 +2416,17 @@ pub fn plan_sim(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
                 };
                 (how, travel)
             }
-            (JointWords::Arc { .. }, None, _) => return Err(CamError::Parse(line, "an arc right after the position was lost".into())),
-            (_, Some(f0), _) => {
+            (JointWords::Arc { .. } | JointWords::PlaneArc { .. }, None) => {
+                return Err(CamError::Parse(line, "an arc right after the position was lost".into()));
+            }
+            (_, Some(f0)) => {
                 let (a, c) = (Joints { linear: f0.linear, rotary: f0.rotary.clone() }, Joints { linear: to.linear, rotary: to.rotary.clone() });
                 let lin = a.linear.dist(c.linear);
                 let lever = start.tip.len().max(end.tip.len()) + lin + lever_extra + profile.radius;
                 let travel = length.max(lin) + a.rotary_change(&c) * lever;
                 (How::Joint { from: a, to: c, tcp }, travel)
             }
-            (_, None, _) => (How::Straight, length),
+            (_, None) => (How::Straight, length),
         };
         // Tool positions along the block: only the 4th axis's model places the tool at points
         // (a heightfield sweeps each block exactly), so only it is limited by them.

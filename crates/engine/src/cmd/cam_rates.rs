@@ -65,5 +65,6 @@ pub(super) fn time_report(cmd: &str, text: &str, machine: &Machine, post: &Post5
         spindle_out_of_range: t.spindle_out_of_range.into_iter().map(|(line, rpm)| SpindleSpeedReport { line, rpm }).collect(),
         span_mm: t.span_mm,
         warnings: t.warnings,
+        limits: t.limits,
     })
 }

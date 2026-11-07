@@ -16,17 +16,16 @@
 //! any other feed.
 
 use std::collections::HashMap;
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::PI;
 
 use serde::{Deserialize, Serialize};
-use solidcore_record::{Vec2, Vec3};
+use solidcore_record::Vec3;
 use solidcraft_geom::prelude::*;
 
 use crate::gcode5::{JointWords, MachineOperation, MachineProgram, Post5, parse5};
 use crate::kinematics::{Carrier, Joints, Machine, arc_distance, forward, tool_axis};
 use crate::machine_time::{DwellUnit, joint_dwells_in};
 use crate::multiaxis::{Move5, Pose, Program5, Toolpath5, slerp};
-use crate::path::arc_sweep;
 use crate::{CamError, Result};
 
 /// Most grid entries the comparison builds.
@@ -201,24 +200,14 @@ pub fn readback_program(text: &str, program: &MachineProgram, post: &Post5, mach
                 }
                 Some(to)
             }
-            JointWords::Arc { linear, center, ccw, rotary, tcp, f, mm_per_unit, .. } => {
+            JointWords::Arc { linear, rotary, tcp, f, mm_per_unit, .. } | JointWords::PlaneArc { linear, rotary, tcp, f, mm_per_unit, .. } => {
                 let to = State { linear: *linear, rotary: rotary.clone(), tcp: *tcp };
-                if let Some(from) = state.as_ref() {
-                    let start = Vec2::new(from.linear.x, from.linear.y) - *center;
-                    let (r, sweep) = (start.len(), arc_sweep(from.linear, to.linear, *center, *ccw));
-                    let length = (r * sweep).hypot(to.linear.z - from.linear.z);
-                    cut_minutes += length / (f * mm_per_unit);
-                    let tol = 1e-4;
-                    let step = if tol < r { 2.0 * (1.0 - tol / r).acos() } else { TAU / 8.0 };
-                    let n = ((sweep.abs() / step.max(1e-3)).ceil() as usize).clamp(1, 4096);
+                if let Some(from) = state.as_ref()
+                    && let Some(arc) = w.arc_from(from.linear)
+                {
+                    cut_minutes += arc.length() / (f * mm_per_unit);
                     let mut prev = pose_at(machine, from.linear, rotary, *tcp);
-                    for k in 1..=n {
-                        let t = k as f64 / n as f64;
-                        let q = if k == n {
-                            to.linear
-                        } else {
-                            (*center + Vec2::from_angle(start.angle() + sweep * t) * r).extend(from.linear.z + (to.linear.z - from.linear.z) * t)
-                        };
+                    for q in arc.points(1e-4) {
                         let p = pose_at(machine, q, rotary, *tcp);
                         cut_length += prev.tip.dist(p.tip);
                         written_segments.push((prev, p));
@@ -285,6 +274,9 @@ pub fn readback_program(text: &str, program: &MachineProgram, post: &Post5, mach
     })
 }
 
+/// Points below which one thread holds them all against the pieces.
+const POINTS_PER_THREAD: usize = 8192;
+
 /// The largest deviation of a pose of `from` from the piece of `to` that explains it best (the
 /// least of tip distance over `allowed_tip` and axis angle over `allowed_axis`, the larger of
 /// the two counting): its tip from the piece's line and its axis from the piece's turn. Tip
@@ -296,10 +288,12 @@ fn directed(from: &[Pose], to: &[(Pose, Pose)], reach: f64, allowed_tip: f64, al
     if to.is_empty() {
         return Ok((reach, PI));
     }
-    // Pieces of `to` filed by the XY cells they cross (each split into bits at most a cell
-    // long, filed by the cells of the bit's box, so a long diagonal files about its length in
-    // cells, not its box's area); a point looks in its cell and the eight around it, so any
-    // piece within `cell` of it in XY is seen.
+    // Pieces of `to` filed by the cells of space they cross (each split into bits at most a
+    // cell long, filed by the cells of the bit's box, so a long diagonal files about its length
+    // in cells, not its box's volume); a point looks in its cell and the 26 around it, so any
+    // piece within `cell` of it is seen. In space, not seen from above: the levels of a pocket
+    // or the turns of a wrapped path lie over one another, and filed by XY alone each point
+    // would be held against all of them.
     let (mut lo, mut hi) =
         (Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY));
     for p in to.iter().flat_map(|(a, b)| [a.tip, b.tip]).chain(from.iter().map(|p| p.tip)) {
@@ -309,24 +303,26 @@ fn directed(from: &[Pose], to: &[(Pose, Pose)], reach: f64, allowed_tip: f64, al
     if !(lo.is_finite() && hi.is_finite()) {
         return Err(CamError::Unsafe("a toolpath has a coordinate that is not a finite number".into()));
     }
-    let cell = reach.max((hi.x - lo.x).max(hi.y - lo.y) / 4096.0);
+    let cell = reach.max((hi.x - lo.x).max(hi.y - lo.y).max(hi.z - lo.z) / 4096.0);
     let index = |v: f64, o: f64| ((v - o) / cell).floor() as i64;
-    let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    let at = |p: Vec3| (index(p.x, lo.x), index(p.y, lo.y), index(p.z, lo.z));
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
     let mut entries = 0usize;
     for (k, (a, b)) in to.iter().enumerate() {
-        let (pa, pb) = (Vec2::new(a.tip.x, a.tip.y), Vec2::new(b.tip.x, b.tip.y));
-        // The extent bounds the length, so at most about 5800 bits.
+        let (pa, pb) = (a.tip, b.tip);
+        // The extent bounds the length, so at most about 7100 bits.
         let bits = ((pa.dist(pb) / cell).ceil() as usize).clamp(1, 8192);
         for s in 0..bits {
             let (p, q) = (pa.lerp(pb, s as f64 / bits as f64), pa.lerp(pb, (s + 1) as f64 / bits as f64));
-            let (i0, i1) = (index(p.x.min(q.x), lo.x), index(p.x.max(q.x), lo.x));
-            let (j0, j1) = (index(p.y.min(q.y), lo.y), index(p.y.max(q.y), lo.y));
+            let ((i0, j0, l0), (i1, j1, l1)) = (at(p.min(q)), at(p.max(q)));
             for i in i0..=i1 {
                 for j in j0..=j1 {
-                    let filed = grid.entry((i, j)).or_default();
-                    if filed.last() != Some(&k) {
-                        filed.push(k);
-                        entries += 1;
+                    for l in l0..=l1 {
+                        let filed = grid.entry((i, j, l)).or_default();
+                        if filed.last() != Some(&k) {
+                            filed.push(k);
+                            entries += 1;
+                        }
                     }
                 }
             }
@@ -335,29 +331,32 @@ fn directed(from: &[Pose], to: &[(Pose, Pose)], reach: f64, allowed_tip: f64, al
             }
         }
     }
-    let (mut worst_tip, mut worst_axis): (f64, f64) = (0.0, 0.0);
-    for p in from {
-        let (pi, pj) = (index(p.tip.x, lo.x), index(p.tip.y, lo.y));
+    // Each point against the pieces near it, the points side by side.
+    let check = |p: &Pose| -> (f64, f64) {
+        let (pi, pj, pl) = at(p.tip);
         let mut best: Option<(f64, f64, f64)> = None;
         for i in pi - 1..=pi + 1 {
             for j in pj - 1..=pj + 1 {
-                for &k in grid.get(&(i, j)).map(Vec::as_slice).unwrap_or_default() {
-                    let Some((a, b)) = to.get(k) else { continue };
-                    let d = p.tip.dist_to_segment(a.tip, b.tip);
-                    if d > reach {
-                        continue;
-                    }
-                    let e = arc_distance(p.axis, a.axis, b.axis);
-                    let score = (d / allowed_tip).max(e / allowed_axis);
-                    if best.is_none_or(|(s, _, _)| score < s) {
-                        best = Some((score, d, e));
+                for l in pl - 1..=pl + 1 {
+                    for &k in grid.get(&(i, j, l)).map(Vec::as_slice).unwrap_or_default() {
+                        let Some((a, b)) = to.get(k) else { continue };
+                        let d = p.tip.dist_to_segment(a.tip, b.tip);
+                        if d > reach {
+                            continue;
+                        }
+                        let e = arc_distance(p.axis, a.axis, b.axis);
+                        let score = (d / allowed_tip).max(e / allowed_axis);
+                        if best.is_none_or(|(s, _, _)| score < s) {
+                            best = Some((score, d, e));
+                        }
                     }
                 }
             }
         }
-        let (d, e) = best.map_or((reach, PI), |(_, d, e)| (d, e));
-        worst_tip = worst_tip.max(d);
-        worst_axis = worst_axis.max(e);
-    }
-    Ok((worst_tip, worst_axis))
+        best.map_or((reach, PI), |(_, d, e)| (d, e))
+    };
+    let ranges = crate::par::split(&vec![1; from.len()], crate::par::threads_for(from.len(), POINTS_PER_THREAD));
+    let worst =
+        crate::par::map(ranges, |r| Ok(from.get(r).unwrap_or(&[]).iter().map(check).fold((0.0f64, 0.0f64), |(t, a), (d, e)| (t.max(d), a.max(e)))))?;
+    Ok(worst.into_iter().fold((0.0, 0.0), |(t, a), (d, e)| (t.max(d), a.max(e))))
 }

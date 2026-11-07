@@ -84,6 +84,34 @@ pub(super) struct Inputs<'a> {
     pub program_file: Option<&'a str>,
     /// The job's stock, when it gives one.
     pub stock: Option<&'a solidcraft_cam::stock::Stock>,
+    /// The job's fixtures in words ([`fixture_words`]).
+    pub fixtures: Vec<String>,
+    /// The machine's spindle-speed and feed limits the job runs into.
+    pub attention: Vec<String>,
+}
+
+/// Each of the job's fixtures (`names`) in words with where it is in work coordinates (`origin`
+/// is the design point at work zero), from its exact box.
+pub(super) fn fixture_words(s: &crate::Session, names: &[String], origin: Vec3) -> Vec<String> {
+    let Ok(st) = s.world_state() else { return names.to_vec() };
+    names
+        .iter()
+        .map(|n| match st.bodies.iter().find(|b| &b.name == n).map(|b| b.body.exact_bounds()) {
+            Some(Ok(b)) => {
+                let (lo, hi) = (b.min - origin, b.max - origin);
+                format!(
+                    "{n}: X {} to {}, Y {} to {}, Z {} to {} (work coordinates)",
+                    fmt_num(lo.x, 3),
+                    fmt_num(hi.x, 3),
+                    fmt_num(lo.y, 3),
+                    fmt_num(hi.y, 3),
+                    fmt_num(lo.z, 3),
+                    fmt_num(hi.z, 3)
+                )
+            }
+            _ => n.clone(),
+        })
+        .collect()
 }
 
 /// The letter of the machine's one rotary when it is a table about work X through work zero
@@ -119,9 +147,10 @@ fn extents(text: &str, machine: &Machine) -> Option<ProgramExtents> {
     let mut ranges: Vec<(f64, f64)> = vec![(f64::INFINITY, f64::NEG_INFINITY); letters.len()];
     for b in &blocks {
         let (linear, rotary) = match b {
-            JointWords::Rapid { linear, rotary, .. } | JointWords::Feed { linear, rotary, .. } | JointWords::Arc { linear, rotary, .. } => {
-                (*linear, rotary)
-            }
+            JointWords::Rapid { linear, rotary, .. }
+            | JointWords::Feed { linear, rotary, .. }
+            | JointWords::Arc { linear, rotary, .. }
+            | JointWords::PlaneArc { linear, rotary, .. } => (*linear, rotary),
             JointWords::Dwell { .. } => continue,
         };
         lo = lo.min(linear);
@@ -332,6 +361,8 @@ pub(super) fn build(i: &Inputs<'_>) -> SetupSheet {
         work_zero: zero,
         rotaries: machine.rotaries.iter().map(rotary_note).collect(),
         stock: i.stock.map(solidcraft_cam::setup_sheet::stock_words),
+        fixtures: i.fixtures.clone(),
+        attention: i.attention.clone(),
         tools,
         operations,
         totals,

@@ -435,15 +435,25 @@ pub fn gouges(surface: &Surface, cutter: &Cutter, path: &Toolpath5, tol: f64, sa
     gouges_in(surface, cutter, path, tol, sample_step, Moves::Cutting)
 }
 
-/// [`gouges`] along the moves `moves` selects.
-pub(crate) fn gouges_in(surface: &Surface, cutter: &Cutter, path: &Toolpath5, tol: f64, sample_step: f64, moves: Moves) -> Result<Vec<Hit>> {
-    let test = GougeTest::new(cutter, tol)?;
-    check_step(sample_step)?;
-    check_path(path)?;
-    let g = Gouger { surface, cutter: *cutter, test, tol, step: sample_step };
-    let mut hits: Vec<Hit> = Vec::new();
-    // The deepest sampled hit: its index in `hits`, its move's ends, its share and spacing.
-    let mut sampled: Option<(usize, Pose, Pose, f64, f64)> = None;
+/// Samples of a check below which one thread does it all: a thread costs more than that.
+const SAMPLES_PER_THREAD: usize = 4096;
+
+/// One move a check samples: its index, its start (`None`: the path's first pose, checked
+/// where it stands), its end, whether its start is sampled (it ends an unchecked move) and how
+/// many samples it takes.
+#[derive(Clone, Copy)]
+struct Leg {
+    index: usize,
+    from: Option<Pose>,
+    to: Pose,
+    start: bool,
+    samples: usize,
+}
+
+/// The moves of `path` that `moves` selects, as [`Leg`]s, the samples of all of them counted
+/// against [`MAX_SAMPLES`] (`per` samples a move of `n` steps takes).
+fn legs(path: &Toolpath5, reach: f64, step: f64, moves: Moves, per: impl Fn(usize) -> usize) -> Result<(Vec<Leg>, usize)> {
+    let mut out = Vec::new();
     let mut prev: Option<Pose> = None;
     let (mut was_checked, mut after_rapid) = (false, false);
     let mut total = 0usize;
@@ -459,31 +469,63 @@ pub(crate) fn gouges_in(surface: &Surface, cutter: &Cutter, path: &Toolpath5, to
             Moves::All => true,
         };
         if checked {
-            let found = match prev {
+            let samples = match prev {
                 Some(from) => {
-                    let n = samples_along(&from, &to, cutter.radius.max(cutter.rim_height()), sample_step)?;
-                    total = total.saturating_add(4 * n + 1);
+                    let n = samples_along(&from, &to, reach, step)?;
+                    total = total.saturating_add(per(n));
                     if total > MAX_SAMPLES {
                         return Err(CamError::TooLarge(format!("more than {MAX_SAMPLES} samples along the toolpath")));
                     }
-                    let exact = cutter.is_ball() && from.axis_angle(&to) <= 1e-12;
-                    g.along(&from, &to, !was_checked)?.map(|(t, pose, depth)| {
-                        if !exact && sampled.is_none_or(|(k, ..)| hits.get(k).is_none_or(|h| depth > h.distance)) {
-                            sampled = Some((hits.len(), from, to, t, 1.0 / n as f64));
-                        }
-                        (pose, depth)
-                    })
+                    n
                 }
-                None => {
-                    let depth = depth_at(surface, cutter, &to)?;
-                    (depth > tol).then_some((to, depth))
-                }
+                None => 1,
             };
-            if let Some((pose, depth)) = found {
-                hits.push(Hit { index: i, pose, envelope: None, distance: depth });
-            }
+            out.push(Leg { index: i, from: prev, to, start: !was_checked, samples });
         }
         (was_checked, after_rapid, prev) = (checked, rapid, Some(to));
+    }
+    Ok((out, total))
+}
+
+/// What one move's gouge check found: where and how deep, and for a sampled move its ends,
+/// share and sample spacing (to follow it to its deepest point).
+type Found = Option<(Pose, f64, Option<(Pose, Pose, f64, f64)>)>;
+
+/// [`gouges`] along the moves `moves` selects. The moves are checked on as many threads as the
+/// work is worth ([`crate::par`]); what is found is the same as one after the other.
+pub(crate) fn gouges_in(surface: &Surface, cutter: &Cutter, path: &Toolpath5, tol: f64, sample_step: f64, moves: Moves) -> Result<Vec<Hit>> {
+    let test = GougeTest::new(cutter, tol)?;
+    check_step(sample_step)?;
+    check_path(path)?;
+    let g = Gouger { surface, cutter: *cutter, test, tol, step: sample_step };
+    let (legs, total) = legs(path, cutter.radius.max(cutter.rim_height()), sample_step, moves, |n| 4 * n + 1)?;
+    let check = |leg: &Leg| -> Result<Found> {
+        Ok(match leg.from {
+            Some(from) => {
+                let exact = cutter.is_ball() && from.axis_angle(&leg.to) <= 1e-12;
+                g.along(&from, &leg.to, leg.start)?
+                    .map(|(t, pose, depth)| (pose, depth, (!exact).then_some((from, leg.to, t, 1.0 / leg.samples as f64))))
+            }
+            None => {
+                let depth = depth_at(surface, cutter, &leg.to)?;
+                (depth > tol).then_some((leg.to, depth, None))
+            }
+        })
+    };
+    let weights: Vec<usize> = legs.iter().map(|l| l.samples + 1).collect();
+    let ranges = crate::par::split(&weights, crate::par::threads_for(total, SAMPLES_PER_THREAD));
+    let found: Vec<Vec<Found>> = crate::par::map(ranges, |r| legs.get(r).unwrap_or(&[]).iter().map(check).collect::<Result<Vec<_>>>())?;
+    let mut hits: Vec<Hit> = Vec::new();
+    // The deepest sampled hit: its index in `hits`, its move's ends, its share and spacing.
+    let mut sampled: Option<(usize, Pose, Pose, f64, f64)> = None;
+    for (leg, f) in legs.iter().zip(found.into_iter().flatten()) {
+        let Some((pose, depth, at)) = f else { continue };
+        if let Some((from, to, t, w)) = at
+            && sampled.is_none_or(|(k, ..)| hits.get(k).is_none_or(|h| depth > h.distance))
+        {
+            sampled = Some((hits.len(), from, to, t, w));
+        }
+        hits.push(Hit { index: leg.index, pose, envelope: None, distance: depth });
     }
     // The deepest sampled hit, if it is the deepest of all, is followed to its deepest point.
     let deepest = hits.iter().map(|h| h.distance).fold(0.0, f64::max);
@@ -497,6 +539,7 @@ pub(crate) fn gouges_in(surface: &Surface, cutter: &Cutter, path: &Toolpath5, to
     }
     Ok(hits)
 }
+
 /// A convex polygon of at most eight corners, without allocating.
 struct Poly {
     p: [Vec3; 8],
@@ -630,21 +673,41 @@ pub(crate) fn holder_collisions_in(
     }
     // What each envelope must keep from the surface.
     let limits: Vec<f64> = envelopes.iter().map(|e| if e.radius <= tool.radius() + 1e-9 { clearance - tolerance } else { clearance }).collect();
-    for_each_sample(path, reach, sample_step, moves, |index, pose| {
-        for (k, (e, limit)) in envelopes.iter().zip(&limits).enumerate() {
-            let Some(gap) = envelope_gap(surface, &pose, e, *limit) else { continue };
-            let hit = Hit { index, pose, envelope: Some(k), distance: gap };
-            match hits.iter_mut().rev().take_while(|h| h.index == index).find(|h| h.envelope == Some(k)) {
-                Some(h) => {
-                    if gap < h.distance {
-                        *h = hit;
+    // The closest sample of each envelope on each move, the moves on as many threads as the
+    // work is worth: the same hits as one sample after the other.
+    let (legs, total) = legs(path, reach, sample_step, moves, |n| n + 1)?;
+    let check = |leg: &Leg| -> Vec<Hit> {
+        let mut out: Vec<Hit> = Vec::new();
+        let mut at = |pose: Pose| {
+            for (k, (e, limit)) in envelopes.iter().zip(&limits).enumerate() {
+                let Some(gap) = envelope_gap(surface, &pose, e, *limit) else { continue };
+                let hit = Hit { index: leg.index, pose, envelope: Some(k), distance: gap };
+                match out.iter_mut().find(|h| h.envelope == Some(k)) {
+                    Some(h) => {
+                        if gap < h.distance {
+                            *h = hit;
+                        }
                     }
+                    None => out.push(hit),
                 }
-                None => hits.push(hit),
             }
+        };
+        match leg.from {
+            Some(from) => {
+                let n = leg.samples;
+                for k in usize::from(!leg.start)..=n {
+                    let t = k as f64 / n as f64;
+                    at(Pose::new(from.tip.lerp(leg.to.tip, t), slerp(from.axis, leg.to.axis, t)));
+                }
+            }
+            None => at(leg.to),
         }
-        Ok(())
-    })?;
+        out
+    };
+    let weights: Vec<usize> = legs.iter().map(|l| l.samples + 1).collect();
+    let ranges = crate::par::split(&weights, crate::par::threads_for(total, SAMPLES_PER_THREAD));
+    let found: Vec<Vec<Hit>> = crate::par::map(ranges, |r| Ok(legs.get(r).unwrap_or(&[]).iter().flat_map(check).collect()))?;
+    hits.extend(found.into_iter().flatten());
     Ok(hits)
 }
 

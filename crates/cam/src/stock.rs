@@ -22,7 +22,7 @@ use solidcraft_geom::prelude::*;
 use crate::check::verify;
 use crate::multiaxis::Pose;
 use crate::ops::{Feeds, Heights};
-use crate::path::{MAX_MOVES, Move, Toolpath};
+use crate::path::{MAX_MOVES, Move, Toolpath, vertical_quarter};
 use crate::tool::{Tool, ToolKind};
 use crate::{CamError, Result, invalid};
 
@@ -397,7 +397,18 @@ pub struct FaceParams {
     /// passes), or where the bottom is below the stock's (what holds the stock is there).
     #[serde(default)]
     pub stock: Option<Stock>,
+    /// The radius of a quarter arc in the vertical plane of the passes (mm), from `lead_radius`
+    /// above and behind a pass's start down into it, and out of its end up and beyond: `G18`
+    /// or `G19` arcs when the passes run along X or Y, lines along the arc otherwise. With
+    /// `zigzag` the passes of a level link round half circles at depth, outside the area, and
+    /// only the level's first pass leads in and its last leads out. `None`: straight down
+    /// beside the stock and straight links.
+    #[serde(default)]
+    pub lead_radius: Option<f64>,
 }
+
+/// Most a facing lead's radius may be, as a share of the tool's diameter.
+const MAX_FACE_LEAD: f64 = 10.0;
 
 /// The diameter of the flat of `tool`'s end: what leaves a flat floor.
 pub fn flat_diameter(tool: &Tool) -> f64 {
@@ -430,6 +441,91 @@ fn levels(top: f64, bottom: f64, stepdown: f64) -> Result<Vec<f64>> {
 
 struct Path {
     moves: Vec<Move>,
+}
+
+/// Where a facing's passes run: from `u.0` to `u.1` along the pass direction (`angle`), at
+/// `passes` across it, at each of `levels`.
+struct Passes<'a> {
+    u: (f64, f64),
+    passes: &'a [f64],
+    levels: &'a [f64],
+    angle: f64,
+}
+
+fn push_all(path: &mut Path, moves: Vec<Move>) -> Result<()> {
+    moves.into_iter().try_for_each(|m| path.push(m))
+}
+
+/// [`face`]'s passes with vertical leads (see [`FaceParams::lead_radius`]).
+fn face_with_leads(path: &mut Path, entries: &mut Vec<(Vec3, Vec3)>, ps: &Passes<'_>, p: &FaceParams, lead: f64) -> Result<()> {
+    let h = p.heights;
+    let (c, s) = (ps.angle.cos(), ps.angle.sin());
+    let world = |u: f64, v: f64, z: f64| Vec3::new(u * c - v * s, u * s + v * c, z);
+    let flat = |q: Vec3| Vec2::new(q.x, q.y);
+    let mut at_start_side = true;
+    let mut last_v: Option<f64> = None;
+    for (li, &z) in ps.levels.iter().enumerate() {
+        let order: Vec<f64> = if p.zigzag && li % 2 == 1 { ps.passes.iter().rev().copied().collect() } else { ps.passes.to_vec() };
+        let count = order.len();
+        for (k, v) in order.into_iter().enumerate() {
+            if !p.zigzag {
+                at_start_side = true;
+            }
+            let (ua, ub) = if at_start_side { ps.u } else { (ps.u.1, ps.u.0) };
+            let dir = if ub >= ua { 1.0 } else { -1.0 };
+            let along = Vec2::new(dir * c, dir * s);
+            let (a, b) = (world(ua, v, z), world(ub, v, z));
+            let at_depth = path.pos().filter(|q| p.zigzag && k > 0 && (q.z - z).abs() <= 1e-9);
+            match (at_depth, last_v) {
+                (Some(q), Some(lv)) => {
+                    // Round half a circle outside the area, through the point farthest out.
+                    let rad = 0.5 * (v - lv).abs();
+                    let center = world(ua, 0.5 * (v + lv), z);
+                    let out = world(ua - dir * rad, 0.5 * (v + lv), z);
+                    let (cs, os) = (flat(q) - flat(center), flat(out) - flat(center));
+                    let ccw = cs.x * os.y - cs.y * os.x > 0.0;
+                    path.push(Move::Arc { to: a, center: flat(center), ccw, feed: p.feeds.cut })?;
+                    entries.push((q, a));
+                }
+                _ => {
+                    let start = world(ua - dir * lead, v, z + lead);
+                    match path.pos() {
+                        None => path.push(Move::Rapid { to: Vec3::new(start.x, start.y, h.clearance) })?,
+                        Some(q) if flat(q).dist(flat(start)) > 1e-9 => {
+                            if q.z < h.retract {
+                                path.push(Move::Rapid { to: Vec3::new(q.x, q.y, h.retract) })?;
+                            }
+                            path.push(Move::Rapid { to: Vec3::new(start.x, start.y, h.retract.max(q.z)) })?;
+                        }
+                        Some(_) => {}
+                    }
+                    let air = h.retract.max(start.z);
+                    if let Some(q) = path.pos()
+                        && q.z > air + 1e-9
+                    {
+                        path.push(Move::Rapid { to: Vec3::new(q.x, q.y, air) })?;
+                    }
+                    if let Some(q) = path.pos() {
+                        entries.push((q, a));
+                        if q.z > start.z + 1e-9 {
+                            path.push(Move::Feed { to: start, feed: p.feeds.plunge })?;
+                        } else if q.z < start.z - 1e-9 {
+                            // A lead taller than the clearance: up to where its arc starts.
+                            path.push(Move::Rapid { to: start })?;
+                        }
+                    }
+                    push_all(path, vertical_quarter(start, a, world(ua, v, z + lead), along, p.feeds.cut))?;
+                }
+            }
+            path.push(Move::Feed { to: b, feed: p.feeds.cut })?;
+            if !p.zigzag || k + 1 == count {
+                push_all(path, vertical_quarter(b, world(ub + dir * lead, v, z + lead), world(ub, v, z + lead), along, p.feeds.cut))?;
+            }
+            last_v = Some(v);
+            at_start_side = !at_start_side;
+        }
+    }
+    Ok(())
 }
 
 impl Path {
@@ -515,7 +611,15 @@ pub fn face(tool: &Tool, p: &FaceParams) -> Result<Toolpath> {
     // The descents and the links between passes, which must be clear of the stock.
     let mut entries: Vec<(Vec3, Vec3)> = Vec::new();
     let mut at_start_side = true;
-    for (li, z) in levels(h.top, h.bottom, p.stepdown)?.into_iter().enumerate() {
+    let levels = levels(h.top, h.bottom, p.stepdown)?;
+    if let Some(lead) = p.lead_radius {
+        if !(lead > 0.0 && lead <= MAX_FACE_LEAD * tool.diameter) {
+            return invalid(format!("the lead radius must be above 0 and at most {MAX_FACE_LEAD} times the tool's diameter"));
+        }
+        let pass = Passes { u: (u_start, u_end), passes: &passes, levels: &levels, angle: p.angle };
+        face_with_leads(&mut path, &mut entries, &pass, p, lead)?;
+    }
+    for (li, z) in levels.into_iter().enumerate().filter(|_| p.lead_radius.is_none()) {
         // Each level runs the passes the other way round from the last, so a zigzag carries on
         // from where the last level ended.
         let order: Vec<f64> = if p.zigzag && li % 2 == 1 { passes.iter().rev().copied().collect() } else { passes.clone() };

@@ -836,3 +836,71 @@ fn rapids_down_are_lifted_above_the_material_but_not_out_of_their_own_cut() {
     let h = Heights { clearance: 30.0, retract: 3.5, top: 0.0, bottom: -5.0 };
     verify(&path, &h).unwrap();
 }
+
+/// The 3-axis reader follows `G18` and `G19` to the arcs that come after them.
+#[test]
+fn the_reader_follows_the_arc_plane() {
+    let moves =
+        parse("G0 X0 Y10.3 Z5\nG1 Z0.15 F50\nG19 G2 Y10 Z-0.15 J-0.3 K0 F1600\nG1 Y0\nG17 G3 X5 I2.5 J0\nG18 G3 X5.3 Z0.15 I0.3 K0\n").unwrap();
+    let plane: Vec<(ArcPlane, Vec3)> =
+        moves.iter().filter_map(|m| if let Move::PlaneArc { plane, center, .. } = m { Some((*plane, *center)) } else { None }).collect();
+    assert_eq!(plane.len(), 2, "{moves:?}");
+    assert_eq!(plane[0].0, ArcPlane::Yz);
+    assert!((plane[0].1 - Vec3::new(0.0, 10.0, 0.15)).len() < 1e-9, "{plane:?}");
+    assert_eq!(plane[1].0, ArcPlane::Zx);
+    assert!((plane[1].1 - Vec3::new(5.3, 0.0, -0.15)).len() < 1e-9, "{plane:?}");
+    assert!(moves.iter().any(|m| matches!(m, Move::Arc { .. })));
+    let s = Toolpath { moves }.stats();
+    assert!(
+        (s.cut_length - (4.85 + 0.15 * std::f64::consts::PI + 10.0 + 2.5 * std::f64::consts::PI + 0.15 * std::f64::consts::PI)).abs() < 1e-9,
+        "{s:?}"
+    );
+    assert!(parse("G0 X0 Y0 Z0\nG18 G2 X1 Z1 J1 F100\n").is_err());
+}
+
+/// Speeds and feeds from cutting data: the spindle speed from the surface speed and the
+/// diameter, the feed from the chip load and the flutes, explicit values first, and a
+/// strategy's data over the tool's own.
+#[test]
+fn speeds_come_from_surface_speed_and_chip_load_unless_given() {
+    let mut t = Tool { flutes: 3, surface_speed: Some(150.0), chip_load: Some(0.02), ..Tool::new(1, ToolKind::FlatEndmill, 6.0, 15.0) };
+    assert!(t.validate().is_ok());
+    let s = t.speeds(None);
+    let rpm = 1000.0 * 150.0 / (PI * 6.0);
+    assert!((s.spindle_rpm.unwrap() - rpm).abs() < 1e-9 && s.rpm_derived, "{s:?}");
+    assert!((s.feed.unwrap() - rpm * 3.0 * 0.02).abs() < 1e-9 && s.feed_derived, "{s:?}");
+    // At a speed held to the spindle's range, the feed follows it.
+    assert!((t.speeds(Some(10000.0)).feed.unwrap() - 600.0).abs() < 1e-9);
+    // Explicit values win.
+    t.spindle_rpm = Some(12000.0);
+    t.feed = Some(900.0);
+    let s = t.speeds(None);
+    assert_eq!((s.spindle_rpm, s.rpm_derived, s.feed, s.feed_derived), (Some(12000.0), false, Some(900.0), false));
+    // A strategy's data over the tool's own; another strategy keeps the tool's.
+    t.stepdown = Some(0.7);
+    t.stepover = Some(2.7);
+    t.cutting_data = vec![CuttingData {
+        strategy: Strategy::Adaptive,
+        spindle_rpm: None,
+        feed: None,
+        plunge_feed: Some(100.0),
+        stepdown: Some(12.0),
+        stepover: Some(0.3),
+        surface_speed: Some(400.0),
+        chip_load: Some(0.04),
+    }];
+    let a = t.for_strategy(Strategy::Adaptive);
+    assert_eq!((a.stepdown, a.stepover, a.plunge_feed, a.spindle_rpm, a.feed), (Some(12.0), Some(0.3), Some(100.0), None, None));
+    assert!(a.speeds(None).rpm_derived && a.speeds(None).feed_derived);
+    assert_eq!(t.for_strategy(Strategy::Slot), t);
+    // Hostile values are refused.
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e9] {
+        assert!(Tool { surface_speed: Some(bad), ..t.clone() }.validate().is_err(), "{bad}");
+        assert!(Tool { chip_load: Some(bad), ..t.clone() }.validate().is_err(), "{bad}");
+        let mut d = t.clone();
+        d.cutting_data[0].stepover = Some(bad);
+        assert!(d.validate().is_err(), "{bad}");
+    }
+    let many = Tool { cutting_data: vec![t.cutting_data[0]; 33], ..t.clone() };
+    assert!(many.validate().is_err());
+}

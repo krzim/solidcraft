@@ -390,6 +390,13 @@ operation! {
         /// A tangent arc into and out of each pass. Default: none.
         #[serde(default)]
         pub lead: Option<LeadSpec>,
+        /// The radius of a vertical lead, mm: each pass is entered down a quarter arc in the
+        /// vertical plane of its start's direction from this far above and behind its start (its
+        /// `lead`'s, with one), and left up one beyond its end (`G18`/`G19` arcs where that
+        /// direction runs along X or Y). It takes the place of `entry` (none, or a plunge).
+        /// Default: none.
+        #[serde(default)]
+        pub vertical_lead: Option<f64>,
         /// How the tool goes down into each pass (instead of `ramp_angle_deg`). Default: the ramp
         /// angle's (0: plunge).
         #[serde(default)]
@@ -820,7 +827,7 @@ pub struct CamJobReply {
 }
 
 /// One operation of a `cam.job` reply.
-#[derive(Debug, Default, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 pub struct OperationReport {
     pub name: String,
     /// Its `type` (an indexed operation: `indexed <type>`).
@@ -1007,7 +1014,7 @@ pub struct CamCheckReply {
 }
 
 /// A rotary axis's range in a program.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct RotaryRange {
     pub letter: String,
     pub min_deg: f64,

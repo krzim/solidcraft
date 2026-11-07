@@ -162,6 +162,28 @@ fn a_parallel_finish_is_written_only_inside_the_agents_folders() {
     assert!((14.999..=30.001).contains(&top), "{c}");
 }
 
+/// The program, the preview and the setup sheet are each written whole to a temporary file
+/// beside the old one and renamed over it: a second name of the old file (a hard link, as a
+/// controller's share may hold) keeps the old program, and nothing is left beside them.
+#[test]
+fn a_job_replaces_its_files_through_a_temporary_file() {
+    let mut s = dome();
+    let dir = Dir::new("atomic");
+    let (tap, page, sheet) = (dir.file("dome.tap"), dir.file("dome.html"), dir.file("dome.md"));
+    for (f, alias) in [(&tap, "tap.old"), (&page, "html.old"), (&sheet, "md.old")] {
+        std::fs::write(f, "old").unwrap();
+        std::fs::hard_link(f, dir.0.join(alias)).unwrap();
+    }
+    let r = run(&mut s, "cam.job", json!({"job": dome_job(), "output": tap, "preview": page, "setup_sheet": sheet}));
+    assert_clean(&r);
+    for (f, alias) in [(&tap, "tap.old"), (&page, "html.old"), (&sheet, "md.old")] {
+        assert!(std::fs::read_to_string(f).unwrap().len() > 100, "{f} was written");
+        assert_eq!(std::fs::read_to_string(dir.0.join(alias)).unwrap(), "old", "{f} was replaced, not written over in place");
+    }
+    let names: Vec<String> = std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
+}
+
 /// The frame A = 90° brings under the tool has its Z along work +Y, as docs/cam-jobs.md says.
 #[test]
 fn a_pocket_indexed_at_90_degrees_cuts_the_side_and_keeps_its_arcs() {
@@ -1182,6 +1204,43 @@ fn facing_a_box_stock_enters_beside_it_and_reads_back() {
     assert_eq!(r["gouge"]["pass"], false, "{r}");
 }
 
+/// Facing with vertical leads, as the approved post's reference programs face: `G19` arcs down
+/// into each level and up out of it for passes along Y, half circles between the passes, and
+/// every check passed, the simulation's included. `cam.check` measures each arc in its plane.
+#[test]
+fn facing_with_vertical_leads_writes_g19_arcs_that_pass_every_check() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 50, "width": 50, "height": 10, "corner": [-25, -25, -11], "body_name": "Block"}));
+    let mill = json!({"number": 5, "kind": "face_mill", "diameter": 10, "corner_radius": 0.2, "flute_length": 6, "spindle_rpm": 18000, "feed": 1600, "plunge_feed": 50});
+    let job = json!({
+        "machine": "3axis", "post": "mach3_4axis", "tools": [mill], "stock": {"box": {"min": [-25, -25, -11], "max": [25, 25, 0]}},
+        "operations": [{"name": "face", "type": "face", "tool": 5, "bottom": -1, "stepdown": 0.5, "angle_deg": 90, "lead_radius": 0.3}]
+    });
+    let dir = Dir::new("face-leads");
+    let out = dir.file("face.tap");
+    let r = run(&mut s, "cam.job", json!({"job": job, "output": out, "simulate": true}));
+    assert_clean(&r);
+    assert_eq!(r["simulation"]["passed"], true, "{r}");
+    let text = std::fs::read_to_string(&out).unwrap();
+    // Down in, one level after the other, and up out of each level.
+    let g19 = text.lines().filter(|l| l.starts_with("G19 G2") || l.starts_with("G19 G3")).count();
+    assert!(g19 >= 2, "{text}");
+    assert!(text.lines().any(|l| l.starts_with("G17 G2") || l.starts_with("G17 G3")), "{text}");
+    assert!(text.contains("\nG17\n"), "back in G17 after the operation: {text}");
+    let c = run(&mut s, "cam.check", json!({"path": out}));
+    assert!(c["errors"].as_array().is_some_and(Vec::is_empty), "{c}");
+    // The program's own cut length as `cam.check` reads it: the planned one, the arcs round.
+    let planned = r["operations"][0]["cut_length"].as_f64().unwrap();
+    let read = c["feed_length"].as_f64().unwrap();
+    assert!((read - planned).abs() < 0.01 * planned, "{read} {planned}");
+    // A quarter arc of 0.3 in YZ is 0.471 long, not its 0.42 chord.
+    let quarter = dir.file("quarter.tap");
+    std::fs::write(&quarter, "G90 G21\nG0 X0 Y10.3 Z5\nG1 Z0.15 F50\nG19 G2 Y10 Z-0.15 J-0.3 K0 F1600\nG17\n").unwrap();
+    let c = run(&mut s, "cam.check", json!({"path": quarter}));
+    let quarter_len = c["feed_length"].as_f64().unwrap() - 4.85;
+    assert!((quarter_len - 0.15 * std::f64::consts::PI).abs() < 1e-6, "{c}");
+}
+
 /// A finish whose retract height is below the stock's top rapids through the stock: refused.
 /// (Its passes all run one way, so it lifts to the retract height and crosses there between
 /// them; its ways down stop above the stock's top.) A machine whose travel ends below the
@@ -1753,7 +1812,7 @@ fn tips(path: &str) -> Vec<(solidcore_record::Vec3, bool)> {
         .into_iter()
         .filter_map(|b| match b {
             JointWords::Rapid { linear, .. } => Some((linear, true)),
-            JointWords::Feed { linear, .. } | JointWords::Arc { linear, .. } => Some((linear, false)),
+            JointWords::Feed { linear, .. } | JointWords::Arc { linear, .. } | JointWords::PlaneArc { linear, .. } => Some((linear, false)),
             JointWords::Dwell { .. } => None,
         })
         .collect()
@@ -1853,7 +1912,8 @@ fn a_pocket_goes_in_by_a_helix_and_never_plunges_into_uncut_material() {
         last = match b {
             solidcraft_cam::gcode5::JointWords::Rapid { linear, .. }
             | solidcraft_cam::gcode5::JointWords::Feed { linear, .. }
-            | solidcraft_cam::gcode5::JointWords::Arc { linear, .. } => Some(*linear),
+            | solidcraft_cam::gcode5::JointWords::Arc { linear, .. }
+            | solidcraft_cam::gcode5::JointWords::PlaneArc { linear, .. } => Some(*linear),
             solidcraft_cam::gcode5::JointWords::Dwell { .. } => last,
         };
     }
@@ -2010,6 +2070,7 @@ fn fastest_descent(path: &str) -> f64 {
                 });
                 (linear, len.map(|l| (l, f)))
             }
+            JointWords::PlaneArc { linear, f, .. } => (linear, at.and_then(|p| b.arc_from(p)).map(|a| (a.length(), f))),
             JointWords::Dwell { .. } => continue,
         };
         if let (Some(p), Some((len, f))) = (at, rate)
@@ -2507,6 +2568,13 @@ fn hostile_rotary_operations_are_refused_without_panics() {
             Ok(v) => panic!("{p}: accepted: {v}"),
         }
     }
+    // Operations past 200 in all are refused before they are planned: the pattern's own error
+    // never shows, as it never runs.
+    let mut bad = face_op("face", 40.0);
+    bad["stepover"] = json!(-1);
+    let over = json!([face_op("plain", 40.0), {"type": "indexed_pattern", "count": 200, "operation": bad}]);
+    let e = s.execute("cam.job", &json!({"job": faces_job(over), "dry_run": true})).unwrap_err().to_string();
+    assert!(e.contains("at most 200 operations") && !e.contains("stepover"), "{e}");
     // The new operations need a 4th axis; rings need a stepover.
     let mut on3 = slot_job("wrap_pocket");
     on3["machine"] = json!("3axis");
@@ -5027,4 +5095,105 @@ fn the_simulation_view_plays_the_program_cam_job_writes() {
     let (rj, rv) = (refusals(&e_job), refusals(&e_view));
     assert_eq!(rj.len(), 1, "{e_job}");
     assert_eq!((rv.len(), &rv[0]["op"], &rv[0]["check"]), (1, &rj[0]["op"], &rj[0]["check"]), "{e_view}");
+}
+
+/// A write after a dry run reuses the dry run's plan, and writes what planning afresh would;
+/// a changed tool library or a changed design plans again.
+#[test]
+fn a_write_after_a_dry_run_reuses_its_plan_until_an_input_changes() {
+    let mut s = dome();
+    let dir = Dir::new("plan-cache");
+    std::fs::write(dir.0.join("tools.json"), json!([ball(2, 6.0)]).to_string()).unwrap();
+    let mut job = dome_job();
+    job.as_object_mut().unwrap().remove("tools");
+    job["tool_library_path"] = json!("tools.json");
+    let job_path = dir.file("dome.cam.json");
+    std::fs::write(&job_path, job.to_string()).unwrap();
+    let hits = |s: &Session| s.cam_plan.lock().unwrap().as_ref().map(|c| c.hits);
+    let dry = run(&mut s, "cam.job", json!({"job_path": job_path, "dry_run": true}));
+    assert_clean(&dry);
+    assert_eq!(hits(&s), Some(0));
+    let out = dir.file("dome.tap");
+    let wrote = run(&mut s, "cam.job", json!({"job_path": job_path, "output": out}));
+    assert_eq!(hits(&s), Some(1), "the write reused the dry run's plan");
+    assert_eq!(dry["program_head"], wrote["program_head"]);
+    assert_eq!(dry["operations"][0]["cut_length"], wrote["operations"][0]["cut_length"]);
+    let reused = std::fs::read_to_string(&out).unwrap();
+    // Planned afresh in a new session: the same program.
+    let mut fresh = dome();
+    let again = dir.file("fresh.tap");
+    run(&mut fresh, "cam.job", json!({"job_path": job_path, "output": again}));
+    assert_eq!(reused, std::fs::read_to_string(&again).unwrap());
+    // A tool library changed since: planned again, at its new feed.
+    let mut faster = ball(2, 6.0);
+    faster["feed"] = json!(1234.5);
+    std::fs::write(dir.0.join("tools.json"), json!([faster]).to_string()).unwrap();
+    let r = run(&mut s, "cam.job", json!({"job_path": job_path, "dry_run": true}));
+    assert_eq!(hits(&s), Some(0), "planned again");
+    assert_ne!(r["cut_minutes"], dry["cut_minutes"], "at the new feed");
+    // A changed design: planned again.
+    run(&mut s, "solid.box", json!({"length": 4, "width": 4, "height": 4, "corner": [16, 16, -4], "operation": "cut"}));
+    run(&mut s, "cam.job", json!({"job_path": job_path, "dry_run": true}));
+    assert_eq!(hits(&s), Some(0), "planned again");
+}
+
+/// A tool's speed and feed from its surface speed and chip load, explicit values first; a
+/// strategy's cutting data over the tool's own; and the machine's limits on the setup sheet,
+/// first, with the fixtures.
+#[test]
+fn speeds_from_cutting_data_are_held_to_the_machine_and_stated_first_on_the_sheet() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "corner": [-20, -15, -10], "body_name": "Plate"}));
+    run(&mut s, "solid.box", json!({"length": 20, "width": 16, "height": 3, "corner": [-10, -8, -3], "operation": "cut"}));
+    run(&mut s, "solid.box", json!({"length": 60, "width": 10, "height": 10, "corner": [-30, -25, -10], "body_name": "Jaw"}));
+    // 150 m/min on a 6 mm cutter is 7958 rev/min; the machine's lowest is 10000.
+    let mill = json!({"number": 1, "kind": "flat_endmill", "diameter": 6, "flute_length": 15, "flutes": 3,
+        "surface_speed": 150, "chip_load": 0.02, "plunge_feed": 200,
+        "cutting_data": [{"strategy": "slot", "stepdown": 1.5, "stepover": 2.5}]});
+    let job = json!({
+        "machine": "3axis", "post": "mach3_4axis", "tools": [mill], "bodies": ["Plate"], "fixtures": ["Jaw"],
+        "machine_rates": mill_rates(),
+        "operations": [{"name": "pocket", "type": "pocket", "tool": 1, "polygon": [[-10, -8], [10, -8], [10, 8], [-10, 8]],
+            "heights": {"clearance": 20, "retract": 5, "top": 0, "bottom": -3}}]
+    });
+    let dir = Dir::new("speeds");
+    let sheet = dir.file("sheet.md");
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": false, "output": dir.file("p.tap"), "setup_sheet": sheet}));
+    let notes = r["notes"].to_string();
+    assert!(notes.contains("worked out from its surface speed of 150 m/min"), "{notes}");
+    assert!(notes.contains("held to the spindle's range 10000 to 24000: 10000 rev/min"), "{notes}");
+    // The feed follows the speed as held: 10000 × 3 × 0.02.
+    assert!(notes.contains("feed 600 mm/min is worked out from its chip load"), "{notes}");
+    assert!(notes.contains("slot cutting data is used"), "{notes}");
+    let text = std::fs::read_to_string(dir.file("p.tap")).unwrap();
+    assert!(text.contains("S10000") && text.contains("F600"), "{text}");
+    // The slot data's 1.5 mm stepdown: two levels to 3 mm.
+    assert!(text.contains("Z-1.5") && text.contains("Z-3"), "{text}");
+    let md = std::fs::read_to_string(&sheet).unwrap();
+    let first = md.find("## Before you start").expect("the limits come first");
+    assert!(first < md.find("## Work zero").unwrap(), "{md}");
+    assert!(md[first..].contains("10000 rev/min"), "{md}");
+    assert!(md.contains("## Fixtures") && md.contains("- Jaw: X -30 to 30, Y -25 to -15, Z -10 to 0 (work coordinates)"), "{md}");
+    // An explicit speed wins; a hostile surface speed is refused.
+    let mut given = job.clone();
+    given["tools"][0]["spindle_rpm"] = json!(18000);
+    let r = run(&mut s, "cam.job", json!({"job": given, "dry_run": true}));
+    assert!(!r["notes"].to_string().contains("surface speed"), "{r}");
+    assert!(r["program_head"].to_string().contains("S18000") || r["summary"].to_string().contains("18000"), "{r}");
+    let mut bad = job.clone();
+    bad["tools"][0]["surface_speed"] = json!(-1);
+    assert!(s.execute("cam.job", &json!({"job": bad, "dry_run": true})).is_err());
+    // A feed from the chip load past the machine's top feed (10000 × 3 × 0.4 = 12000) is held
+    // to it, and so is the plunge that follows it without a `plunge_feed` of its own: never
+    // faster than the cut, and down no faster than Z's top feed.
+    let mut fast = job.clone();
+    fast["tools"][0]["chip_load"] = json!(0.4);
+    fast["tools"][0].as_object_mut().unwrap().remove("plunge_feed");
+    let out = dir.file("fast.tap");
+    run(&mut s, "cam.job", json!({"job": fast, "output": out}));
+    let text = std::fs::read_to_string(&out).unwrap();
+    let feeds: Vec<f64> =
+        text.lines().flat_map(|l| l.split_whitespace()).filter_map(|w| w.strip_prefix('F')).filter_map(|f| f.parse().ok()).collect();
+    assert!(feeds.contains(&8000.0) && feeds.iter().all(|f| *f <= 8000.0), "{feeds:?}");
+    assert!(feeds.contains(&4000.0), "the plunge is held to Z's top feed: {feeds:?}");
 }

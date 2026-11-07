@@ -170,7 +170,8 @@ fn same_motion(a: &JointWords, b: &JointWords) -> bool {
     match (a, b) {
         (JointWords::Rapid { linear: l1, rotary: r1, tcp: t1, .. }, JointWords::Rapid { linear: l2, rotary: r2, tcp: t2, .. })
         | (JointWords::Feed { linear: l1, rotary: r1, tcp: t1, .. }, JointWords::Feed { linear: l2, rotary: r2, tcp: t2, .. })
-        | (JointWords::Arc { linear: l1, rotary: r1, tcp: t1, .. }, JointWords::Arc { linear: l2, rotary: r2, tcp: t2, .. }) => {
+        | (JointWords::Arc { linear: l1, rotary: r1, tcp: t1, .. }, JointWords::Arc { linear: l2, rotary: r2, tcp: t2, .. })
+        | (JointWords::PlaneArc { linear: l1, rotary: r1, tcp: t1, .. }, JointWords::PlaneArc { linear: l2, rotary: r2, tcp: t2, .. }) => {
             l1 == l2 && r1 == r2 && t1 == t2
         }
         (JointWords::Dwell { seconds: s1, .. }, JointWords::Dwell { seconds: s2, .. }) => s1 == s2,
@@ -179,9 +180,7 @@ fn same_motion(a: &JointWords, b: &JointWords) -> bool {
 }
 
 fn line_of(b: &JointWords) -> usize {
-    match b {
-        JointWords::Rapid { line, .. } | JointWords::Feed { line, .. } | JointWords::Arc { line, .. } | JointWords::Dwell { line, .. } => *line,
-    }
+    b.line()
 }
 
 /// The operation of every block of `blocks` (read from the program as written), from the
@@ -360,15 +359,18 @@ pub fn check_rapids_staged(
     // Filed in a frame whose Z is the tool's axis of the operation's first such move (an
     // indexed operation at any angle, not only at A0).
     let mut cut: Vec<Option<(AxisFrame, Swept)>> = program.operations.iter().map(|_| None).collect();
+    // What the blocks found, in their order: the blocks' own checks are made after the walk
+    // through the program, side by side ([`crate::par`]), and their hits taken in this order.
+    let mut found: Vec<Found<'_>> = Vec::new();
     // With the tool always along machine Z (rotaries on the table only), a rapid from an unknown
     // place (after a return home) comes down its own axis to where it ends.
     let table_only = machine.rotaries.iter().all(|r| r.carrier == Carrier::Table);
     for (i, b) in blocks.iter().enumerate() {
         let (line, linear, rotary, tcp, rapid) = match b {
             JointWords::Rapid { line, linear, rotary, tcp } => (*line, *linear, rotary, *tcp, true),
-            JointWords::Feed { line, linear, rotary, tcp, .. } | JointWords::Arc { line, linear, rotary, tcp, .. } => {
-                (*line, *linear, rotary, *tcp, false)
-            }
+            JointWords::Feed { line, linear, rotary, tcp, .. }
+            | JointWords::Arc { line, linear, rotary, tcp, .. }
+            | JointWords::PlaneArc { line, linear, rotary, tcp, .. } => (*line, *linear, rotary, *tcp, false),
             JointWords::Dwell { .. } => continue,
         };
         let to = State { linear, rotary: rotary.clone(), tcp, line, tool: tool_at(i) };
@@ -401,7 +403,6 @@ pub fn check_rapids_staged(
                     });
                 let through_cut = owner.is_some() && cut.get(k).and_then(Option::as_ref).is_some_and(|(f, c)| down_into(&poses, f, c));
                 let left = if back_in || through_cut { None } else { left };
-                check_block(&mut out, &poses, (line, owner.as_ref().map(|_| k)), tool, cutter, obstacles, left, deliberate, tol, step)?;
                 if owner.is_some() && retract(&poses) {
                     withdrawn = poses.first().map(|p| (k, *p));
                 }
@@ -413,9 +414,12 @@ pub fn check_rapids_staged(
                             poses.iter().filter_map(move |p| axis_intrusion(p, tool.radius(), z.center, z.radius, z.x.0, z.x.1).map(|d| (d, p.tip)))
                         })
                         .reduce(|a, b| if b.0 > a.0 { b } else { a });
+                    found.push(Found::Block(Block { poses, at: (line, owner.as_ref().map(|_| k)), tool, cutter, stock: left, deliberate }));
                     if let Some((depth, at)) = deepest {
-                        out.hit(RapidHit { line, operation: owner.as_ref().map(|_| k), kind: RapidHitKind::Turn, depth, at });
+                        found.push(Found::Hit(RapidHit { line, operation: owner.as_ref().map(|_| k), kind: RapidHitKind::Turn, depth, at }));
                     }
+                } else {
+                    found.push(Found::Block(Block { poses, at: (line, owner.as_ref().map(|_| k)), tool, cutter, stock: left, deliberate }));
                 }
             }
         }
@@ -424,7 +428,7 @@ pub fn check_rapids_staged(
             && let Some(c) = cut.get_mut(k)
         {
             // An arc is filed by its ends: its chord is not where it cut.
-            let arc = matches!(b, JointWords::Arc { .. });
+            let arc = matches!(b, JointWords::Arc { .. } | JointWords::PlaneArc { .. });
             let (a, end) = (pose_at(machine, from.linear, &from.rotary, from.tcp), pose_at(machine, to.linear, &to.rotary, to.tcp));
             let (f, c) = c.get_or_insert_with(|| (AxisFrame::along(a.axis), Swept::default()));
             if f.holds(&a) && f.holds(&end) {
@@ -438,6 +442,18 @@ pub fn check_rapids_staged(
             }
         }
         state = Some(to);
+    }
+    let blocks: Vec<&Block<'_>> = found.iter().filter_map(|f| if let Found::Block(b) = f { Some(b) } else { None }).collect();
+    let weights: Vec<usize> = blocks.iter().map(|b| b.poses.len()).collect();
+    let ranges = crate::par::split(&weights, crate::par::threads_for(weights.iter().sum(), BLOCK_SAMPLES_PER_THREAD));
+    let checked: Vec<Vec<Vec<RapidHit>>> =
+        crate::par::map(ranges, |r| blocks.get(r).unwrap_or(&[]).iter().map(|b| check_block(b, obstacles, tol, step)).collect::<Result<Vec<_>>>())?;
+    let mut checked = checked.into_iter().flatten();
+    for f in found {
+        match f {
+            Found::Block(_) => checked.next().into_iter().flatten().for_each(|h| out.hit(h)),
+            Found::Hit(h) => out.hit(h),
+        }
     }
     Ok(out)
 }
@@ -527,21 +543,33 @@ fn samples(machine: &Machine, from: Option<&State>, to: &State, reach: f64, step
         .collect())
 }
 
-/// Checks the poses of one rapid block (`at`: its line and the operation whose tool it is, when known).
-#[allow(clippy::too_many_arguments)]
-fn check_block(
-    out: &mut RapidCheck,
-    poses: &[Pose],
+/// Samples of rapids below which one thread checks them all (a sample of a turning rapid holds
+/// the tool against the part along any axis, which is slow).
+const BLOCK_SAMPLES_PER_THREAD: usize = 64;
+
+/// A rapid block to check: its samples, its line and operation, the tool, and what is left of
+/// the stock (`None`: not checked against it).
+struct Block<'a> {
+    poses: Vec<Pose>,
     at: (usize, Option<usize>),
-    tool: &Tool,
-    cutter: &Cutter,
-    obstacles: &Surface,
-    stock: Option<&Stock>,
+    tool: &'a Tool,
+    cutter: &'a Cutter,
+    stock: Option<&'a Stock>,
     deliberate: bool,
-    tol: f64,
-    step: f64,
-) -> Result<()> {
-    let (line, op) = at;
+}
+
+/// What the walk through a program finds, in order: a block to check, or a hit already found.
+enum Found<'a> {
+    Block(Block<'a>),
+    Hit(RapidHit),
+}
+
+/// The hits of one rapid block (`b.at`: its line and the operation whose tool it is, when known)
+/// against `obstacles` and the stock, in the order they count.
+fn check_block(b: &Block<'_>, obstacles: &Surface, tol: f64, step: f64) -> Result<Vec<RapidHit>> {
+    let mut out = RapidCheck::default();
+    let (poses, tool, cutter, stock, deliberate) = (b.poses.as_slice(), b.tool, b.cutter, b.stock, b.deliberate);
+    let (line, op) = b.at;
     let path = Toolpath5 { moves: poses.iter().map(|&to| Move5::Rapid { to }).collect() };
     // A retract out of a cut the model does not show leaves it the way it went in.
     if !(deliberate && retract(poses)) {
@@ -566,7 +594,7 @@ fn check_block(
             out.hit(RapidHit { line, operation: op, kind: RapidHitKind::Stock, depth, at });
         }
     }
-    Ok(())
+    Ok(out.hits)
 }
 
 /// Whether `poses` (a rapid's samples) run straight back down the tool axis of `bottom` (the
@@ -626,27 +654,24 @@ pub fn check_travel(text: &str, machine: &Machine) -> Result<Option<Travel>> {
             JointWords::Rapid { line, linear, rotary, tcp } | JointWords::Feed { line, linear, rotary, tcp, .. } => {
                 (*line, vec![axes(*linear, rotary, *tcp)])
             }
-            JointWords::Arc { line, linear, center, ccw, rotary, tcp, .. } => {
+            JointWords::Arc { line, linear, rotary, tcp, .. } | JointWords::PlaneArc { line, linear, rotary, tcp, .. } => {
                 let mut pts = Vec::new();
                 if let Some(from) = last
                     && !*tcp
+                    && let Some(arc) = b.arc_from(from)
                 {
-                    let start = Vec2::new(from.x, from.y) - *center;
-                    let sweep = crate::path::arc_sweep(from, *linear, *center, *ccw);
-                    let at = |t: f64| {
-                        let q = *center + Vec2::from_angle(start.angle() + sweep * t) * start.len();
-                        Vec3::new(q.x, q.y, from.z + (linear.z - from.z) * t)
-                    };
+                    let start = arc.plane.split(from).0 - arc.plane.split(arc.center).0;
+                    let sweep = arc.sweep();
                     for k in 1..64 {
-                        pts.push(at(k as f64 / 64.0));
+                        pts.push(arc.at(k as f64 / 64.0));
                     }
-                    // Where the arc reaches farthest along X and Y (it may between the samples):
-                    // wherever it passes a quarter turn.
+                    // Where the arc reaches farthest along its plane's axes (it may between the
+                    // samples): wherever it passes a quarter turn.
                     if sweep.abs() > 1e-12 {
                         for k in -6..=6 {
                             let t = (f64::from(k) * std::f64::consts::FRAC_PI_2 - start.angle()) / sweep;
                             if t > 0.0 && t < 1.0 {
-                                pts.push(at(t));
+                                pts.push(arc.at(t));
                             }
                         }
                     }

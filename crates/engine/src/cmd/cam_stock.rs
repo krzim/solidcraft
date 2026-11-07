@@ -9,7 +9,7 @@ use solidcraft_cam::indexed::{IndexedOperation, frame_for_index};
 use solidcraft_cam::kinematics::Machine;
 use solidcraft_cam::rapids::{RAPID_STEP, check_rapids_staged, check_travel};
 use solidcraft_cam::stock::{FaceParams, Stock, default_face_overhang, default_face_stepover, face};
-use solidcraft_cam::{Frame, Heights, Move5, Surface, Toolpath};
+use solidcraft_cam::{Frame, Heights, Move5, Toolpath};
 
 use super::{Ctx, Planned, Surfaces, cam_err, finite_point, num, v3};
 use crate::Result;
@@ -52,7 +52,7 @@ pub(super) fn stock_of(cmd: &str, job: &CamJob, surfaces: &Surfaces, tol: f64, n
 pub(super) fn check_below_stock(
     planned: &[Planned],
     stock: &Stock,
-    fixtures: Option<&Surface>,
+    fixture_low: Option<f64>,
     machine: &Machine,
     tol: f64,
     failures: &mut Vec<String>,
@@ -65,9 +65,7 @@ pub(super) fn check_below_stock(
     // it there, and every cut is checked against them: a cut through the stock may go on down
     // to where the lowest of them reaches (what is below that, the vise's floor or the table, is
     // not modelled).
-    let held = fixtures
-        .map(|f| f.triangles().iter().flat_map(|t| t.iter().map(|p| p.z)).fold(f64::INFINITY, f64::min))
-        .filter(|z| z.is_finite() && *z < min.z);
+    let held = fixture_low.filter(|z| z.is_finite() && *z < min.z);
     let floor = held.unwrap_or(min.z);
     for p in planned {
         let lowest = p
@@ -169,6 +167,7 @@ pub(super) fn plan_face(ctx: &Ctx<'_>, o: &FaceOp, arc_tol: f64) -> Result<Plann
         overhang: o.overhang.unwrap_or_else(|| default_face_overhang(tool)),
         zigzag: o.zigzag.unwrap_or(true),
         stock: stock.copied(),
+        lead_radius: o.lead_radius,
     };
     let path: Toolpath = face(tool, &params).map_err(|e| ctx.bad(c.name, e))?;
     let rotary = vec![0.0; ctx.machine.rotaries.len()];

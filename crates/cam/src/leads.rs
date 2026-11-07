@@ -31,7 +31,7 @@ use crate::ops::{
     Builder, ContourParams, Cut, MAX_COORD, MAX_RAMP_LAPS, PocketParams, Side, check_leave, check_ramp, corner_spur, link_is_clear, mills,
     pocket_rings, start_near,
 };
-use crate::path::{Move, Toolpath, arc_sweep};
+use crate::path::{Move, Toolpath, arc_sweep, vertical_quarter};
 use crate::piece::{Piece, wrap};
 use crate::tool::Tool;
 use crate::{CamError, Result, invalid};
@@ -125,6 +125,13 @@ pub struct ContourOptions {
     /// Repeat the last pass once.
     pub spring_pass: bool,
     pub linking: Linking,
+    /// The radius of a vertical lead (mm): each pass is entered down a quarter arc in the
+    /// vertical plane of its start's direction, from this far above and behind its start (its
+    /// lead's, if it has one), and left up a quarter arc beyond its end. `G18`/`G19` arcs where
+    /// that direction runs along X or Y, lines along the arc otherwise. It takes the place of
+    /// the entry (a plunge only). `None`: none.
+    #[serde(default)]
+    pub vertical_lead: Option<f64>,
 }
 
 /// A pocket's entry and linking. The default is the pocket's `ramp_angle` and clearance links.
@@ -219,6 +226,8 @@ fn xy(p: solidcore_record::Vec3) -> Vec2 {
 /// down many times faster than that (a 30° ramp at 2880 mm/min goes down at 1440 mm/min, where
 /// a small tool may be rated for 100).
 fn limit_descent(moves: &mut [Move], plunge: f64) {
+    /// Points a vertical arc's slope is taken at, its ends included.
+    const STEEPEST_SAMPLES: usize = 64;
     let cap = |feed: &mut f64, len: f64, dz: f64| {
         let most = plunge * (len / dz).max(1.0);
         if *feed > most {
@@ -235,6 +244,19 @@ fn limit_descent(moves: &mut [Move], plunge: f64) {
             Move::Arc { to, center, ccw, feed } if p.z - to.z > 1e-9 => {
                 let run = xy(p).dist(*center) * arc_sweep(p, *to, *center, *ccw);
                 cap(feed, run.hypot(p.z - to.z), p.z - to.z);
+            }
+            // A vertical arc goes down fastest where it is steepest (a quarter arc into a cut
+            // starts straight down), not at its average.
+            Move::PlaneArc { to, center, plane, ccw, feed } => {
+                let arc = crate::path::PlaneArc { from: p, to: *to, center: *center, plane: *plane, ccw: *ccw };
+                let sampled =
+                    (0..=STEEPEST_SAMPLES).filter_map(|k| arc.tangent(k as f64 / STEEPEST_SAMPLES as f64)).map(|t| -t.z).fold(0.0f64, f64::max);
+                // Between two samples the slope is at most this much steeper.
+                let between = 1.0 - (arc.sweep().abs() / (2 * STEEPEST_SAMPLES) as f64).cos();
+                let steepest = (sampled + between).min(1.0);
+                if sampled > 1e-9 {
+                    cap(feed, 1.0, steepest);
+                }
             }
             _ => {}
         }
@@ -521,6 +543,8 @@ struct Pass {
     tabs: Vec<f64>,
     lead_in: Vec<Piece>,
     lead_out: Vec<Piece>,
+    /// The radius of its vertical leads ([`ContourOptions::vertical_lead`]).
+    vertical: Option<f64>,
 }
 
 impl Pass {
@@ -528,9 +552,62 @@ impl Pass {
         self.lp.first().map_or(Vec2::default(), Piece::start)
     }
 
-    /// Where the tool goes down.
+    /// Where the cut at depth starts (its lead's start, if it has one) and its direction there.
+    fn cut_start(&self) -> (Vec2, Vec2) {
+        match self.lead_in.first().or(self.lp.first()) {
+            Some(piece) => (piece.start(), piece.tangent_at(0.0)),
+            None => (Vec2::default(), Vec2::new(1.0, 0.0)),
+        }
+    }
+
+    /// Where the cut at depth ends (its lead out's end, if it has one) and its direction there.
+    fn cut_end(&self) -> (Vec2, Vec2) {
+        match self.lead_out.last() {
+            Some(piece) => (piece.end(), piece.tangent_at(1.0)),
+            None => (self.start(), self.lp.last().map_or(Vec2::new(1.0, 0.0), |piece| piece.tangent_at(1.0))),
+        }
+    }
+
+    /// Where the tool goes down: behind the start by the vertical lead's radius, if it has one.
     fn entry(&self) -> Vec2 {
-        self.lead_in.first().map_or(self.start(), Piece::start)
+        let (p, t) = self.cut_start();
+        match self.vertical {
+            Some(r) => p - t * r,
+            None => p,
+        }
+    }
+
+    /// Whether the tool leaves the pass's start to come back to it: by a lead or a vertical lead.
+    fn leads(&self) -> bool {
+        !self.lead_in.is_empty() || self.vertical.is_some()
+    }
+
+    /// Down a quarter arc from above and behind the start to the start at `z`, from wherever
+    /// the tool is above [`Pass::entry`].
+    fn vertical_in(&self, b: &mut Builder, z: f64, r: f64) -> Result<()> {
+        let (p, t) = self.cut_start();
+        let Some(q) = b.pos else { return Err(CamError::Unsafe("a lead before the first positioning move".into())) };
+        let top = z + r;
+        if q.z > top + 1e-9 {
+            b.plunge_to(top)?;
+        } else if q.z < top - 1e-9 {
+            // Back up the way it came down.
+            b.push(Move::Rapid { to: xy(q).extend(top) })?;
+        }
+        let Some(from) = b.pos else { return Err(CamError::Unsafe("a lead before the first positioning move".into())) };
+        for m in vertical_quarter(from, p.extend(z), p.extend(top), t, b.feeds.cut) {
+            b.push(m)?;
+        }
+        Ok(())
+    }
+
+    /// Up a quarter arc from the end at `z` to above and beyond it.
+    fn vertical_out(&self, b: &mut Builder, z: f64, r: f64) -> Result<()> {
+        let (e, t) = self.cut_end();
+        for m in vertical_quarter(e.extend(z), (e + t * r).extend(z + r), e.extend(z + r), t, b.feeds.cut) {
+            b.push(m)?;
+        }
+        Ok(())
     }
 
     fn pieces(&self) -> impl Iterator<Item = &Piece> {
@@ -569,7 +646,7 @@ fn lead_paths(lead: &Lead, lp: &[Piece], away_left: bool) -> Option<(Vec<Piece>,
     Some((arc(first.tangent_at(0.0), true), arc(last.tangent_at(1.0), false)))
 }
 
-fn make_pass(lp: Vec<Piece>, tabs: Vec<f64>, lead: Option<Lead>, geo: &Geo<'_>, away_left: bool) -> Result<Pass> {
+fn make_pass(lp: Vec<Piece>, tabs: Vec<f64>, lead: Option<Lead>, vertical: Option<f64>, geo: &Geo<'_>, away_left: bool) -> Result<Pass> {
     let (lead_in, lead_out) = match lead {
         None => (Vec::new(), Vec::new()),
         Some(l) => {
@@ -581,7 +658,18 @@ fn make_pass(lp: Vec<Piece>, tabs: Vec<f64>, lead: Option<Lead>, geo: &Geo<'_>, 
             (i, o)
         }
     };
-    Ok(Pass { lp, tabs, lead_in, lead_out })
+    let pass = Pass { lp, tabs, lead_in, lead_out, vertical };
+    if let Some(r) = vertical {
+        // The vertical leads come down behind the start and go up beyond the end: both there
+        // must be clear of the part.
+        let ((p, t), (e, te)) = (pass.cut_start(), pass.cut_end());
+        let behind = [Piece::Line { a: p - t * r, b: p }];
+        let beyond = [Piece::Line { a: e, b: e + te * r }];
+        if !geo.path_is_free(&behind, p) || !geo.path_is_free(&beyond, e) {
+            return invalid("the vertical lead would cut into the part: give it a smaller radius, or a lead that ends clear of the part");
+        }
+    }
+    Ok(pass)
 }
 
 /// To `to` between passes: up to the retract height and across when `linking` allows it and
@@ -688,6 +776,9 @@ struct Down<'a> {
 
 impl Down<'_> {
     fn enter(&self, b: &mut Builder, pass: &Pass, z: f64) -> Result<()> {
+        if let Some(r) = pass.vertical {
+            return pass.vertical_in(b, z, r);
+        }
         match self.entry {
             Entry::Plunge => b.plunge_to(z),
             Entry::Ramp { angle } => self.ramp(b, pass, z, angle),
@@ -784,7 +875,11 @@ fn cut_pass(b: &mut Builder, pass: &Pass, z: f64, plan: Option<&TabPlan>) -> Res
     if let Some(first) = pass.lp.first() {
         b.cut_to(first.start(), z)?;
     }
-    b.cut_loop(&pass.lead_out, z)
+    b.cut_loop(&pass.lead_out, z)?;
+    match pass.vertical {
+        Some(r) => pass.vertical_out(b, z, r),
+        None => Ok(()),
+    }
 }
 
 /// Follows the boundaries of `regions` on the chosen side, one loop after the other, each down
@@ -809,7 +904,15 @@ pub fn contour_with(
     if let Some(l) = &opts.lead {
         l.validate()?;
     }
-    if params.side == Side::On && (opts.lead.is_some() || matches!(entry, Entry::Helix { .. })) {
+    if let Some(v) = opts.vertical_lead {
+        if !(MIN_ARC_RADIUS..=MAX_LEAD).contains(&v) {
+            return invalid(format!("the vertical lead's radius must be from {MIN_ARC_RADIUS} to {MAX_LEAD} mm"));
+        }
+        if entry != Entry::Plunge {
+            return invalid("a vertical lead takes the place of the entry: give no ramp or helix with it");
+        }
+    }
+    if params.side == Side::On && (opts.lead.is_some() || opts.vertical_lead.is_some() || matches!(entry, Entry::Helix { .. })) {
         return invalid("on the profile both sides of the line are the part: a lead or a helix would cut beside it; use a ramp or a plunge");
     }
     if let Some(t) = &opts.tabs {
@@ -867,7 +970,7 @@ pub fn contour_with(
     let flip = params.climb != natural_is_climb;
     let away_left = if params.side == Side::Outside { flip } else { !flip };
     let orient = |lp: &Vec<Piece>| if flip { reversed(lp) } else { lp.clone() };
-    let relocate = opts.lead.is_some() || opts.tabs.is_some() || matches!(entry, Entry::Helix { .. });
+    let relocate = opts.lead.is_some() || opts.vertical_lead.is_some() || opts.tabs.is_some() || matches!(entry, Entry::Helix { .. });
     let geo = Geo { shape: &shape, side: params.side, away, r };
     let (top, bottom) = (cut.heights.top, cut.heights.bottom);
     let plan = opts.tabs.map(|t| TabPlan { plateau: t.width * 0.5 + r, top: bottom + t.height, slope: t.ramp_angle.tan(), bottom });
@@ -886,16 +989,19 @@ pub fn contour_with(
             _ => Vec::new(),
         };
         let tab_points: Vec<Vec2> = tabs.iter().map(|s| at_length(&lp, *s).0).collect();
-        let rough = make_pass(lp, tabs, opts.lead, &geo, away_left)?;
+        let rough = make_pass(lp, tabs, opts.lead, opts.vertical_lead, &geo, away_left)?;
         // Down to the top (at rapid to just above it), then into the material by the entry, as
         // often as there are levels.
         hop(&mut b, rough.entry(), opts.linking, above)?;
         b.descend_to(top, top)?;
         let mut prev = top;
         for (k, &z) in levels.iter().enumerate() {
-            if k > 0 && !rough.lead_in.is_empty() {
+            if k > 0 && rough.leads() {
                 hop(&mut b, rough.entry(), opts.linking, above)?;
-                b.descend_to(prev, prev)?;
+                // Down to the level above, or with a vertical lead to where its arc started on
+                // that level (the tool went no lower there).
+                let back = prev + rough.vertical.unwrap_or(0.0);
+                b.descend_to(back, back)?;
             }
             down.enter(&mut b, &rough, z)?;
             cut_pass(&mut b, &rough, z, plan.as_ref())?;
@@ -909,17 +1015,21 @@ pub fn contour_with(
             for (j, &z) in steps.iter().enumerate() {
                 let at_z = b.pos.filter(|q| (q.z - z).abs() <= 1e-9);
                 // Back at the pass's start after the step above: straight on down.
-                let on_down = j > 0 && pass.lead_in.is_empty() && b.at(to) && b.pos.is_some_and(|q| q.z > z);
+                let on_down = j > 0 && !pass.leads() && b.at(to) && b.pos.is_some_and(|q| q.z > z);
                 match at_z {
-                    Some(q) if pass.lead_in.is_empty() && geo.link_in_band(xy(q), to, d, rough_d) => b.cut_to(to, z)?,
+                    Some(q) if !pass.leads() && geo.link_in_band(xy(q), to, d, rough_d) => b.cut_to(to, z)?,
                     _ if on_down => b.plunge_to(z)?,
                     _ => {
                         hop(b, to, opts.linking, above)?;
                         // Down where the depth passes cut, or into the material by the entry.
                         if cut_so_far.iter().any(|piece| piece.dist(to) <= 0.9 * r) {
                             b.descend_to(z, top)?;
-                        } else if entry == Entry::Plunge {
-                            return invalid("a finishing pass would plunge where the depth passes did not cut: give it a smaller lead, or an entry");
+                        } else if entry == Entry::Plunge && pass.vertical.is_none_or(|v| z + v < top - 1e-9) {
+                            // A vertical lead whose arc starts below the top plunges down to it.
+                            return invalid(
+                                "a finishing pass would plunge where the depth passes did not cut: give it a smaller lead, a vertical lead \
+                                 that starts above the top, or an entry",
+                            );
                         } else {
                             b.descend_to(top, top)?;
                             down.enter(b, &pass, z)?;
@@ -960,7 +1070,7 @@ pub fn contour_with(
                         }
                     }
                 }
-                let pass = make_pass(lp, tabs, opts.lead, &geo, away_left)?;
+                let pass = make_pass(lp, tabs, opts.lead, opts.vertical_lead, &geo, away_left)?;
                 last = finish(&mut b, pass, *d, &steps, &mut cut_so_far)?;
             }
         }

@@ -72,7 +72,7 @@ pub struct ViewOperation {
 }
 
 /// Where a toolpath goes, in work coordinates (the design less the job's origin), mm.
-#[derive(Debug, Default, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 pub struct ToolpathExtents {
     /// Lowest and highest tool tip X, Y, Z of every move, rapids included.
     pub all: [[f64; 3]; 2],

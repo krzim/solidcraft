@@ -28,7 +28,8 @@ use solidcore_record::{Region2, Seg2, Vec2, Vec3};
 use solidcraft_cam::collision::Hit;
 use solidcraft_cam::gcode5::{JointWords, Post5, parse5};
 use solidcraft_cam::kinematics::{Carrier, Joints, Machine, forward};
-use solidcraft_cam::{Feeds, Frame, Heights, HolderSection, Tool, ToolKind, offset_regions};
+use solidcraft_cam::machine_time::MachineRates;
+use solidcraft_cam::{Feeds, Frame, Heights, HolderSection, Strategy, Tool, ToolKind, offset_regions};
 use solidcraft_geom::prelude::*;
 use solidcraft_kernel::{Body, PointClass};
 
@@ -295,6 +296,7 @@ pub(super) fn load_job_of(cmd: &str, p: &Value, has_job: bool, job_path: Option<
 }
 
 /// The part's and the fixtures' exact geometry, in design coordinates.
+#[derive(Clone)]
 pub(super) struct Geometry {
     part: Vec<Body>,
     fixtures: Vec<Body>,
@@ -436,6 +438,18 @@ impl Geometry {
     /// The fixtures' top in `frame`, when there are fixtures.
     fn fixture_top(&self, frame: &Frame) -> Option<f64> {
         self.fixture_box.map(|b| self.z_range(b, frame).0)
+    }
+
+    /// The highest the part and the fixtures reach along `frame`'s Z, in its coordinates, from
+    /// their exact boxes: exact for a frame square to the work's axes, above them otherwise.
+    pub fn top_in(&self, frame: &Frame) -> Option<f64> {
+        let part = self.part_range(frame).ok().map(|(top, _, _)| top);
+        [part, self.fixture_top(frame)].into_iter().flatten().reduce(f64::max)
+    }
+
+    /// The lowest the fixtures reach in work Z, from their exact box, when there are fixtures.
+    pub fn fixture_low(&self) -> Option<f64> {
+        self.fixture_box.map(|b| self.z_range(b, &Frame::IDENTITY).1)
     }
 
     /// Whether the frame point `p` is in the part's material or on its boundary.
@@ -608,8 +622,10 @@ fn region_samples(regions: &[Region2], tol: f64) -> std::result::Result<Vec<Vec2
 
 /// What the agent side keeps while a job is planned: the policies, the operation being
 /// planned, and what the reply reports.
+#[derive(Clone)]
 pub(super) struct Agent {
-    pub geo: Geometry,
+    /// Shared by the forks that plan operations on threads of their own ([`Agent::fork`]).
+    pub geo: std::sync::Arc<Geometry>,
     clearance_above: f64,
     retract_above: f64,
     feeds: FeedsPolicy,
@@ -622,6 +638,14 @@ pub(super) struct Agent {
     derived: RefCell<Vec<DerivedHeights>>,
     used: RefCell<BTreeMap<usize, (Heights, Frame)>>,
     notes: RefCell<Vec<String>>,
+    /// The spindle speeds and feeds held to the machine's limits, for the setup sheet's
+    /// warnings up front.
+    limits: RefCell<Vec<String>>,
+    /// The strategy of the operation being planned: its tools' cutting data for it apply.
+    strategy: Cell<Option<Strategy>>,
+    /// The machine's spindle range and top feeds (its rates file), which hold the speeds and
+    /// feeds as the profile's `default_feeds` do.
+    rates: Option<MachineRates>,
     /// The height the part and fixtures reach as the table turns, and the rotaries' name, when
     /// the post turns the rotaries at the operations' clearance (no `safe_rotate` to the
     /// machine's top, no post `clearance` above it).
@@ -642,7 +666,15 @@ fn positive(v: Option<f64>, max: f64) -> bool {
 }
 
 impl Agent {
-    pub fn new(cmd: &str, job: &CamJob, geo: Geometry, loaded: &Loaded, machine: &Machine, post: &Post5) -> Result<Agent> {
+    pub fn new(
+        cmd: &str,
+        job: &CamJob,
+        geo: Geometry,
+        loaded: &Loaded,
+        machine: &Machine,
+        post: &Post5,
+        rates: Option<&MachineRates>,
+    ) -> Result<Agent> {
         let h = job.default_heights.unwrap_or_default();
         let clearance_above = h.clearance_above.unwrap_or(10.0);
         let retract_above = h.retract_above.unwrap_or(2.0);
@@ -671,7 +703,7 @@ impl Agent {
             None
         };
         Ok(Agent {
-            geo,
+            geo: std::sync::Arc::new(geo),
             turn,
             tol: job.tolerance.unwrap_or(0.01),
             auto: RefCell::new(BTreeSet::new()),
@@ -687,7 +719,51 @@ impl Agent {
             derived: RefCell::new(Vec::new()),
             used: RefCell::new(BTreeMap::new()),
             notes: RefCell::new(Vec::new()),
+            limits: RefCell::new(Vec::new()),
+            strategy: Cell::new(None),
+            rates: rates.cloned(),
         })
+    }
+
+    /// A copy that plans one operation on a thread of its own: the same policies and geometry,
+    /// nothing recorded yet. [`Agent::absorb`] takes back what it records.
+    pub fn fork(&self) -> Agent {
+        Agent {
+            geo: std::sync::Arc::clone(&self.geo),
+            clearance_above: self.clearance_above,
+            retract_above: self.retract_above,
+            feeds: self.feeds,
+            left_out: self.left_out.clone(),
+            profile: self.profile.clone(),
+            index: Cell::new(self.index.get()),
+            name: RefCell::new(None),
+            pending: RefCell::new(None),
+            choices: RefCell::new(Vec::new()),
+            derived: RefCell::new(Vec::new()),
+            used: RefCell::new(BTreeMap::new()),
+            notes: RefCell::new(Vec::new()),
+            limits: RefCell::new(Vec::new()),
+            strategy: Cell::new(None),
+            rates: self.rates.clone(),
+            turn: self.turn.clone(),
+            tol: self.tol,
+            auto: RefCell::new(BTreeSet::new()),
+        }
+    }
+
+    /// What `fork` recorded, after what this one holds, in the order it was recorded; and the
+    /// operation it planned (its index, name and refusal) as the one being planned here.
+    pub fn absorb(&self, fork: Agent) {
+        self.index.set(fork.index.get());
+        self.name.replace(fork.name.into_inner());
+        self.pending.replace(fork.pending.into_inner());
+        self.strategy.set(fork.strategy.get());
+        self.choices.borrow_mut().extend(fork.choices.into_inner());
+        self.derived.borrow_mut().extend(fork.derived.into_inner());
+        self.used.borrow_mut().extend(fork.used.into_inner());
+        self.notes.borrow_mut().extend(fork.notes.into_inner());
+        self.limits.borrow_mut().extend(fork.limits.into_inner());
+        self.auto.borrow_mut().extend(fork.auto.into_inner());
     }
 
     /// Operation `index` is planned next.
@@ -695,6 +771,24 @@ impl Agent {
         self.index.set(index);
         self.name.replace(None);
         self.pending.replace(None);
+        self.strategy.set(None);
+    }
+
+    /// The operation being planned is of `strategy`: its tool's cutting data for it apply.
+    pub fn set_strategy(&self, strategy: Option<Strategy>) {
+        self.strategy.set(strategy);
+    }
+
+    /// The spindle speeds and feeds held to the machine's limits so far.
+    pub fn limits(&self) -> Vec<String> {
+        self.limits.borrow().clone()
+    }
+
+    /// A note that a speed or feed was held to a limit: in the reply's notes and up front on the
+    /// setup sheet.
+    fn limit(&self, n: String) {
+        self.limits.borrow_mut().push(n.clone());
+        self.note(n);
     }
 
     /// The operation being planned is called `name` (every refusal of an operation names it).
@@ -1254,10 +1348,26 @@ pub(super) fn resolve_for(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&To
     let pol = ag.feeds;
     let op = c.name;
     let prefix = format!("operation {} `{op}`", ag.index.get());
+    // The tool as this operation's strategy uses it: its cutting data for it over its own.
+    let strategy_tool = ag.strategy.get().map(|s| (s, tool.for_strategy(s)));
+    if let Some((s, t)) = &strategy_tool
+        && tool.cutting_data.iter().any(|d| d.strategy == *s)
+    {
+        ag.note(format!("{prefix}: tool {}'s {} cutting data is used", t.number, s.label()));
+    }
+    let tool = strategy_tool.as_ref().map_or(tool, |(_, t)| t);
+    // The machine's spindle range and top feeds: the profile's. A speed or feed worked out from
+    // the tool's surface speed or chip load is held to the job's machine rates too, where the
+    // profile gives no limit (a speed or feed given outright is the controller's to hold, and the
+    // machine time says so).
+    let rates = ag.rates.as_ref();
+    let speeds = tool.speeds(None);
+    let spindle_range = pol.spindle_rpm_range.or_else(|| rates.and_then(|r| r.spindle_rpm).filter(|_| speeds.rpm_derived && c.spindle_rpm.is_none()));
+    let (max_cut, max_plunge) = (pol.max_cut, pol.max_plunge);
     // The spindle speed.
     let rpm = match c.spindle_rpm {
         Some(r) => {
-            if let Some([lo, hi]) = pol.spindle_rpm_range
+            if let Some([lo, hi]) = spindle_range
                 && !(lo..=hi).contains(&r)
             {
                 return Err(refuse_op(
@@ -1272,8 +1382,19 @@ pub(super) fn resolve_for(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&To
             r
         }
         None => {
-            let r = match (tool.spindle_rpm, pol.fallback) {
-                (Some(r), _) => r,
+            let r = match (speeds.spindle_rpm, pol.fallback) {
+                (Some(r), _) => {
+                    if speeds.rpm_derived {
+                        ag.note(format!(
+                            "{prefix}: tool {}'s {} rev/min is worked out from its surface speed of {} m/min at {} mm",
+                            tool.number,
+                            num(r.round()),
+                            num(tool.surface_speed.unwrap_or(0.0)),
+                            num(tool.diameter)
+                        ));
+                    }
+                    r
+                }
                 (None, Some(f)) => {
                     ag.note(format!(
                         "{prefix}: tool {} has no spindle speed: the profile's fallback {} rev/min is used",
@@ -1289,14 +1410,22 @@ pub(super) fn resolve_for(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&To
                         "feeds",
                         format!("tool {} has no spindle speed", tool.number),
                         None,
-                        "give the operation `spindle_rpm`, the tool `spindle_rpm`, or the profile `default_feeds.fallback`".into(),
+                        "give the operation `spindle_rpm`, the tool `spindle_rpm` or `surface_speed`, or the profile `default_feeds.fallback`".into(),
                     ));
                 }
             };
-            match pol.spindle_rpm_range {
+            let r = if speeds.rpm_derived { r.round() } else { r };
+            match spindle_range {
                 Some([lo, hi]) if !(lo..=hi).contains(&r) => {
                     let held = r.clamp(lo, hi);
-                    ag.note(format!("{prefix}: tool {}'s {} rev/min is held to the spindle's range: {}", tool.number, num(r), num(held)));
+                    ag.limit(format!(
+                        "{prefix}: tool {}'s {} rev/min is held to the spindle's range {} to {}: {} rev/min",
+                        tool.number,
+                        num(r),
+                        num(lo),
+                        num(hi),
+                        num(held)
+                    ));
                     held
                 }
                 _ => r,
@@ -1316,7 +1445,7 @@ pub(super) fn resolve_for(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&To
     // The feeds.
     let feeds = match c.feeds {
         Some(f) => {
-            for (v, max, key, limit) in [(f.cut, pol.max_cut, "feeds.cut", "max_cut"), (f.plunge, pol.max_plunge, "feeds.plunge", "max_plunge")] {
+            for (v, max, key, limit) in [(f.cut, max_cut, "feeds.cut", "max_cut"), (f.plunge, max_plunge, "feeds.plunge", "max_plunge")] {
                 if let Some(m) = max
                     && v > m
                 {
@@ -1333,7 +1462,21 @@ pub(super) fn resolve_for(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&To
             Feeds { cut: f.cut, plunge: f.plunge }
         }
         None => {
-            let base = match (tool.feed, tool.plunge_feed, pol.fallback) {
+            // A feed from the chip load follows the spindle speed as held.
+            let fed = tool.speeds(Some(rpm));
+            if fed.feed_derived
+                && let Some(f) = fed.feed
+            {
+                ag.note(format!(
+                    "{prefix}: tool {}'s feed {} mm/min is worked out from its chip load of {} mm × {} flutes at {} rev/min",
+                    tool.number,
+                    num(f.round()),
+                    num(tool.chip_load.unwrap_or(0.0)),
+                    tool.flutes,
+                    num(rpm)
+                ));
+            }
+            let base = match (fed.feed.map(|f| if fed.feed_derived { f.round() } else { f }), tool.plunge_feed, pol.fallback) {
                 (Some(cut), Some(plunge), _) => Feeds { cut, plunge },
                 (Some(cut), None, _) => Feeds { cut, plunge: cut },
                 (None, _, Some(f)) => {
@@ -1353,16 +1496,21 @@ pub(super) fn resolve_for(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&To
                 }
             };
             let mut f = Feeds { cut: base.cut * pol.cut_scale.unwrap_or(1.0), plunge: base.plunge * pol.plunge_scale.unwrap_or(1.0) };
-            if let Some(m) = pol.max_cut
+            let max_cut = max_cut.or_else(|| rates.and_then(|r| r.max_feed_mm_min).filter(|_| fed.feed_derived));
+            if let Some(m) = max_cut
                 && f.cut > m
             {
-                ag.note(format!("{prefix}: the cutting feed {} is held to the machine's {}", num(f.cut), num(m)));
+                ag.limit(format!("{prefix}: the cutting feed {} is held to the machine's {}", num(f.cut), num(m)));
                 f.cut = m;
             }
-            if let Some(m) = pol.max_plunge
+            // A plunge that follows a feed from the chip load (the tool gives no `plunge_feed`)
+            // goes down no faster than the machine's Z.
+            let max_plunge = max_plunge
+                .or_else(|| rates.and_then(|r| r.max_feed_z_mm_min.or(r.max_feed_mm_min)).filter(|_| fed.feed_derived && tool.plunge_feed.is_none()));
+            if let Some(m) = max_plunge
                 && f.plunge > m
             {
-                ag.note(format!("{prefix}: the plunge feed {} is held to the machine's {}", num(f.plunge), num(m)));
+                ag.limit(format!("{prefix}: the plunge feed {} is held to the machine's {}", num(f.plunge), num(m)));
                 f.plunge = m;
             }
             f
@@ -1391,9 +1539,9 @@ fn line_near(text: &str, machine: &Machine, tip: Vec3) -> Option<usize> {
     for b in &blocks {
         let (line, linear, rotary, tcp, cut) = match b {
             JointWords::Rapid { line, linear, rotary, tcp } => (*line, *linear, rotary, *tcp, false),
-            JointWords::Feed { line, linear, rotary, tcp, .. } | JointWords::Arc { line, linear, rotary, tcp, .. } => {
-                (*line, *linear, rotary, *tcp, true)
-            }
+            JointWords::Feed { line, linear, rotary, tcp, .. }
+            | JointWords::Arc { line, linear, rotary, tcp, .. }
+            | JointWords::PlaneArc { line, linear, rotary, tcp, .. } => (*line, *linear, rotary, *tcp, true),
             JointWords::Dwell { .. } => continue,
         };
         let p = if tcp { linear } else { forward(machine, &Joints { linear, rotary: rotary.clone() }).tip };

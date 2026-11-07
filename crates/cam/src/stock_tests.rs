@@ -24,6 +24,7 @@ fn params(tool: &Tool, angle: f64, zigzag: bool) -> FaceParams {
         overhang: default_face_overhang(tool),
         zigzag,
         stock: None,
+        lead_radius: None,
     }
 }
 
@@ -321,5 +322,81 @@ fn a_face_mill_faces_and_its_inserts_corners_set_the_flat() {
     for t in [chamfer, thread] {
         let e = face(&t, &params(&t, 0.0, true)).unwrap_err();
         assert!(e.to_string().contains("facing needs a face mill"), "{e}");
+    }
+}
+
+/// Fusion-style leads: each level enters down a quarter arc in the vertical plane of the passes
+/// from beside the stock, the passes of a level link round half circles outside the area, and
+/// the level ends up a quarter arc; still nothing left standing and nothing below the bottom.
+#[test]
+fn facing_with_vertical_leads_arcs_down_into_and_up_out_of_the_passes() {
+    let tool = face_mill(10.0);
+    for (angle, plane) in [(0.0, Some(ArcPlane::Zx)), (90f64.to_radians(), Some(ArcPlane::Yz)), (30f64.to_radians(), None)] {
+        let p = FaceParams { lead_radius: Some(0.3), ..params(&tool, angle, true) };
+        let path = face(&tool, &p).unwrap();
+        assert!(crate::check::verify(&path, &p.heights).is_ok());
+        let arcs: Vec<(Vec3, ArcPlane)> =
+            path.moves.iter().filter_map(|m| if let Move::PlaneArc { to, plane, .. } = m { Some((*to, *plane)) } else { None }).collect();
+        match plane {
+            // One in and one out a level: three levels.
+            Some(pl) => {
+                assert_eq!(arcs.len(), 6, "angle {angle}: {arcs:?}");
+                assert!(arcs.iter().all(|(_, p)| *p == pl));
+            }
+            None => assert!(arcs.is_empty()),
+        }
+        let half_circles = path.moves.iter().filter(|m| matches!(m, Move::Arc { .. })).count();
+        let r = tool.radius();
+        for z in [-0.5, -1.0, -1.5] {
+            let cuts = cuts_at(&path, z);
+            for i in 0..=100 {
+                for j in 0..=100 {
+                    let q = Vec2::new(-25.0 + 0.5 * i as f64, -25.0 + 0.5 * j as f64);
+                    let d = cuts.iter().map(|&(a, b)| dist_to_segment(q, a, b)).fold(f64::INFINITY, f64::min);
+                    assert!(d <= r - 1e-6, "angle {angle}: {q:?} is {d} from the passes at {z}");
+                }
+            }
+        }
+        assert!(half_circles > 0, "the passes link round half circles");
+        // Every descent and every link is outside the area with the cutter clear of it.
+        let mut pos: Option<Vec3> = None;
+        for m in &path.moves {
+            let to = m.target().unwrap();
+            if pos.is_some_and(|q| to.z < q.z - 1e-9) || matches!(m, Move::Arc { .. }) {
+                let gap = dist_to_square(Vec2::new(to.x, to.y), 25.0);
+                assert!(gap >= r + FACE_LEAD - 1e-6, "angle {angle}: {m:?} is {gap} from the stock");
+            }
+            pos = Some(to);
+        }
+        assert!(path.moves.iter().filter_map(Move::target).all(|q| q.z >= -1.5 - 1e-9));
+    }
+    // The first descent ends the lead's radius above the first level, the lead's radius behind
+    // the pass's start; the arc ends at the start, at depth.
+    let p = FaceParams { lead_radius: Some(0.3), ..params(&tool, 0.0, true) };
+    let path = face(&tool, &p).unwrap();
+    let k = path.moves.iter().position(|m| matches!(m, Move::PlaneArc { .. })).unwrap();
+    let before = path.moves[k - 1].target().unwrap();
+    let Move::PlaneArc { to, center, .. } = path.moves[k] else { panic!() };
+    close(before.z, -0.5 + 0.3, 1e-12);
+    close(to.z, -0.5, 1e-12);
+    close(to.x - before.x, 0.3, 1e-12);
+    close(center.z, -0.2, 1e-12);
+    // Hostile radii are refused.
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e9] {
+        assert!(face(&tool, &FaceParams { lead_radius: Some(bad), ..params(&tool, 0.0, true) }).is_err(), "{bad}");
+    }
+    // A lead that starts above the clearance height: the tool goes up to its start, and every
+    // arc starts where the tool is, its radius from its centre.
+    for zigzag in [true, false] {
+        let p = FaceParams { lead_radius: Some(20.0), ..params(&tool, 0.0, zigzag) };
+        let path = face(&tool, &p).unwrap();
+        assert!(crate::check::verify(&path, &p.heights).is_ok());
+        let mut pos: Option<Vec3> = None;
+        for m in &path.moves {
+            if let (Some(from), Move::PlaneArc { to, center, plane, ccw, .. }) = (pos, *m) {
+                close(crate::path::PlaneArc { from, to, center, plane, ccw }.radius(), 20.0, 1e-9);
+            }
+            pos = m.target().or(pos);
+        }
     }
 }

@@ -247,8 +247,9 @@ pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
 
-/// The stock the simulation left, written to `out` as a binary STL file.
+/// The stock the simulation left, written to `out` as a binary STL file (export: the stock's
+/// display mesh, never a decision).
 fn export_stock(out: &str, report: &SimReport) -> Result<()> {
     let mesh = report.stock.mesh(STL_SIDE);
-    solidcraft_io::vfs::write(out, &solidcraft_io::stl_binary(&[mesh], "stock")).map_err(|e| EngineError::Other(format!("{out}: {e}")))
+    super::write_file(out, &solidcraft_io::stl_binary(&[mesh], "stock")).map_err(|e| EngineError::Other(format!("{out}: {e}")))
 }

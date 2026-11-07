@@ -29,7 +29,7 @@ use solidcraft_geom::prelude::*;
 use crate::gcode::{number, words};
 use crate::gcode5::{JointWords, parse5};
 use crate::kinematics::AxisLetter;
-use crate::path::{Move, arc_sweep};
+use crate::path::{ArcPlane, Move};
 use crate::post::Post;
 use crate::{Result, invalid};
 
@@ -219,6 +219,10 @@ pub struct MachineTime {
     pub span_mm: [f64; 3],
     /// What the controller will do differently from what is written.
     pub warnings: Vec<String>,
+    /// Of those, where the program asks for more than the machine's spindle range or top feeds
+    /// allow (a setup sheet states these first).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<String>,
 }
 
 /// Where the axes are after a block (mm, radians).
@@ -237,6 +241,21 @@ fn turn_deg(from: &[f64], to: &[f64]) -> f64 {
 fn axis_minutes(d: Vec3, turn: f64, xy: Option<f64>, z: Option<f64>, a: Option<f64>) -> f64 {
     let per = |dist: f64, rate: Option<f64>| rate.map_or(0.0, |r| dist / r);
     per(d.x.abs(), xy).max(per(d.y.abs(), xy)).max(per(d.z.abs(), z)).max(per(turn, a))
+}
+
+/// For an arc in `plane` that moves `d` end to end: the rate of the axes it turns round with
+/// (each in turn moves as fast as the tool does: the slower of the plane's two), how far it
+/// goes along the plane's normal, and that axis's rate.
+fn arc_rates(plane: ArcPlane, d: Vec3, xy: Option<f64>, z: Option<f64>) -> (Option<f64>, f64, Option<f64>) {
+    let slower = match (xy, z) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    match plane {
+        ArcPlane::Xy => (xy, d.z.abs(), z),
+        ArcPlane::Zx => (slower, d.y.abs(), xy),
+        ArcPlane::Yz => (slower, d.x.abs(), xy),
+    }
 }
 
 fn peak(slot: &mut Option<(usize, f64)>, line: usize, v: f64) {
@@ -270,7 +289,8 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
             }
             JointWords::Rapid { line, linear, rotary, .. }
             | JointWords::Feed { line, linear, rotary, .. }
-            | JointWords::Arc { line, linear, rotary, .. } => (*line, *linear, rotary),
+            | JointWords::Arc { line, linear, rotary, .. }
+            | JointWords::PlaneArc { line, linear, rotary, .. } => (*line, *linear, rotary),
         };
         for (k, v) in [linear.x, linear.y, linear.z].into_iter().enumerate() {
             if let (Some(lo), Some(hi)) = (low.get_mut(k), high.get_mut(k)) {
@@ -325,10 +345,10 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
                     }
                 }
             }
-            JointWords::Arc { center, ccw, f, mm_per_unit, .. } => {
-                let r = (from.linear.x - center.x).hypot(from.linear.y - center.y);
-                let across = r * arc_sweep(from.linear, linear, *center, *ccw).abs();
-                let len = across.hypot(d.z);
+            JointWords::Arc { f, mm_per_unit, .. } | JointWords::PlaneArc { f, mm_per_unit, .. } => {
+                let Some(arc) = w.arc_from(from.linear) else { continue };
+                let across = arc.radius() * arc.sweep().abs();
+                let len = arc.length();
                 let nominal = len / (f * mm_per_unit);
                 if !(nominal.is_finite() && nominal > 0.0) {
                     continue;
@@ -336,7 +356,8 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
                 peak(&mut t.peak_feed_mm_min, line, len / nominal);
                 // Round an arc each linear axis in turn moves as fast as the tool does.
                 let per = |dist: f64, rate: Option<f64>| rate.map_or(0.0, |r| dist / r);
-                let run = nominal.max(per(across, xy)).max(per(d.z.abs(), z));
+                let (round, along, normal) = arc_rates(arc.plane, d, xy, z);
+                let run = nominal.max(per(across, round)).max(per(along, normal));
                 t.written_cut_minutes += nominal;
                 t.cut_minutes += run;
                 if run > nominal * (1.0 + SLOWED) {
@@ -390,35 +411,41 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
     if t.rotary_over > 0
         && let (Some(max), Some((l, p)), Some(first)) = (a, t.peak_rotary_deg_min, first_rotary_over)
     {
-        t.warnings.push(format!(
+        let w = format!(
             "{} cutting blocks (the first at line {first}) ask {rotary} to turn faster than its {}°/min (up to {}°/min at line {l}): \
              the controller slows them, so they take longer than written and cut at a lower feed",
             t.rotary_over,
             fmt(max),
             fmt(p)
-        ));
+        );
+        t.limits.push(w.clone());
+        t.warnings.push(w);
     }
     if t.feed_over > 0
         && let Some(first) = first_feed_over
     {
         let peak = worst_feed_over.map_or(String::new(), |(l, p)| format!(" (up to {} mm/min at line {l})", fmt(p)));
-        t.warnings.push(format!(
+        let w = format!(
             "{} cutting blocks (the first at line {first}) ask a linear axis for more than its top feed{peak}: the controller \
              slows them, so they take longer than written",
             t.feed_over
-        ));
+        );
+        t.limits.push(w.clone());
+        t.warnings.push(w);
     }
     if untimed_turns > 0 {
         t.warnings.push(format!("{untimed_turns} rapids turn {rotary}, which is not timed: the machine's rates give no `rapid_a_deg_min`"));
     }
     if let (Some([lo, hi]), Some(&(l, s))) = (rates.spindle_rpm, t.spindle_out_of_range.first()) {
-        t.warnings.push(format!(
+        let w = format!(
             "{out_of_range} spindle speeds are outside the machine's {}-{} rpm (S{} at line {l}): the controller runs them at the \
              nearest end of its range",
             fmt(lo),
             fmt(hi),
             fmt(s)
-        ));
+        );
+        t.limits.push(w.clone());
+        t.warnings.push(w);
     }
     if let Some(travel) = rates.travel_mm {
         for ((axis, span), limit) in ['X', 'Y', 'Z'].into_iter().zip(t.span_mm).zip(travel) {
@@ -536,7 +563,8 @@ pub fn block_times(text: &str, letters: &[AxisLetter], rates: &MachineRates, dwe
             }
             JointWords::Rapid { line, linear, rotary, .. }
             | JointWords::Feed { line, linear, rotary, .. }
-            | JointWords::Arc { line, linear, rotary, .. } => (*line, *linear, rotary),
+            | JointWords::Arc { line, linear, rotary, .. }
+            | JointWords::PlaneArc { line, linear, rotary, .. } => (*line, *linear, rotary),
         };
         out.lines.push(line);
         let Some(from) = at.replace(At { linear, rotary: rotary.clone() }) else {
@@ -565,20 +593,16 @@ pub fn block_times(text: &str, letters: &[AxisLetter], rates: &MachineRates, dwe
                 let m = if nominal.is_finite() && nominal > 0.0 { nominal.max(axis_minutes(d, turn, xy, z, a)) } else { 0.0 };
                 (m, if len > 1e-12 { len } else { turn }, dir, dir, false)
             }
-            JointWords::Arc { center, ccw, f, mm_per_unit, .. } => {
-                let r = (from.linear.x - center.x).hypot(from.linear.y - center.y);
-                let across = r * arc_sweep(from.linear, linear, *center, *ccw).abs();
-                let len = across.hypot(d.z);
+            JointWords::Arc { f, mm_per_unit, .. } | JointWords::PlaneArc { f, mm_per_unit, .. } => {
+                let Some(arc) = w.arc_from(from.linear) else { continue };
+                let across = arc.radius() * arc.sweep().abs();
+                let len = arc.length();
                 let nominal = len / (f * mm_per_unit);
                 let per = |dist: f64, rate: Option<f64>| rate.map_or(0.0, |r| dist / r);
-                let m = if nominal.is_finite() && nominal > 0.0 { nominal.max(per(across, xy)).max(per(d.z.abs(), z)) } else { 0.0 };
-                // The tangents at the ends: the radius turned a quarter the way the arc runs.
-                let tangent = |p: Vec3| {
-                    let rad = Vec3::new(p.x - center.x, p.y - center.y, 0.0);
-                    let t = if *ccw { Vec3::new(-rad.y, rad.x, 0.0) } else { Vec3::new(rad.y, -rad.x, 0.0) };
-                    t.normalized().unwrap_or(dir)
-                };
-                (m, len, tangent(from.linear), tangent(linear), false)
+                let (round, along, normal) = arc_rates(arc.plane, d, xy, z);
+                let m = if nominal.is_finite() && nominal > 0.0 { nominal.max(per(across, round)).max(per(along, normal)) } else { 0.0 };
+                // The tangents at the ends.
+                (m, len, arc.tangent(0.0).unwrap_or(dir), arc.tangent(1.0).unwrap_or(dir), false)
             }
             JointWords::Dwell { .. } => (0.0, 0.0, dir, dir, false),
         };
@@ -590,8 +614,8 @@ pub fn block_times(text: &str, letters: &[AxisLetter], rates: &MachineRates, dwe
             (true, None) => f64::INFINITY,
         };
         let mut speed = if seconds > 1e-12 { length / seconds } else { 0.0 };
-        if let JointWords::Arc { center, .. } = w {
-            let r = (from.linear.x - center.x).hypot(from.linear.y - center.y);
+        if let Some(arc) = w.arc_from(from.linear) {
+            let r = arc.radius();
             if r > 1e-9 && accel.is_finite() {
                 speed = speed.min((accel * r).sqrt());
             }

@@ -255,6 +255,10 @@ pub fn limit_descents(path: &mut Toolpath, plunge: f64, cut: f64, decimals: u8, 
                     let r = flat(a).dist(*center);
                     Some(((r * arc_sweep(a, b, *center, *ccw)).hypot(b.z - a.z), b, feed))
                 }
+                Move::PlaneArc { to, center, plane, ccw, feed } => {
+                    let b = at(*to);
+                    Some((crate::path::PlaneArc { from: a, to: b, center: *center, plane: *plane, ccw: *ccw }.length(), b, feed))
+                }
                 _ => None,
             };
             let Some((len, b, feed)) = cut_move else {
