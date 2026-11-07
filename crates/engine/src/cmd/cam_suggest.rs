@@ -729,7 +729,7 @@ fn operations(
         // stay above the floor too), the largest whose radius fits the inside corners, else the
         // smallest that fits; one that does not reach only where none does.
         let reaches = |t: &&Pick| {
-            let shank_clear = t.tool.shank_diameter.is_none_or(|d| d <= t.tool.diameter + 1e-9) || t.tool.flute_length >= pk.depth;
+            let shank_clear = t.tool.shank_diameter.is_none_or(|d| d <= t.tool.diameter + 1e-9) || t.tool.flute_length >= pk.depth + 0.5;
             shank_clear && t.tool.stickout.unwrap_or(t.tool.flute_length) >= pk.depth + 1.0
         };
         let in_corner = |t: &&Pick| t.tool.radius() <= corner + 1e-9;
