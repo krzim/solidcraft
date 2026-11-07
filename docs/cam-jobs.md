@@ -66,8 +66,10 @@ The command never writes a program that fails one of these unless `allow_unsafe`
 - **Travel.** With a machine whose JSON has `linear_limits`, every position is within them.
 - **Below the stock.** With a `box` stock on a machine without rotaries, no operation cuts
   below the stock's bottom (by more than the tolerance): what holds the stock is there
-  (parallels, the vise's floor, the table). A failure names the operation, how deep it goes and
-  the fix (raise its bottom, or give a stock that reaches as deep).
+  (parallels, the vise's floor, the table). Where `fixtures` reach below the stock (the
+  parallels it stands on), a cut may go on down to the lowest of them, as every cut is checked
+  against them for gouges. A failure names the operation, how deep it goes and the fix (raise
+  its bottom, give a stock that reaches as deep, or give what the stock stands on as fixtures).
 - **Operation checks** that are part of planning, each refusing the job with a message that
   names the operation: a drill's rapid down to the R height over the part round a hole (see
   [Drilling](#drilling)), a face down into the stock or below it (see
