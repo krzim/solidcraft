@@ -128,6 +128,23 @@ fn reply_findings(reply: &CamJobReply, origin: [f64; 3]) -> Vec<Finding> {
             });
         }
     }
+    // Picks found by their position or by a name worked out from the shape, and a work zero
+    // that no longer matches the way it was set: each to check.
+    for p in reply.picks_resolved.iter().filter(|p| p.by != "lost" || p.op.is_none()) {
+        let Some(note) = &p.note else { continue };
+        let (check, message) = match &p.op {
+            Some(o) => ("picks", format!("pick {} of `{}` {note}", p.pick + 1, o.name)),
+            None => ("work_zero", note.clone()),
+        };
+        out.push(Finding {
+            severity: "warning".into(),
+            check: check.into(),
+            op: p.op.clone(),
+            message,
+            fix: if p.op.is_some() { "look at the pick in the view; pick it again if it is not the face meant".into() } else { String::new() },
+            ..Finding::default()
+        });
+    }
     if let Some(sim) = &reply.simulation {
         let sim = serde_json::to_value(sim).unwrap_or(Value::Null);
         for (key, severity) in [("failures", "error"), ("warnings", "warning")] {

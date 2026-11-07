@@ -2033,6 +2033,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         param_warnings: Vec::new(),
         failure_details: details,
         op_of,
+        picks_resolved: loaded.picks.clone(),
         ..CamJobReply::default()
     };
     agent.finish(&mut reply);
@@ -2455,6 +2456,10 @@ pub(crate) mod job_edit;
 pub(super) mod job_plan;
 #[path = "cam_leads.rs"]
 mod leads;
+#[path = "cam_op_defaults.rs"]
+pub(super) mod op_defaults;
+#[path = "cam_picks.rs"]
+pub(super) mod picks;
 #[path = "cam_image.rs"]
 pub(super) mod pictures;
 #[path = "cam_rates.rs"]

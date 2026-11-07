@@ -1095,7 +1095,7 @@ takes it on from there. Nothing of it is saved in the design.
 | `cam.job.get` | `job?`. Replies whether the file changed outside (`none`, `changed`, `gone`), the undo and redo steps, whether the last Generate is current, and a summary. |
 | `cam.job.edit` | `set?: {path: value}`, `unset?: [path]`: job keys, dotted paths into objects (`stock.box.max`). |
 | `cam.job.undo`, `cam.job.redo` | The job's own history (up to 200 steps), apart from the design's. |
-| `cam.op.add` | `op: {type, ...}`, `at?`, `a_deg?`. Keys left out stay out; a `tool` left out is `{}` (the job's best tool for it); keys the type needs get starting values. |
+| `cam.op.add` | `op: {type, ...}`, `at?`, `a_deg?`, `picks?` or `from_selection?` (its geometry, see [Picks](#picks)). Keys left out stay out; a `tool` left out is `{}` (the job's best tool for it); keys the type needs get starting values (heights none with picks: the picks give them). Picks on another side of a 4th-axis part turn A there (`indexed`), unless `a_deg` says otherwise. |
 | `cam.op.edit` | `op` (index or name), `set?`, `unset?`, `rename?`, `a_deg?`: one angle wraps the operation in `indexed` (0 unwraps it), several in `indexed_pattern`, `{count, start_deg?}` too. Keys of a wrapped operation are its inner operation's. |
 | `cam.op.remove`, `cam.op.move`, `cam.op.duplicate`, `cam.op.enable` | By index or name. `enabled: false` keeps an operation in the job, neither planned nor written; on removes the key. |
 | `cam.library.list` | `folder?` (default: found above the job's folder). The profiles, posts, tool libraries (with the tools this build leaves out), machines, workholdings and machine models of a library folder. |
@@ -1103,6 +1103,10 @@ takes it on from there. Nothing of it is saved in the design.
 | `cam.findings`, `cam.finding.go` | The last Generate's findings; going to one selects its operation in the window and frames its place. |
 | `cam.post` | `output?` (default: the job file's name with the post's extension, beside it), `setup_sheet?`, `preview?`, `allow_unsafe?`, `simulate?`. Plans the job and design as they are now (reusing the last plan when nothing changed), so a program is never written from stale results. |
 | `view.manufacture_stage` | `setup`, `operations`, `check` or `program`. |
+| `cam.op.defaults` | `op` (index or name) or `draft: {type, …}`, `plan?` (default true). Every key the operation's type has, with the value it runs with and where that comes from: `given` (in the job), `tool`, `cutting_data`, `profile`, `model`, `stock`, `feature`, `pick` or `rule` (the schema's own "Default:" words); the tool it cuts with and why, the job's tools with why each does not fit, and how its picks were found. Changes nothing. |
+| `cam.op.suggest` | `replace?`, `stock_top?`. The operations `cam.suggest` proposes for the part, with the job's machine and tools, added as one undo step, their geometry as picks. |
+| `cam.picks.resolve` | `picks` or `from_selection`, `for?`. What each pick is (`reads`: "pocket 16 x 10 mm, 5 deep, corners R4"), how it was found, and the operations that suit them, best first, each with the job's tool it would take. |
+| `cam.setup.zero` | One of `at: [x,y,z]`, `pick`, `stock: {x, y, z}`, `axis` + `x_end?`, or `refresh: true`; `keep_ref?` (default true). Sets work zero as one undo step and keeps how it was set in `origin_from`; a box or bar stock (work coordinates) is moved so it stays where it was on the part. |
 
 Every edit is one step of the job's history, and is read with the job's schema before it is
 kept: an edit that would not read is refused and changes nothing, so a person cannot save a job
@@ -1120,6 +1124,61 @@ Keys the open job adds to the job file, each written only when used:
 - `workholding` on the job: the workholding written into the job, instead of `workholding_path`.
 - `top` and `bottom` on `stock.around_part`: the material above and below the part, instead of
   `margin`'s Z.
+
+### Picks
+
+An operation can name its geometry by the design's persistent face and edge names instead of a
+sketch, a polygon or a feature id (which renumber when the model gains or loses a hole):
+
+```json
+"picks": [
+  {"body": "Bracket", "face": "F12:side:c3", "at": [10.0, -4.0, 7.5]},
+  {"body": "Bracket", "edge": "F2:top|F7:side:l4", "at": [-20.0, 15.0, 20.0]},
+  {"sketch": "Outline", "profile": 0}
+]
+```
+
+`face` and `edge` are the names `model.faces` and `model.edges` give; `at` is a point on the face
+or edge (design coordinates), where it is looked for when the name finds nothing. Each time the
+job is planned every pick is found again: by its name, else by the exact face its point lies on
+(the face's surface and exact extent, never the display mesh), and is `lost` when neither finds
+it. The reply's `picks_resolved` says how (`name`, `point` or `lost`) and which `cam.features` id
+it belongs to. A lost pick refuses the operation (a `picks` error finding); one found by its
+position, or by a name worked out from the shape rather than exact history, is a warning to
+check. The job as stored keeps the picks; what the planners read is worked out from them:
+
+| Operation | A pick means |
+| --- | --- |
+| `pocket`, `contour` | the feature the face is part of (a pocket's floor or wall, a hole, a face, an outline's top or side): `feature`; in an indexed pattern turned to other angles, its outline in its own frame |
+| `adaptive` | that feature's outline (`polygon`) and its top and bottom; a pocket with islands is refused (use `pocket`) |
+| `chamfer` | the outline of the pocket, hole or outline whose rim it breaks, inside or outside; a chamfer face gives the width |
+| `drill`, `bore`, `thread_mill` | the holes' centres (and diameters), top and bottom |
+| `face` | `bottom` at the face |
+| the 3D finishes and roughing | `boundary.rect` round the faces' exact extent, grown by the tool's radius; `bottom` at the lowest |
+| `rotary_finish`, `rotary_roughing` | `range` along X of the turned diameters |
+| `wrap`, `wrap_pocket`, `wrap_contour` | a sketch's curve or profiles, and a cylinder face's radius |
+
+Heights the picks give fill only the keys the job leaves out. Picks on another side of a 4th-axis
+part run the operation indexed there.
+
+Any height (`heights.clearance`, `retract`, `top`, `bottom`; a face operation's `bottom` and
+`top`) can follow the model: `{"from": <pick of a planar face square to the tool> | "stock_top" |
+"part_top" | "part_bottom", "offset": -0.1}`, worked out in the operation's frame each time it is
+planned.
+
+`origin_from` keeps how work zero was set: `{"pick": <pick>}` (a circular edge's centre, an edge's
+end nearest the pick, the point on a face, a round face's axis), `{"stock": {"x": "low" |
+"middle" | "high", "y": …, "z": "top" | "middle" | "bottom"}}`, or `{"axis": <cylinder face>,
+"x_end": "stock_low" | "stock_high" | <pick>}` (on a 4th axis). `origin` stays the numbers every
+reader uses; when the model or the stock moves what `origin_from` gives by more than the
+tolerance, Generate reports a `work_zero` warning and nothing moves until
+`cam.setup.zero {refresh: true}`.
+
+`cam.features {picks: true}` gives each feature as picks (`picks` by feature id), and
+`cam.suggest {as_picks: true}` writes its operations with `picks` instead of `feature`, so a
+suggested job follows the model.
+
+These keys are new: a build older than them refuses a job that uses them, naming the key.
 
 Edits made outside SolidCraft (an agent, an editor, git) are noticed by the file's time and
 size, and its bytes where there are no file times (the web). The Manufacture workspace looks

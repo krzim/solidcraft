@@ -329,7 +329,7 @@ fn every_path_of_an_indexed_pattern_is_drawn_as_its_own_block() {
     let mut keys: Vec<u64> = sc.blocks.iter().map(|b| b.key).collect();
     keys.sort_unstable();
     keys.dedup();
-    assert_eq!(keys.len(), 4, "one block per angle's path");
+    assert_eq!(keys.len(), 5, "one block per angle's path, and work zero's triad");
     // A new Generate takes the last finding's mark away.
     h.app.manufacture.mark = Some([1.0, 2.0, 3.0]);
     crate::manufacture_ui::generate_now(&mut h.app);

@@ -127,6 +127,11 @@ pub struct CamJob {
     /// work X through work zero. Default: the design's origin.
     #[serde(default)]
     pub origin: Option<[f64; 3]>,
+    /// How work zero was set (a pick, a place on the stock, a cylinder's axis), kept so a change
+    /// of the model or stock that moves it is reported; `origin` stays the numbers used.
+    /// Default: none (set by numbers).
+    #[serde(default)]
+    pub origin_from: Option<super::cam_picks::OriginFrom>,
     /// The bodies that make up the part, by name. Default: every visible body not in `fixtures`.
     #[serde(default)]
     pub bodies: Option<Vec<String>>,
@@ -209,12 +214,16 @@ pub enum MachineSpec {
 #[serde(deny_unknown_fields)]
 pub struct HeightsSpec {
     /// Where the tool travels between cuts.
+    #[schemars(with = "super::cam_picks::HeightValue")]
     pub clearance: f64,
     /// Where rapid motion towards the material stops and feed begins.
+    #[schemars(with = "super::cam_picks::HeightValue")]
     pub retract: f64,
     /// Top of the material to cut.
+    #[schemars(with = "super::cam_picks::HeightValue")]
     pub top: f64,
     /// Final depth (for a parallel finish: the floor the tool never goes below).
+    #[schemars(with = "super::cam_picks::HeightValue")]
     pub bottom: f64,
 }
 
@@ -317,6 +326,12 @@ macro_rules! operation {
             /// still run. Default: true.
             #[serde(default)]
             pub gouge_check: Option<bool>,
+            /// The pieces of the design it works on, by their persistent names (faces, edges,
+            /// sketch profiles): found again each time the job is planned and read as its
+            /// geometry (a pocket, holes, an area), in place of `sketch`, `polygon` or `feature`.
+            /// Default: none.
+            #[serde(default)]
+            pub picks: Option<Vec<$crate::schema::cam_picks::Pick>>,
             $($(#[$fdoc])* pub $field: $ty,)*
         }
 
@@ -828,6 +843,9 @@ pub struct CamJobReply {
     /// The heights of operations that left some out, as worked out from the part.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_heights: Vec<DerivedHeights>,
+    /// How each operation's picks (and work zero's `origin_from`) were found again.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub picks_resolved: Vec<super::cam_picks::PickResolved>,
     /// The profile the job was read with (`profile_path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,

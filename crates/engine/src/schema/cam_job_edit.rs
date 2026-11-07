@@ -132,6 +132,13 @@ pub struct CamOpAddParams {
     /// Index it to this A angle, degrees (an `indexed` operation; 0: not indexed).
     #[serde(default)]
     pub a_deg: Option<f64>,
+    /// Its geometry: faces, edges or sketch pieces by their persistent names. A pick on another
+    /// side of a 4th-axis part turns A there (unless `a_deg` says otherwise). Default: none.
+    #[serde(default)]
+    pub picks: Option<Vec<super::cam_picks::Pick>>,
+    /// Its geometry: the faces and edges selected in the design (as `picks`). Default: false.
+    #[serde(default)]
+    pub from_selection: Option<bool>,
 }
 
 /// Change an operation of the open job (one undoable step).

@@ -352,6 +352,8 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(cam::VIEW_COMMANDS.iter());
     v.extend(cam::job_edit::COMMANDS.iter());
     v.extend(cam::job_plan::COMMANDS.iter());
+    v.extend(cam::picks::COMMANDS.iter());
+    v.extend(cam::op_defaults::COMMANDS.iter());
     v.extend(mass_properties::COMMANDS.iter());
     v.extend(browser::COMMANDS.iter());
     v.extend(delete::COMMANDS.iter());

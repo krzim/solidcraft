@@ -29,12 +29,23 @@ fn shown(app: &SolveApp) -> bool {
 /// What the layer looks like, for the scene's key (0: nothing drawn).
 pub(crate) fn scene_key(app: &SolveApp) -> u64 {
     let mark = app.manufacture.mark.map(|m| m.map(f64::to_bits));
+    let zero = zero(app).filter(|_| crate::manufacture_workspace::active(app)).map(|o| o.map(f64::to_bits));
     if !shown(app) {
-        return mark.map_or(0, |m| hash_of(("mark", m)));
+        return if mark.is_none() && zero.is_none() { 0 } else { hash_of(("mark", mark, zero)) };
     }
     let Some(g) = app.session.cam_job.as_deref().and_then(|j| j.generated.as_ref()) else { return 0 };
     let points: usize = g.paths.iter().map(|p| p.points.len()).sum();
-    hash_of(("paths", g.revision, g.model_revision, g.paths.len(), points, app.manufacture.selected, show_key(app.manufacture.show_paths), mark))
+    hash_of((
+        "paths",
+        g.revision,
+        g.model_revision,
+        g.paths.len(),
+        points,
+        app.manufacture.selected,
+        show_key(app.manufacture.show_paths),
+        mark,
+        zero,
+    ))
 }
 
 fn show_key(s: ShowPaths) -> u8 {
@@ -76,6 +87,7 @@ pub(crate) fn draw(app: &SolveApp, sc: &mut GpuScene) {
         bb.marker([m[0] as f32, m[1] as f32, m[2] as f32], c, 10.0, false);
         sc.blocks.push(SceneBlock { key: hash_of(("mark-block", m.map(f64::to_bits))), bytes: bb.freeze() });
     }
+    triad(app, sc, &t);
     if !shown(app) {
         return;
     }
@@ -111,6 +123,47 @@ pub(crate) fn draw(app: &SolveApp, sc: &mut GpuScene) {
             sc.blocks.push(SceneBlock { key: hash_of(("block", g.revision, n, path.op, k, bright)), bytes: bb.freeze() });
         }
     }
+}
+
+/// Work zero: a triad in the axis colours, and the A axis as a dash-dot line on a 4th axis.
+fn triad(app: &SolveApp, sc: &mut GpuScene, t: &Tokens) {
+    if !crate::manufacture_workspace::active(app) {
+        return;
+    }
+    let Some(o) = zero(app) else { return };
+    let size = ({
+        let b = crate::viewport::scene_bounds(app);
+        let e = b.max - b.min;
+        let d = (e.x * e.x + e.y * e.y + e.z * e.z).sqrt();
+        if d.is_finite() && d > 0.0 { d } else { 50.0 }
+    } * 0.12)
+        .clamp(5.0, 200.0) as f32;
+    let mut bb = BlockBuilder::default();
+    let p = [o[0] as f32, o[1] as f32, o[2] as f32];
+    for (k, colour) in [t.axis_x, t.axis_y, t.axis_z].into_iter().enumerate() {
+        let mut q = p;
+        q[k] += size;
+        let c = sc.color(c4(colour));
+        bb.line(p, q, c, 2.0);
+    }
+    bb.marker(p, sc.color(c4(t.accent)), 7.0, false);
+    if crate::manufacture_op::four_axis(app) {
+        let c = sc.color(c4(t.axis_x.gamma_multiply(0.7)));
+        let a = Vec3::new(o[0] - f64::from(size) * 6.0, o[1], o[2]);
+        let b = Vec3::new(o[0] + f64::from(size) * 6.0, o[1], o[2]);
+        let s = f64::from(size);
+        for (x, y) in crate::viewport::dashes(&[a, b], &[s * 0.5, s * 0.15, s * 0.1, s * 0.15]) {
+            bb.line(f3(x), f3(y), c, 1.0);
+        }
+    }
+    sc.blocks.push(SceneBlock { key: hash_of(("triad", o.map(f64::to_bits), size.to_bits())), bytes: bb.freeze() });
+}
+
+/// Work zero of the open job (design coordinates).
+fn zero(app: &SolveApp) -> Option<[f64; 3]> {
+    let j = app.session.cam_job.as_deref()?;
+    let o = j.value.get("origin").and_then(|o| serde_json::from_value::<[f64; 3]>(o.clone()).ok()).unwrap_or([0.0; 3]);
+    o.iter().all(|x| x.is_finite()).then_some(o)
 }
 
 fn v3(p: [f32; 3]) -> Vec3 {

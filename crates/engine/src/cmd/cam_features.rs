@@ -84,7 +84,19 @@ fn features(s: &mut Session, p: &Value) -> Result<Value> {
         AxisSpec::A => Machine::four_axis_a(),
     };
     let names = part_names(cmd, s, params.bodies.as_deref(), &[])?;
-    let set = recognize(cmd, s, &names, v3(origin), axis, tol, &machine)?;
+    let mut set = recognize(cmd, s, &names, v3(origin), axis, tol, &machine)?;
+    if params.picks.unwrap_or(false) {
+        let st = s.world_state()?;
+        let ids: Vec<String> = set.geo.keys().cloned().collect();
+        let mut picks = BTreeMap::new();
+        for id in ids {
+            let list = super::picks::feature_picks(&set, &st, &id);
+            if !list.is_empty() {
+                picks.insert(id, list);
+            }
+        }
+        set.reply.picks = picks;
+    }
     serde_json::to_value(&set.reply).map_err(|e| EngineError::Other(e.to_string()))
 }
 
@@ -298,7 +310,7 @@ fn fixture_tops(s: &Session, fixtures: &[String], origin: Vec3, setups: &mut [Se
 /// 3 mm above the material (the setup's top or the `top` given, the higher), the clearance 10 mm
 /// above it, 5 mm above the retract given, 5 mm past the swing on a 4th axis and 5 mm above the
 /// fixtures. Out of order, the refusal names each height and where it came from.
-fn feature_heights(setup: &Setup, top: f64, bottom: f64, given: Option<&HeightsPartial>) -> std::result::Result<Heights, String> {
+pub(super) fn feature_heights(setup: &Setup, top: f64, bottom: f64, given: Option<&HeightsPartial>) -> std::result::Result<Heights, String> {
     let g = given.copied().unwrap_or_default();
     let top_v = g.top.unwrap_or(top);
     let bottom_v = g.bottom.unwrap_or(bottom);
@@ -933,6 +945,11 @@ fn seg_point(s: &Seg2, t: f64) -> Vec2 {
 
 /// The points of a loop of segments, each segment's start and the points within `tol` along
 /// its curve (the loop's last point, its first again, left out).
+/// Points along `l` within `tol` of it (its outline as a polygon).
+pub(crate) fn sample_loop(l: &Loop2, tol: f64) -> Vec<Vec2> {
+    loop_points(&l.segs, tol.max(1e-4))
+}
+
 fn loop_points(segs: &[Seg2], tol: f64) -> Vec<Vec2> {
     let mut out = Vec::new();
     for s in segs {
@@ -1338,6 +1355,116 @@ pub(crate) fn recognize(cmd: &str, s: &Session, names: &[String], origin: Vec3, 
         })
         .collect();
     Ok(FeatureSet { reply, setups, geo: found.geo.into_iter().collect() })
+}
+
+/// Exact facts about the faces and edges of one body, for picks (`cam_picks`): what each face is,
+/// where it lies, which faces an edge bounds. Coordinates are the design's.
+pub(crate) struct BodyFaces<'a> {
+    topo: Topo<'a>,
+}
+
+impl<'a> BodyFaces<'a> {
+    pub fn new(name: &str, body: &'a Body) -> BodyFaces<'a> {
+        BodyFaces { topo: Topo::new(name, body, Vec3::ZERO) }
+    }
+
+    pub fn face_count(&self) -> usize {
+        self.topo.record.faces.len()
+    }
+
+    /// Face `f`'s analytic surface.
+    pub fn surface(&self, f: usize) -> Option<FaceSurface> {
+        self.topo.surface(f).copied()
+    }
+
+    /// `planar`, `cylinder`, `cone`, `sphere`, `torus` or `other`.
+    pub fn kind(&self, f: usize) -> &'static str {
+        match self.topo.surface(f) {
+            Some(FaceSurface::Plane { .. }) => "planar",
+            Some(FaceSurface::Cylinder { .. }) => "cylinder",
+            Some(FaceSurface::Cone { .. }) => "cone",
+            Some(FaceSurface::Sphere { .. }) => "sphere",
+            Some(FaceSurface::Torus { .. }) => "torus",
+            None => "other",
+        }
+    }
+
+    /// Face `f`'s exact extent along the axes of `frame` (work coordinates `origin` away from the
+    /// design's), in the frame's coordinates: [[low x, low y, low z], [high x, high y, high z]].
+    pub fn extent(&self, f: usize, origin: Vec3, frame: &Frame) -> Option<[[f64; 3]; 2]> {
+        let mut lo = [0.0; 3];
+        let mut hi = [0.0; 3];
+        for (k, dir) in [frame.x, frame.y, frame.z].into_iter().enumerate() {
+            let (a, b) = self.topo.face_range(f, dir, true)?;
+            let shift = (origin + frame.origin).dot(dir);
+            lo[k] = a - shift;
+            hi[k] = b - shift;
+        }
+        Some([lo, hi])
+    }
+
+    /// The faces a design point lies on: within `tol` of the face's surface and inside its exact
+    /// extent (grown by `tol`), nearest the middle of its extent first.
+    pub fn faces_at(&self, p: Vec3, tol: f64) -> Vec<usize> {
+        let mut hits: Vec<(f64, usize)> = Vec::new();
+        for f in 0..self.face_count() {
+            let Some(surface) = self.topo.surface(f) else { continue };
+            let Some(on) = surface.nearest(p) else { continue };
+            if on.dist(p) > tol {
+                continue;
+            }
+            let Some([lo, hi]) = self.extent(f, Vec3::ZERO, &Frame::IDENTITY) else { continue };
+            let q = [p.x, p.y, p.z];
+            if (0..3).all(|k| q[k] >= lo[k] - tol && q[k] <= hi[k] + tol) {
+                let mid = Vec3::new((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5);
+                hits.push((mid.dist(p), f));
+            }
+        }
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        hits.into_iter().map(|(_, f)| f).collect()
+    }
+
+    /// A point on face `f`'s surface near the middle of its extent: where a pick of it is
+    /// looked for when its name finds nothing.
+    pub fn point_on(&self, f: usize) -> Option<Vec3> {
+        let [lo, hi] = self.extent(f, Vec3::ZERO, &Frame::IDENTITY)?;
+        let mid = Vec3::new((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5);
+        let s = self.topo.surface(f)?;
+        // On a round face's axis every direction is as near: step off it along X or Y.
+        s.nearest(mid).or_else(|| s.nearest(mid + Vec3::new(1e-3, 0.0, 0.0))).or_else(|| s.nearest(mid + Vec3::new(0.0, 1e-3, 0.0)))
+    }
+
+    /// The edges of face `f`'s loops.
+    pub fn face_edges(&self, f: usize) -> Vec<usize> {
+        self.topo.face_edges(f).collect()
+    }
+
+    /// The round wall face `f` is, or (a round hole's floor) the round wall round it.
+    pub fn round_wall(&self, f: usize) -> Option<usize> {
+        if matches!(self.topo.surface(f), Some(FaceSurface::Cylinder { .. })) {
+            return Some(f);
+        }
+        if !matches!(self.topo.surface(f), Some(FaceSurface::Plane { .. })) {
+            return None;
+        }
+        let edges = self.face_edges(f);
+        let [e] = edges.as_slice() else { return None };
+        self.edge_circle(*e)?;
+        self.edge_faces(*e).into_iter().find(|g| *g != f && matches!(self.topo.surface(*g), Some(FaceSurface::Cylinder { .. })))
+    }
+
+    /// The faces edge `e` bounds.
+    pub fn edge_faces(&self, e: usize) -> Vec<usize> {
+        self.topo.edge_faces.get(e).cloned().unwrap_or_default()
+    }
+
+    /// Edge `e`'s circle, when it is one (design coordinates).
+    pub fn edge_circle(&self, e: usize) -> Option<EdgeCircle> {
+        match self.topo.shapes.get(e)? {
+            EdgeShape::Circle(c) => Some(*c),
+            EdgeShape::Hull(_) => None,
+        }
+    }
 }
 
 /// A quantised coordinate for ordering features.

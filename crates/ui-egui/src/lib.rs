@@ -112,6 +112,8 @@ mod loft_rails_dialog_tests;
 mod look_at_tests;
 #[cfg(test)]
 mod manage_dialogs_tests;
+mod manufacture_op;
+mod manufacture_op_fields;
 mod manufacture_plan_layer;
 mod manufacture_ui;
 pub mod manufacture_workspace;

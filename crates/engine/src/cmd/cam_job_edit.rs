@@ -243,11 +243,20 @@ fn read_job(cmd: &str, path: &str) -> Result<(Value, Disk, usize)> {
     if !value.is_object() {
         return Err(bad(cmd, format!("{path}: a job is a JSON object")));
     }
-    let mut de = serde_json::Deserializer::from_str(text);
-    if let Err(e) = serde_path_to_error::deserialize::<_, CamJob>(&mut de) {
-        let at = format!("line {} column {}", e.inner().line(), e.inner().column());
-        let problem = job_problem(&value, &e.path().to_string(), &e.inner().to_string());
-        return Err(bad(cmd, format!("{path}: not a job (docs/cam-jobs.md), {at}: {problem}")));
+    if super::picks::has_refs(&value) {
+        // Picks and heights from faces are read without the model first.
+        let plain = super::picks::placeholders(&value).map_err(|e| bad(cmd, format!("{path}: not a job (docs/cam-jobs.md): {e}")))?;
+        if let Err(e) = serde_path_to_error::deserialize::<_, CamJob>(&plain) {
+            let problem = job_problem(&plain, &e.path().to_string(), &e.inner().to_string());
+            return Err(bad(cmd, format!("{path}: not a job (docs/cam-jobs.md): {problem}")));
+        }
+    } else {
+        let mut de = serde_json::Deserializer::from_str(text);
+        if let Err(e) = serde_path_to_error::deserialize::<_, CamJob>(&mut de) {
+            let at = format!("line {} column {}", e.inner().line(), e.inner().column());
+            let problem = job_problem(&value, &e.path().to_string(), &e.inner().to_string());
+            return Err(bad(cmd, format!("{path}: not a job (docs/cam-jobs.md), {at}: {problem}")));
+        }
     }
     check_job(cmd, &value)?;
     let disk = Disk { stamp: solidcraft_io::vfs::stamp(path), hash: cam_job_state::hash_bytes(&bytes) };
@@ -311,6 +320,13 @@ fn check_job(cmd: &str, value: &Value) -> Result<()> {
     if value.to_string().len() > cam_job_state::MAX_FILE_BYTES {
         return Err(bad(cmd, "the job would be larger than 16 MB"));
     }
+    let plain;
+    let value = if super::picks::has_refs(value) {
+        plain = super::picks::placeholders(value).map_err(|e| bad(cmd, format!("the job would not read, so nothing changed: {e}")))?;
+        &plain
+    } else {
+        value
+    };
     if let Err(e) = serde_path_to_error::deserialize::<_, CamJob>(value) {
         let problem = job_problem(value, &e.path().to_string(), &e.inner().to_string());
         return Err(bad(cmd, format!("the job would not read, so nothing changed: {problem}")));
@@ -319,7 +335,7 @@ fn check_job(cmd: &str, value: &Value) -> Result<()> {
 }
 
 /// Keep `next` as the open job, one undo step `label`, once it reads as a job.
-fn commit(s: &mut Session, cmd: &str, label: String, next: Value) -> Result<()> {
+pub(super) fn commit(s: &mut Session, cmd: &str, label: String, next: Value) -> Result<()> {
     check_job(cmd, &next)?;
     let open = need(s, cmd)?;
     if open.value != next {
@@ -578,7 +594,7 @@ fn stage(_s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The operation `sel` names in `ops`: its place. A name two operations have is refused.
-fn select(cmd: &str, ops: &[Value], sel: &OpSelect) -> Result<usize> {
+pub(super) fn select(cmd: &str, ops: &[Value], sel: &OpSelect) -> Result<usize> {
     match sel {
         OpSelect::Index(i) if *i < ops.len() => Ok(*i),
         OpSelect::Index(i) => Err(bad(cmd, format!("operation {i} is not in the job: it has {} (from 0)", ops.len()))),
@@ -618,14 +634,22 @@ pub fn type_label(ty: &str) -> &str {
     OP_TYPES.iter().find(|(t, _, _)| *t == ty).map_or(ty, |(_, label, _)| *label)
 }
 
+/// The starting heights of an operation that needs all four.
+const STARTING_HEIGHTS: [(&str, i32); 4] = [("clearance", 10), ("retract", 3), ("top", 0), ("bottom", -1)];
+
 /// Starting values for the keys `ty` cannot do without, where `op` leaves them out. Everything
-/// else stays out, so it takes its default.
+/// else stays out, so it takes its default. With picks, the heights (and a face's bottom) come
+/// from the picked geometry instead.
 fn starting_values(ty: &str, op: &mut Map<String, Value>) {
+    let picked = op.get("picks").is_some();
     let mut put = |k: &str, v: Value| {
+        if picked && matches!(k, "heights" | "bottom" | "width") {
+            return;
+        }
         op.entry(k.to_string()).or_insert(v);
     };
     put("tool", json!({}));
-    let heights = json!({"clearance": 10, "retract": 3, "top": 0, "bottom": -1});
+    let heights = Value::Object(STARTING_HEIGHTS.iter().map(|(k, v)| ((*k).to_string(), json!(v))).collect());
     match ty {
         "face" => put("bottom", json!(0)),
         "adaptive" | "adaptive_roughing" | "drill" | "bore" | "scallop" | "steep_shallow" | "pencil" => put("heights", heights),
@@ -735,15 +759,31 @@ fn op_reply(s: &Session, index: Option<usize>, name: String) -> Result<Value> {
 fn op_add(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.add";
     let params: CamOpAddParams = parse(cmd, p, "")?;
+    need(s, cmd)?;
+    let mut op = params.op;
+    let Some(ty) = op.get("type").and_then(Value::as_str).map(str::to_string) else {
+        return Err(bad(cmd, "`op` needs its `type` (face, pocket, contour, drill, …)"));
+    };
+    let picks = match (&params.picks, params.from_selection.unwrap_or(false)) {
+        (None, false) => None,
+        (p, sel) => Some(super::picks::picks_param(cmd, s, p.as_ref(), sel)?),
+    };
+    let mut a_deg = params.a_deg;
+    if let Some(picks) = &picks {
+        if super::picks::GEOMETRY_KEYS.iter().any(|k| op.contains_key(*k)) {
+            return Err(bad(cmd, "give the operation `picks` or its own geometry (sketch, polygon, feature…), not both"));
+        }
+        // Picks on another side turn A there (a pocket or contour on a feature turns itself).
+        if a_deg.is_none() && !matches!(ty.as_str(), "pocket" | "contour") {
+            a_deg = super::picks::picks_side(cmd, s, picks);
+        }
+        op.insert("picks".into(), json!(picks));
+    }
     let open = need(s, cmd)?;
     let mut ops = ops_of(&open.value);
     if ops.len() >= MAX_OPERATIONS {
         return Err(bad(cmd, format!("a job has at most {MAX_OPERATIONS} operations")));
     }
-    let mut op = params.op;
-    let Some(ty) = op.get("type").and_then(Value::as_str).map(str::to_string) else {
-        return Err(bad(cmd, "`op` needs its `type` (face, pocket, contour, drill, …)"));
-    };
     if ty == "indexed" || ty == "indexed_pattern" {
         if op.get("operation").is_none() {
             return Err(bad(cmd, format!("an `{ty}` operation holds its `operation`")));
@@ -769,7 +809,7 @@ fn op_add(s: &mut Session, p: &Value) -> Result<Value> {
     if at > ops.len() {
         return Err(bad(cmd, format!("`at` must be 0 to {}", ops.len())));
     }
-    let value = match params.a_deg {
+    let value = match a_deg {
         Some(a) if a != 0.0 => index_to(cmd, op, &json!(a))?,
         _ => Value::Object(op),
     };
@@ -791,6 +831,21 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
     // Edits go to the operation inside a wrapper; its name and on/off stay with it.
     let mut inner = Value::Object(unwrap_indexed(&ops[i]));
     apply_edits(cmd, &mut inner, params.set.as_ref(), params.unset.as_deref(), &["type", "operation"])?;
+    // New picks take the place of the geometry it had, and of the starting heights it was
+    // added with (the picks give heights of their own).
+    if let (Some(set), Value::Object(m)) = (&params.set, &mut inner)
+        && set.contains_key("picks")
+    {
+        for k in super::picks::GEOMETRY_KEYS {
+            if !set.contains_key(*k) {
+                m.remove(*k);
+            }
+        }
+        let starting = Value::Object(STARTING_HEIGHTS.iter().map(|(k, v)| ((*k).to_string(), json!(v))).collect());
+        if m.get("heights") == Some(&starting) && !set.contains_key("heights") {
+            m.remove("heights");
+        }
+    }
     let mut name = old_name.clone();
     if let Some(new) = &params.rename {
         check_name(cmd, "`rename`", new)?;

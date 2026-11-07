@@ -113,16 +113,20 @@ impl fmt::Display for ToolSpec {
 pub struct HeightsInput {
     /// Where the tool travels between cuts. Default: above the part and fixtures.
     #[serde(default)]
+    #[schemars(with = "Option<super::cam_picks::HeightValue>")]
     pub clearance: Option<f64>,
     /// Where rapid motion towards the material stops and feed begins. Default: just above `top`.
     #[serde(default)]
+    #[schemars(with = "Option<super::cam_picks::HeightValue>")]
     pub retract: Option<f64>,
     /// Top of the material to cut. Default: the part's top.
     #[serde(default)]
+    #[schemars(with = "Option<super::cam_picks::HeightValue>")]
     pub top: Option<f64>,
     /// Final depth (for a parallel finish: the floor the tool never goes below). Default: the
     /// lowest point of the region.
     #[serde(default)]
+    #[schemars(with = "Option<super::cam_picks::HeightValue>")]
     pub bottom: Option<f64>,
 }
 

@@ -14,10 +14,10 @@ fn run(s: &mut Session, id: &str, p: Value) -> Value {
 
 #[test]
 fn schemas_and_the_key_check_agree() {
-    assert_keys(input_schema_for::<CamFeaturesParams>(), &["axis", "bodies", "origin", "tolerance"]);
+    assert_keys(input_schema_for::<CamFeaturesParams>(), &["axis", "bodies", "origin", "picks", "tolerance"]);
     assert_keys(
         input_schema_for::<CamSuggestParams>(),
-        &["axis", "bodies", "check", "origin", "post", "profile_path", "stock_top", "tolerance", "tool_library_path", "tools"],
+        &["as_picks", "axis", "bodies", "check", "origin", "post", "profile_path", "stock_top", "tolerance", "tool_library_path", "tools"],
     );
 }
 
@@ -35,6 +35,7 @@ fn replies_match_the_output_schemas() {
     run(&mut s, "solid.cylinder", json!({"radius": 3, "height": 12, "base": [0, 0, -11], "operation": "cut"}));
     matches(output_schema_for::<CamFeaturesReply>(), &run(&mut s, "cam.features", json!({})));
     matches(output_schema_for::<CamFeaturesReply>(), &run(&mut s, "cam.features", json!({"axis": "a"})));
+    matches(output_schema_for::<CamFeaturesReply>(), &run(&mut s, "cam.features", json!({"picks": true})));
     let tools =
         json!([{"number": 1, "kind": "flat_endmill", "diameter": 4, "flute_length": 15, "spindle_rpm": 12000, "feed": 800, "plunge_feed": 200}]);
     matches(output_schema_for::<CamSuggestReply>(), &run(&mut s, "cam.suggest", json!({"tools": tools})));

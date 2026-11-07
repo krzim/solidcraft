@@ -39,6 +39,11 @@ pub struct CamFeaturesParams {
     /// `tolerance`). Default: 0.01.
     #[serde(default)]
     pub tolerance: Option<f64>,
+    /// Also give each feature as picks (its faces by their persistent names, `picks`), which an
+    /// operation can store in place of the feature's id and which follow model edits. Default:
+    /// false.
+    #[serde(default)]
+    pub picks: Option<bool>,
 }
 
 /// What `cam.features` returns. Every coordinate of a feature is in its setup's frame: work
@@ -73,6 +78,9 @@ pub struct CamFeaturesReply {
     pub turned: Vec<TurnedReport>,
     /// What was not recognised, or not reachable along the axis.
     pub notes: Vec<String>,
+    /// With `picks: true`: each feature's faces as picks, by feature id.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub picks: std::collections::BTreeMap<String, Vec<super::cam_picks::Pick>>,
     /// In the warn parameter-check mode: what the call's parameters got wrong.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub param_warnings: Vec<String>,
@@ -329,6 +337,10 @@ pub struct CamSuggestParams {
     /// `dry_run`. Default: false.
     #[serde(default)]
     pub check: Option<bool>,
+    /// Write the operations' geometry as picks (faces by their persistent names) instead of
+    /// feature ids, so the job follows model edits that renumber the features. Default: false.
+    #[serde(default)]
+    pub as_picks: Option<bool>,
 }
 
 /// What `cam.suggest` returns.

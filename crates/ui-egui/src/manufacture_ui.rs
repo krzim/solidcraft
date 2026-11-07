@@ -6,7 +6,7 @@
 
 use egui::{Rect, Ui};
 use serde_json::{Map, Value, json};
-use solidcraft_engine::cam_job_state::{OP_TYPES, op_enabled, op_name, op_types};
+use solidcraft_engine::cam_job_state::{op_enabled, op_name, op_types};
 use solidcraft_engine::schema::cam_job_edit::OpStatus;
 
 use crate::SolveApp;
@@ -324,6 +324,7 @@ fn tree_card(app: &mut SolveApp, ui: &mut Ui) {
                 ui_kit::tree_row(ui, ui.scope_id().with(("mf_tool", k)), &ui_kit::Row { depth: 1, compact: true, label: line, ..Default::default() });
             }
         }
+        crate::manufacture_op::found_rows(app, ui);
     });
 }
 
@@ -594,7 +595,7 @@ fn stage_card(app: &mut SolveApp, ui: &mut Ui) {
     }
     scroll(ui, "manufacture_stage", |ui| match app.manufacture.stage {
         Stage::Setup => setup_form(app, ui),
-        Stage::Operations => operations_form(app, ui),
+        Stage::Operations => crate::manufacture_op::operations_form(app, ui),
         Stage::Check => check_form(app, ui),
         Stage::Program => program_form(app, ui),
     });
@@ -805,9 +806,10 @@ fn setup_form(app: &mut SolveApp, ui: &mut Ui) {
             let mut o = origin.clone();
             o.resize(3, 0.0);
             o[k] = x;
-            edit_job(app, &[("origin", Some(json!(o)))], &[]);
+            edit_job(app, &[("origin", Some(json!(o)))], &["origin_from"]);
         }
     }
+    crate::manufacture_op::zero_rows(app, ui);
     ui_kit::divider(ui, "manufacture:setup:stock");
     stock_rows(app, ui, v.get("stock"));
     ui_kit::divider(ui, "manufacture:setup:holding");
@@ -899,76 +901,6 @@ fn stock_rows(app: &mut SolveApp, ui: &mut Ui, stock: Option<&Value>) {
         field(app, ui, app.tr("ui.manufacture.stock_radius"), "stock.cylinder.radius", get(&["cylinder", "radius"]));
         field(app, ui, app.tr("ui.manufacture.stock_x_min"), "stock.cylinder.x_min", get(&["cylinder", "x_min"]));
         field(app, ui, app.tr("ui.manufacture.stock_x_max"), "stock.cylinder.x_max", get(&["cylinder", "x_max"]));
-    }
-}
-
-/// The selected operation in brief (its parameters are edited in a form in a later stage), and
-/// adding one from the list of types.
-fn operations_form(app: &mut SolveApp, ui: &mut Ui) {
-    let four = app.session.cam_job.as_deref().is_some_and(|j| j.value.get("machine").and_then(Value::as_str) == Some("4axis_a"));
-    let labels: Vec<String> = OP_TYPES
-        .iter()
-        .filter(|(_, _, group)| four || *group != "rotary")
-        .map(|(ty, label, group)| {
-            let id = format!("ui.manufacture.op.{ty}");
-            let text = crate::i18n::Locale::for_language(&app.preferences.language).text(&id).to_string();
-            let group = app.tr(&format!("ui.manufacture.group.{group}")).to_string();
-            format!("{group} \u{b7} {}", if text == id { (*label).to_string() } else { text })
-        })
-        .collect();
-    let types: Vec<&str> = OP_TYPES.iter().filter(|(_, _, group)| four || *group != "rotary").map(|(t, _, _)| *t).collect();
-    let mut add = app.manufacture.add_type.min(types.len().saturating_sub(1));
-    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    ui_kit::choice_row(ui, app.tr("ui.manufacture.add_operation"), "manufacture_add", &mut add, &refs);
-    app.manufacture.add_type = add;
-    let b = ui_kit::button(ui, app.tr("ui.manufacture.add"), ui_kit::Button::Primary);
-    crate::scenario::publish_target("manufacture:add", b.rect);
-    if b.clicked()
-        && let Some(ty) = types.get(add)
-    {
-        let at = app.manufacture.selected.map(|i| i + 1).unwrap_or(ops(app).len()).min(ops(app).len());
-        if let Some(r) = report(app, "cam.op.add", json!({"op": {"type": ty}, "at": at})) {
-            app.manufacture.selected = r.get("index").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok());
-        }
-    }
-    ui_kit::divider(ui, "manufacture:ops:rule");
-    let Some(i) = app.manufacture.selected.filter(|i| *i < ops(app).len()) else {
-        ui_kit::text(ui, app.tr("ui.manufacture.select_operation"), ui_kit::Text::Hint("manufacture:ops:none"));
-        return;
-    };
-    let op = ops(app)[i].clone();
-    ui_kit::text(ui, &type_label(app, &op), ui_kit::Text::Heading("manufacture:op:type"));
-    if let Some(name) = value_row(app, ui, app.tr("ui.manufacture.name"), &format!("op{i}name"), &op_name(&op)) {
-        report(app, "cam.op.edit", json!({"op": i, "rename": name}));
-    }
-    if four {
-        let a = match op_types(&op).0.as_str() {
-            "indexed" => op.get("a_deg").and_then(Value::as_f64).map_or_else(String::new, num),
-            "indexed_pattern" => op
-                .get("a_deg")
-                .and_then(Value::as_array)
-                .map_or_else(String::new, |a| a.iter().filter_map(Value::as_f64).map(num).collect::<Vec<_>>().join(", ")),
-            _ => "0".into(),
-        };
-        if let Some(t) = value_row(app, ui, app.tr("ui.manufacture.turn_a"), &format!("op{i}a"), &a) {
-            let angles: Vec<f64> = t.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect();
-            let a_deg = if angles.len() == 1 { json!(angles[0]) } else { json!(angles) };
-            if !angles.is_empty() {
-                report(app, "cam.op.edit", json!({"op": i, "a_deg": a_deg}));
-            }
-        }
-    }
-    // Its keys as the job holds them: what is not here takes its default.
-    ui_kit::text(ui, app.tr("ui.manufacture.keys_given"), ui_kit::Text::Note("manufacture:op:keys"));
-    let body = if op_types(&op).0.starts_with("indexed") { op.get("operation").cloned().unwrap_or(Value::Null) } else { op.clone() };
-    if let Some(map) = body.as_object() {
-        for (k, v) in map.iter().filter(|(k, _)| !matches!(k.as_str(), "name" | "type")) {
-            let mut text = v.to_string();
-            if text.chars().count() > 60 {
-                text = format!("{}\u{2026}", text.chars().take(60).collect::<String>());
-            }
-            ui_kit::text(ui, &format!("{k}: {text}"), ui_kit::Text::MonoNote(&format!("manufacture:op:key:{k}")));
-        }
     }
 }
 

@@ -271,7 +271,7 @@ fn at_side(op: Value, a_deg: Option<f64>) -> (Value, bool) {
 }
 
 /// `cam.suggest`.
-fn suggest(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn suggest(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.suggest";
     let params: CamSuggestParams = parse(cmd, p, "")?;
     let tol = params.tolerance.unwrap_or(0.01);
@@ -358,7 +358,13 @@ fn suggest(s: &mut Session, p: &Value) -> Result<Value> {
     used.sort_unstable();
     used.dedup();
     job.insert("tools".into(), Value::Array(tools.iter().filter(|t| used.contains(&t.tool.number)).map(|t| Value::Object(t.json.clone())).collect()));
-    job.insert("operations".into(), Value::Array(plan.ops.clone()));
+    let ops = if params.as_picks.unwrap_or(false) {
+        let st = s.world_state()?;
+        plan.ops.iter().map(|op| super::picks::as_picks(&set, &st, op)).collect()
+    } else {
+        plan.ops.clone()
+    };
+    job.insert("operations".into(), Value::Array(ops));
     let job = Value::Object(job);
 
     let top = set.setups.first().map_or(0.0, |su| su.top);

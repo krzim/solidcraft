@@ -79,7 +79,12 @@ pub struct FaceOp {
     /// Check this operation for gouges into the part. Default: true.
     #[serde(default)]
     pub gouge_check: Option<bool>,
+    /// The face it faces down to (its `bottom` then follows that face), by persistent name.
+    /// Default: none.
+    #[serde(default)]
+    pub picks: Option<Vec<super::cam_picks::Pick>>,
     /// The faced height, mm.
+    #[schemars(with = "super::cam_picks::HeightValue")]
     pub bottom: f64,
     /// Where the first level starts from, mm. Default: the stock's top (required without a stock).
     #[serde(default)]

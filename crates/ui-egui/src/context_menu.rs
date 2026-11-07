@@ -668,6 +668,11 @@ fn viewport_items(app: &SolveApp) -> Vec<Item> {
         v.push(act("ui.repeat", &format!("Repeat {label}"), "redo").key(&key));
         v.push(Item::sep());
     }
+    // In the Manufacture workspace, faces and edges picked: the operations that suit them.
+    if crate::manufacture_workspace::active(app) && app.session.cam_job.is_some() && has(|s| matches!(s, Sel::Face { .. } | Sel::Edge { .. })) {
+        v.push(act("ui.manufacture.machine_this", "Machine This", "hole").key("M"));
+        v.push(Item::sep());
+    }
     // Everything under the cursor, for what lies beneath something else.
     if app.menu.over_geometry {
         v.push(act("ui.selectOther", "Select Other…", "select").key("Hold click"));
@@ -1504,6 +1509,7 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
                 app.start("parts.resize");
             }
         }
+        "ui.manufacture.machine_this" => crate::manufacture_op::machine_this(app),
         "ui.repeat" => {
             app.repeat_last();
         }

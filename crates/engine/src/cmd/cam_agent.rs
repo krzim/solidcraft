@@ -61,6 +61,8 @@ pub(super) struct Loaded {
     pub left_out: Vec<(u32, String)>,
     /// Whether an operation of the job has `gouge_check: false`.
     pub unchecked: bool,
+    /// How the operations' picks (and work zero's `origin_from`) were found again.
+    pub picks: Vec<crate::schema::cam_picks::PickResolved>,
 }
 
 /// A refusal of the job as a whole.
@@ -246,10 +248,48 @@ pub(super) fn load_job_of(cmd: &str, s: &crate::Session, p: &Value, has_job: boo
         (true, None) => (p.get("job").cloned().unwrap_or(Value::Null), None, String::new()),
         (false, Some(path)) => (read_json(cmd, path, "job_path")?, Path::new(path).parent().map(Path::to_path_buf), format!("job_path {path}")),
     };
+    load_value(cmd, s, raw, base, what)
+}
+
+/// The job `raw` as the planners read it, with `base` the folder its relative paths are read
+/// from: its profile merged in, its machine file and tool libraries read, its picks found.
+pub(super) fn load_value(cmd: &str, s: &crate::Session, raw: Value, base: Option<PathBuf>, what: String) -> Result<Loaded> {
+    let (job, profile, left_out) = merge(cmd, raw, base.as_deref(), &what)?;
+    let mut value = Value::Object(job);
+    let picks = if super::picks::has_refs(&value) {
+        let mut m = super::picks::model_of(cmd, s, &value, base.as_deref())?;
+        match &mut value {
+            Value::Object(map) => super::picks::resolve_job(&mut m, map)?,
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let Value::Object(job) = value else { return Err(bad(cmd, "the job must be a JSON object")) };
+    // Only operations the program holds: one turned off excuses no gouge of the others.
+    let unchecked = job
+        .get("operations")
+        .and_then(Value::as_array)
+        .is_some_and(|ops| ops.iter().filter(|o| crate::cam_job_state::op_enabled(o)).any(super::sim::unchecked));
+    let job: CamJob = super::parse(cmd, &Value::Object(job), &what)?;
+    let notes = left_out.iter().map(|(_, n)| n.clone()).collect();
+    Ok(Loaded { job, base, profile, notes, left_out, unchecked, picks })
+}
+
+/// The job `raw` with its profile merged in (`base`: its folder), as a JSON value: what an
+/// operation reads its defaults from.
+pub(super) fn merged_value(cmd: &str, raw: Value, base: Option<&Path>) -> Result<Value> {
+    merge(cmd, raw, base, "").map(|(job, ..)| Value::Object(job))
+}
+
+/// Type of [`merge`]'s result: the job, its profile's path, the library tools left out.
+type Merged = (Map<String, Value>, Option<String>, Vec<(u32, String)>);
+
+/// The job `raw` with its profile merged in, its machine file and tool libraries read.
+fn merge(cmd: &str, raw: Value, based: Option<&Path>, what: &str) -> Result<Merged> {
     let Value::Object(mut job) = raw else {
         return Err(bad(cmd, format!("{what}: the job must be a JSON object").trim_start_matches(": ").to_string()));
     };
-    let based = base.as_deref();
     let mut profile = None;
     if let Some(given) = str_key(cmd, &job, "profile_path")?.map(str::to_string) {
         let path = beside(based, &given);
@@ -303,14 +343,7 @@ pub(super) fn load_job_of(cmd: &str, s: &crate::Session, p: &Value, has_job: boo
         }
         Some(_) => return Err(bad(cmd, "`tool_library_paths` is a list of file paths")),
     }
-    // Only operations the program holds: one turned off excuses no gouge of the others.
-    let unchecked = job
-        .get("operations")
-        .and_then(Value::as_array)
-        .is_some_and(|ops| ops.iter().filter(|o| crate::cam_job_state::op_enabled(o)).any(super::sim::unchecked));
-    let job: CamJob = super::parse(cmd, &Value::Object(job), &what)?;
-    let notes = left_out.iter().map(|(_, n)| n.clone()).collect();
-    Ok(Loaded { job, base, profile, notes, left_out, unchecked })
+    Ok((job, profile, left_out))
 }
 
 /// The part's and the fixtures' exact geometry, in design coordinates.
@@ -807,6 +840,12 @@ impl Agent {
     fn limit(&self, n: String) {
         self.limits.borrow_mut().push(n.clone());
         self.note(n);
+    }
+
+    /// What planning recorded: the tools chosen and why, the heights worked out and why, and
+    /// the notes (cutting data used, speeds worked out or held to the machine's limits).
+    pub fn record(&self) -> (Vec<ToolChoice>, Vec<DerivedHeights>, Vec<String>) {
+        (self.choices.borrow().clone(), self.derived.borrow().clone(), self.notes.borrow().clone())
     }
 
     /// The operation being planned is called `name` (every refusal of an operation names it).

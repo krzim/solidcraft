@@ -134,6 +134,8 @@ pub struct Manufacture {
     /// The cards' widths.
     pub tree_width: f32,
     pub stage_width: f32,
+    /// Operations by hand: the form's defaults, the part's features, Machine this.
+    pub ops: crate::manufacture_op::OpState,
 }
 
 impl Manufacture {
@@ -290,6 +292,7 @@ pub fn apply_command(app: &mut SolveApp, id: &str, reply: &Value) {
             app.manufacture.written = None;
             app.manufacture.error = None;
             app.manufacture.save_at = None;
+            app.manufacture.ops = Default::default();
             if id != "cam.job.close" {
                 refresh_library(app);
             }
@@ -348,7 +351,7 @@ pub fn takes_command(app: &mut SolveApp, id: &str) -> bool {
 }
 
 /// Whether this build runs heavy work off the window thread.
-fn threads(app: &SolveApp) -> bool {
+pub(crate) fn threads(app: &SolveApp) -> bool {
     cfg!(not(target_arch = "wasm32")) && app.apply_off_thread.is_some()
 }
 
@@ -407,7 +410,8 @@ fn finished(app: &mut SolveApp, command: &str, result: Result<Value, String>) {
 /// Each frame: take back the worker's result, look at the job file, save when due.
 pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
     collect(app);
-    if app.manufacture.away.is_some() {
+    crate::manufacture_op::collect(app);
+    if app.manufacture.away.is_some() || crate::manufacture_op::busy(app) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
     keep_up(app, crate::now_ms());

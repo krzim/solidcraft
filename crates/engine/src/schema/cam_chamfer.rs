@@ -13,10 +13,13 @@ use crate::schema::types::SketchRef;
 #[serde(deny_unknown_fields)]
 pub struct ChamferHeightsSpec {
     /// Where the tool travels between cuts.
+    #[schemars(with = "crate::schema::cam_picks::HeightValue")]
     pub clearance: f64,
     /// Where rapid motion towards the material stops and feed begins.
+    #[schemars(with = "crate::schema::cam_picks::HeightValue")]
     pub retract: f64,
     /// The top face whose edges are chamfered.
+    #[schemars(with = "crate::schema::cam_picks::HeightValue")]
     pub top: f64,
 }
 
