@@ -201,7 +201,12 @@ pub(super) fn rest_map(
 /// The map of what earlier operations left ([`rest_map`], work coordinates) in the operation's
 /// frame, which must look straight down along work X and Y (a 3-axis operation's does), and
 /// how thick a skin it leaves unchased: the simulation's cell and the tolerance.
-fn rest_in(ctx: &Ctx<'_>, name: &str, frame: &Frame) -> Result<Option<(HeightMap, f64, String)>> {
+fn rest_in(ctx: &Ctx<'_>, name: &str, frame: &Frame, rest_from: bool) -> Result<Option<(HeightMap, f64, String)>> {
+    // `rest_from` is worked out for an operation of the job's own list (`rest_map`); one inside
+    // `indexed` has none, and is refused rather than planned on the whole stock.
+    if rest_from && ctx.rest.is_none() {
+        return Err(ctx.bad(name, "`rest_from` works on a 3-axis operation of the job's own `operations`, not inside `indexed`"));
+    }
     // What an earlier setup left, and what the operations before this one cut of it.
     let (map, note) = match (ctx.start, &ctx.rest) {
         (None, None) => return Ok(None),
@@ -249,7 +254,7 @@ pub(super) fn plan(ctx: &Ctx<'_>, o: &AdaptiveOp, frame: &Frame) -> Result<(Tool
         ),
     )?;
     let mut stock = if o.from_stock.unwrap_or(true) { stock_in(ctx.stock, frame) } else { StockModel::default() };
-    let rest = rest_in(ctx, c.name, frame)?;
+    let rest = rest_in(ctx, c.name, frame, o.rest_from.is_some())?;
     if let Some((map, skin, _)) = &rest {
         stock.heights = Some(map.clone());
         stock.rest_tolerance = *skin;
@@ -319,7 +324,7 @@ pub(super) fn plan_roughing(ctx: &Ctx<'_>, o: &AdaptiveRoughingOp, frame: &Frame
         adaptive: p,
         rest: None,
     };
-    let rest = rest_in(ctx, c.name, frame)?;
+    let rest = rest_in(ctx, c.name, frame, o.rest_from.is_some())?;
     let rp = AdaptiveRoughingParams { rest: rest.as_ref().map(|(m, _, _)| m.clone()), ..rp };
     let a = adaptive_roughing(surface, &r.tool, &rp).map_err(|e| ctx.bad(c.name, e))?;
     let mut warnings = a.warnings.clone();

@@ -10,6 +10,7 @@ use solidcraft_cam::kinematics::Machine;
 use solidcraft_cam::rapids::{RAPID_STEP, check_rapids_staged, check_travel};
 use solidcraft_cam::stock::{FaceParams, Stock, default_face_overhang, default_face_stepover, face};
 use solidcraft_cam::{Frame, Heights, Move5, Toolpath};
+use solidcraft_geom::Vec3Geom;
 
 use super::{Ctx, Planned, Surfaces, cam_err, finite_point, num, v3};
 use crate::Result;
@@ -111,6 +112,21 @@ fn simulated(cmd: &str, path: &str, place: &super::Placement) -> Result<(Stock, 
     finite_point(&file.origin, "the height map's `origin`").map_err(|e| bad(cmd, e))?;
     if let Some(a) = &file.axes {
         finite_point(&a.concat(), "the height map's `axes`").map_err(|e| bad(cmd, e))?;
+        // A turn: three unit directions square to each other, right-handed (a skewed or
+        // mirrored file would put the material where it is not).
+        let [x, y, z] = a.map(v3);
+        let near = |v: f64, want: f64| (v - want).abs() <= 1e-6;
+        let turn = [x, y, z].iter().all(|v| near(v.dot(*v), 1.0))
+            && near(x.dot(y), 0.0)
+            && near(y.dot(z), 0.0)
+            && near(x.dot(z), 0.0)
+            && near(x.cross(y).dot(z), 1.0);
+        if !turn {
+            return Err(bad(
+                cmd,
+                "`stock.simulated`: the height map's `axes` must be a turn: three unit directions square to each other, right-handed",
+            ));
+        }
     }
     let was = super::Placement { origin: v3(file.origin), axes: file.axes.map(|a| a.map(v3)) };
     // From the written job's work coordinates to this job's, and back.

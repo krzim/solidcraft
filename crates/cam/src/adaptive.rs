@@ -1761,7 +1761,10 @@ pub fn adaptive_in(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cu
                 let cell_stock = |p: Vec2| walls.shape.inside(p, k.h) && stock.material_at(p, z);
                 let at = |p: Vec2| stock.material_at(p, z);
                 let cap = slab_top;
-                let floor_at = |c: Vec2, rad: f64| Some(stock.top_over(c, rad, cap).max(z));
+                // A plan made once is written at every level: its helices start from the level
+                // above where they are written (`None`), cleared by then. A level planned on its
+                // own starts them where the map leaves material over them.
+                let floor_at = |c: Vec2, rad: f64| per_level.then(|| stock.top_over(c, rad, cap).max(z));
                 let mut lv = Level::new(g, k, domain, allow.clone(), &cell_stock, &at, &mut steps_taken, &mut work)?;
                 let (plan, n_helix) = lv.plan(None, &floor_at)?;
                 let n_left = lv.material_cells();

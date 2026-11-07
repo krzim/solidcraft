@@ -618,7 +618,10 @@ the narrower width the limit allows, which takes more steps.
   material and entered with a helix. Round a 30 × 20 mm boss on a 60 × 50 mm stock at 0.6 mm
   with a 6 mm tool the path is 1.3 times the area over the load (it was 7.6 times, entered with
   a helix); a closed 40 mm square pocket is about 1.9 times (it was 3.3), the corners needing a
-  way back to each new cut when every cut climbs.
+  way back to each new cut when every cut climbs. Nothing round the stock is modelled here
+  either: where the tool goes down beside the stock below the top of the vise jaws or clamps,
+  model them as `fixtures` (the gouge check then refuses a path into them) or give
+  `from_stock: false`.
 - **Stock.** `adaptive_roughing` takes the material as the box over `boundary` (its rectangle,
   and inside its polygon too) from `top` down, and goes down to a level in the open air outside
   it. Without `boundary.rect` the stock is the part's extent seen from above, and the report
@@ -630,7 +633,8 @@ the narrower width the limit allows, which takes more steps.
   earlier operations of the job left: `"previous"` (every operation before it),
   `{"operations": [names]}` or `{"tool": n}` (those before it with tool n, a larger tool that
   roughed first). Those operations' program is simulated as `cam.simulate` does, from the job's
-  `stock` box (required, on a 3-axis machine), and the levels are planned on the stock it
+  `stock` box (required, on a 3-axis machine, for an operation of the job's own
+  `operations`: one inside `indexed` is refused), and the levels are planned on the stock it
   leaves (a height map in cells of the simulation's size): material is where a cell's top is
   above the level by more than twice the tolerance (at least 0.02 mm). The tool goes down
   where the earlier operations cleared and cuts in from there, so a smaller tool after a larger

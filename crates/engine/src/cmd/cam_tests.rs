@@ -97,6 +97,13 @@ fn a_parallel_finish_runs_down_walls_at_the_descent_feed() {
     eprintln!("down the walls at the cut feed {:.3} min, at the plunge feed {:.3} min", minutes(&fast), minutes(&slow));
     assert!(minutes(&slow) > minutes(&fast) * 1.2, "{} {}", minutes(&slow), minutes(&fast));
     assert!((minutes(&never) - minutes(&fast)).abs() < 1e-9, "{} {}", minutes(&never), minutes(&fast));
+    // A descent feed between the plunge and the cut feed is kept as the program is written,
+    // not slowed again to the plunge feed.
+    let mid = run(&mut s, "cam.job", job(json!({"cut": 900, "plunge": 250, "descent": 575}), None));
+    assert_clean(&mid);
+    eprintln!("down the walls at 575 mm/min {:.3} min", minutes(&mid));
+    assert!(minutes(&mid) < minutes(&slow) - 0.3 * (minutes(&slow) - minutes(&fast)), "{} {}", minutes(&mid), minutes(&slow));
+    assert!(minutes(&mid) > minutes(&fast), "{} {}", minutes(&mid), minutes(&fast));
     let e = s.execute("cam.job", &job(json!({"cut": 900, "plunge": 250, "descent": 0}), None)).unwrap_err();
     assert!(e.to_string().contains("descent feed"), "{e}");
 }
@@ -1744,6 +1751,42 @@ fn rest_machining_clears_what_the_operations_before_left() {
     j["job"].as_object_mut().unwrap().remove("stock");
     let e = s.execute("cam.job", &j).unwrap_err();
     assert!(e.to_string().contains("`stock` box"), "{e}");
+    // Inside an `indexed` operation (a 4th axis) it is refused, not left out.
+    let mut side = pocketed_block();
+    let mut j = side_pocket_job();
+    j["operations"][0]["operation"] = json!({"name": "side", "type": "adaptive", "tool": 1, "polygon": [[-6, -6], [6, -6], [6, 6], [-6, 6]],
+        "heights": {"clearance": 40, "retract": 20, "top": 15, "bottom": 10}, "rest_from": "previous", "compare": false});
+    let e = side.execute("cam.job", &json!({"job": j, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("rest_from"), "{e}");
+}
+
+/// The kernel's matrix of a job's turn moves the exact part where the turn moves its points, as
+/// the meshes are turned: a quarter turn about X about a point off the design's origin (a turn
+/// that is not its own inverse, so a transposed matrix would show).
+#[test]
+fn a_turns_matrix_moves_the_exact_part_as_its_points() {
+    use solidcore_record::Vec3;
+    use solidcraft_geom::Vec3Geom;
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 20, "height": 10, "corner": [0, 0, 0], "body_name": "Block"}));
+    let st = s.world_state().unwrap();
+    let body = &st.bodies.iter().find(|b| b.name == "Block").unwrap().body;
+    let x = Vec3::new(1.0, 0.0, 0.0);
+    let axes = [x, Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)].map(|e| solidcraft_cam::rotate(e, x, -90f64.to_radians()));
+    let place = super::Placement { origin: Vec3::new(5.0, 3.0, 2.0), axes: Some(axes) };
+    let b = solidcraft_kernel::transform_matrix(body, place.matrix().unwrap()).unwrap().exact_bounds().unwrap();
+    let (mut lo, mut hi) =
+        (Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY));
+    for k in 0..8 {
+        let c = Vec3::new(if k & 1 == 0 { 0.0 } else { 40.0 }, if k & 2 == 0 { 0.0 } else { 20.0 }, if k & 4 == 0 { 0.0 } else { 10.0 });
+        let t = place.turn(c);
+        lo = Vec3::new(lo.x.min(t.x), lo.y.min(t.y), lo.z.min(t.z));
+        hi = Vec3::new(hi.x.max(t.x), hi.y.max(t.y), hi.z.max(t.z));
+    }
+    // A right-handed quarter turn about X takes +Y up: the block's 20 mm along Y stands up.
+    assert!((hi.z - lo.z - 20.0).abs() < 1e-6 && (hi.y - lo.y - 10.0).abs() < 1e-6, "{lo:?} {hi:?}");
+    assert!(lo.dist(b.min) < 1e-6 && hi.dist(b.max) < 1e-6, "turned points {lo:?} {hi:?}, turned body {:?} {:?}", b.min, b.max);
+    assert!(place.unturn(place.turn(Vec3::new(7.0, -2.0, 4.0))).dist(Vec3::new(7.0, -2.0, 4.0)) < 1e-9);
 }
 
 /// A job's `orientation` turns the part for its setup, about its `origin`: the back of a block
@@ -1837,6 +1880,15 @@ fn op2_starts_from_the_stock_op1_left() {
     side["job"]["orientation"] = json!({"axis": [1, 0, 0], "angle_deg": 90});
     let e = s.execute("cam.job", &side).unwrap_err();
     assert!(e.to_string().contains("upright or upside down"), "{e}");
+    // A file whose axes are not a turn (skewed, or mirrored) is refused, not read askew.
+    let mut file: Value = serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+    for axes in [json!([[1, 0.5, 0], [0, 1, 0], [0, 0, 1]]), json!([[1, 0, 0], [0, 1, 0], [0, 0, -1]])] {
+        file["axes"] = axes.clone();
+        let bad = dir.file("bad.stock.json");
+        std::fs::write(&bad, serde_json::to_vec(&file).unwrap()).unwrap();
+        let e = s.execute("cam.job", &op2(json!({"simulated": {"path": bad}}))).unwrap_err();
+        assert!(e.to_string().contains("axes"), "{axes}: {e}");
+    }
 }
 
 /// A block 30 × 20 × 10, its top at Z 0, with its four top edges chamfered 1 mm at 45° when

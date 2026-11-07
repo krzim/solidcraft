@@ -920,7 +920,15 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
     if let Some(top) = material_top(ctx, frame) {
         lift_entries(&mut path, top);
     }
-    limit_descents(&mut path, r.feeds.plunge, r.feeds.cut, b.decimals, b.units.mm(), feed_step).map_err(|e| ctx.bad(name, e))?;
+    // A 3D finish's moves down a wall go down at its descent feed, its entries (straight down)
+    // at the plunge feed: the larger of the two bounds both, and a straight entry keeps its own.
+    let takes_descent =
+        matches!(op, Op3Spec::Parallel(_) | Op3Spec::Scallop(_) | Op3Spec::SteepShallow(_) | Op3Spec::Pencil(_) | Op3Spec::RestFinish(_));
+    let down = match r.descent {
+        Some(d) if takes_descent => d.max(r.feeds.plunge),
+        _ => r.feeds.plunge,
+    };
+    limit_descents(&mut path, down, r.feeds.cut, b.decimals, b.units.mm(), feed_step).map_err(|e| ctx.bad(name, e))?;
     Ok((path, r, kind))
 }
 

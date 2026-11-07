@@ -678,6 +678,36 @@ fn a_closed_pocket_path_is_not_much_longer_than_its_area_over_the_load() {
     assert_cleared(&[square(40.0)], &a.path, 3.0, 0.0, -1.0, 0.4);
 }
 
+/// Each level's helix ramps down from the level above it (cleared by then), not from the top of
+/// the stock: a deep pocket's helices would otherwise grow with every level, through air.
+#[test]
+fn each_levels_helix_starts_at_the_level_above() {
+    let closed = StockModel { rect: Some([Vec2::new(-10.0, -10.0), Vec2::new(40.0, 40.0)]), top: Some(0.0), ..Default::default() };
+    for stock in [StockModel::default(), closed] {
+        let c = cut(0.0, -9.0);
+        let a = adaptive_in(&[square(30.0)], &flat(6.0), &params(), &c, &stock).unwrap();
+        assert_eq!(a.levels, 3, "{a:?}");
+        let mut helices = 0;
+        let (mut pos, mut start): (Option<Vec3>, Option<f64>) = (None, None);
+        for (m, role) in a.path.moves.iter().zip(&a.roles) {
+            let Some(to) = m.target() else { continue };
+            match (role, start) {
+                (MoveRole::Entry, None) => start = pos.map(|p| p.z),
+                (MoveRole::Entry, Some(_)) => {}
+                (_, Some(s)) => {
+                    let end = pos.map_or(s, |p| p.z);
+                    assert!(s - end <= c.stepdown + 1e-6, "a helix from {s} down to {end}");
+                    helices += 1;
+                    start = None;
+                }
+                _ => {}
+            }
+            pos = Some(to);
+        }
+        assert!(helices >= 3, "{helices}");
+    }
+}
+
 /// A height map over `lo..hi` in cells of `cell` mm, its tops from `top(x, y)`.
 fn height_map(lo: Vec2, hi: Vec2, cell: f64, top: &dyn Fn(f64, f64) -> f64) -> HeightMap {
     let (nx, ny) = (((hi.x - lo.x) / cell).ceil() as usize, ((hi.y - lo.y) / cell).ceil() as usize);
