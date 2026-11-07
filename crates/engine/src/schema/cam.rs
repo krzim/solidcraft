@@ -797,6 +797,10 @@ pub struct CamJobReply {
     /// The profile the job was read with (`profile_path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// The job operation each of `operations` comes from (an indexed pattern is several), for
+    /// the compact reply; not part of the reply.
+    #[serde(skip)]
+    pub op_of: Vec<usize>,
 }
 
 /// One operation of a `cam.job` reply.

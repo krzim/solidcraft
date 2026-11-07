@@ -742,8 +742,8 @@ fn plan3(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> Resul
 }
 
 /// Where the material may reach in `frame` (the highest Z of the operation's coordinates): the
-/// stock's top seen from there; without a stock, on a machine with rotaries, the round bar
-/// through the part's farthest point from the A axis (as the simulation takes the stock);
+/// stock's top seen from there; on a machine with rotaries without a bar stock, the round bar
+/// through the part's farthest point from the A axis too (as the simulation takes the stock);
 /// otherwise not known (the operations' heights say).
 fn material_top(ctx: &Ctx<'_>, frame: &Frame) -> Option<f64> {
     use solidcraft_cam::stock::Stock;
@@ -763,23 +763,26 @@ fn material_top(ctx: &Ctx<'_>, frame: &Frame) -> Option<f64> {
             highest(Vec3::new(x0, -radius, -radius), Vec3::new(x1, radius, radius))
         }
     };
-    let top = match ctx.stock {
-        Some(Stock::Box { min, max }) => highest(*min, *max),
-        Some(Stock::Cylinder { radius, x_min, x_max }) => bar(*radius, *x_min, *x_max),
-        None if !ctx.machine.rotaries.is_empty() => {
-            let (mut reach, mut x0, mut x1) = (0.0f64, f64::INFINITY, f64::NEG_INFINITY);
-            for t in ctx.part.triangles() {
-                for p in t {
-                    reach = reach.max(p.y.hypot(p.z));
-                    x0 = x0.min(p.x);
-                    x1 = x1.max(p.x);
-                }
+    // The round bar through the part's farthest point from work X.
+    let part_bar = || {
+        let (mut reach, mut x0, mut x1) = (0.0f64, f64::INFINITY, f64::NEG_INFINITY);
+        for t in ctx.part.triangles() {
+            for p in t {
+                reach = reach.max(p.y.hypot(p.z));
+                x0 = x0.min(p.x);
+                x1 = x1.max(p.x);
             }
-            if !(x0 <= x1) {
-                return None;
-            }
-            bar(reach, x0, x1)
         }
+        (x0 <= x1).then(|| bar(reach, x0, x1))
+    };
+    let rotary = !ctx.machine.rotaries.is_empty();
+    let top = match ctx.stock {
+        Some(Stock::Box { min, max }) if !rotary => highest(*min, *max),
+        // On a 4th axis the simulation models the round bar through the part's farthest point,
+        // not a box: above both.
+        Some(Stock::Box { min, max }) => part_bar().map_or(highest(*min, *max), |b| b.max(highest(*min, *max))),
+        Some(Stock::Cylinder { radius, x_min, x_max }) => bar(*radius, *x_min, *x_max),
+        None if rotary => part_bar()?,
         None => return None,
     };
     top.is_finite().then_some(top)
@@ -1530,7 +1533,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
     gouge.pass = gouge.hits == 0;
     // Every operation's lowest cut against the stock's bottom.
     if let Some(st) = stock.as_ref() {
-        cam_stock::check_below_stock(&planned, st, &machine, tol, &mut failures);
+        cam_stock::check_below_stock(&planned, st, surfaces.fixtures.as_ref(), &machine, tol, &mut failures);
     }
     // Every rapid of the program as written, and every position against the machine's travel.
     let unchecked: Vec<bool> = planned.iter().map(|p| !p.gouge_check).collect();
@@ -1675,6 +1678,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         images,
         param_warnings: Vec::new(),
         failure_details: details,
+        op_of,
         ..CamJobReply::default()
     };
     agent.finish(&mut reply);

@@ -357,7 +357,12 @@ pub fn check_rapids_staged(
     // coordinates: a rapid straight down to above where one of them went through that point
     // comes down through what that operation has already cut (a level of a pocket or a
     // roughing coming down through the air the levels before cleared).
-    let mut cut: Vec<Swept> = program.operations.iter().map(|_| Swept::default()).collect();
+    // Filed in a frame whose Z is the tool's axis of the operation's first such move (an
+    // indexed operation at any angle, not only at A0).
+    let mut cut: Vec<Option<(AxisFrame, Swept)>> = program.operations.iter().map(|_| None).collect();
+    // With the tool always along machine Z (rotaries on the table only), a rapid from an unknown
+    // place (after a return home) comes down its own axis to where it ends.
+    let table_only = machine.rotaries.iter().all(|r| r.carrier == Carrier::Table);
     for (i, b) in blocks.iter().enumerate() {
         let (line, linear, rotary, tcp, rapid) = match b {
             JointWords::Rapid { line, linear, rotary, tcp } => (*line, *linear, rotary, *tcp, true),
@@ -388,8 +393,13 @@ pub fn check_rapids_staged(
                     _ => stock,
                 };
                 let deliberate = owner.is_some() && unchecked.get(k).copied().unwrap_or(false);
-                let back_in = owner.is_some() && withdrawn.as_ref().is_some_and(|(w, bottom)| *w == k && back_down(&poses, bottom));
-                let through_cut = owner.is_some() && cut.get(k).is_some_and(|c| down_into(&poses, c));
+                // Back down the way it went out: also after a return home and a whole turn of a
+                // rotary in between (a rewind), where only the end of the way down is known.
+                let back_in = owner.is_some()
+                    && withdrawn.as_ref().is_some_and(|(w, bottom)| {
+                        *w == k && (back_down(&poses, bottom) || (from.is_none() && table_only && on_way_out(&poses, bottom)))
+                    });
+                let through_cut = owner.is_some() && cut.get(k).and_then(Option::as_ref).is_some_and(|(f, c)| down_into(&poses, f, c));
                 let left = if back_in || through_cut { None } else { left };
                 check_block(&mut out, &poses, (line, owner.as_ref().map(|_| k)), tool, cutter, obstacles, left, deliberate, tol, step)?;
                 if owner.is_some() && retract(&poses) {
@@ -416,12 +426,14 @@ pub fn check_rapids_staged(
             // An arc is filed by its ends: its chord is not where it cut.
             let arc = matches!(b, JointWords::Arc { .. });
             let (a, end) = (pose_at(machine, from.linear, &from.rotary, from.tcp), pose_at(machine, to.linear, &to.rotary, to.tcp));
-            if upright(&a) && upright(&end) {
+            let (f, c) = c.get_or_insert_with(|| (AxisFrame::along(a.axis), Swept::default()));
+            if f.holds(&a) && f.holds(&end) {
+                let (p, q) = (f.local(a.tip), f.local(end.tip));
                 if arc {
-                    c.add(a.tip, a.tip);
-                    c.add(end.tip, end.tip);
+                    c.add(p, p);
+                    c.add(q, q);
                 } else {
-                    c.add(a.tip, end.tip);
+                    c.add(p, q);
                 }
             }
         }
@@ -430,19 +442,54 @@ pub fn check_rapids_staged(
     Ok(out)
 }
 
-/// Whether the tool's axis is work +Z.
-fn upright(p: &Pose) -> bool {
-    p.axis.z >= 1.0 - 1e-9
+/// A frame whose Z is a tool axis, for the cutting moves along that axis.
+struct AxisFrame {
+    x: Vec3,
+    y: Vec3,
+    z: Vec3,
 }
 
-/// Whether `poses` (a rapid's samples) run straight down with the tool upright, ending above
-/// where a cutting move of `cut` went through that point.
-fn down_into(poses: &[Pose], cut: &Swept) -> bool {
+impl AxisFrame {
+    fn along(axis: Vec3) -> AxisFrame {
+        // Work X and Y where the axis is work Z, so an upright operation is filed as seen from
+        // above.
+        let z = axis.normalized().unwrap_or(Vec3::Z);
+        let x =
+            if z.x.abs() < 0.9 { (Vec3::X - z * z.x).normalized().unwrap_or(Vec3::X) } else { (Vec3::Y - z * z.y).normalized().unwrap_or(Vec3::Y) };
+        AxisFrame { x, y: z.cross(x), z }
+    }
+
+    /// Whether the tool's axis at `p` is this frame's Z.
+    fn holds(&self, p: &Pose) -> bool {
+        p.axis.dot(self.z) >= 1.0 - 1e-9
+    }
+
+    fn local(&self, v: Vec3) -> Vec3 {
+        Vec3::new(v.dot(self.x), v.dot(self.y), v.dot(self.z))
+    }
+}
+
+/// Whether `poses` (a rapid's samples) run straight down the tool axis of `frame`, ending above
+/// where a cutting move of `cut` (filed in `frame`) went through that point.
+fn down_into(poses: &[Pose], frame: &AxisFrame, cut: &Swept) -> bool {
     let (Some(a), Some(b)) = (poses.first(), poses.last()) else { return false };
+    let (la, lb) = (frame.local(a.tip), frame.local(b.tip));
     poses.len() > 1
-        && b.tip.z < a.tip.z
-        && poses.iter().all(|p| upright(p) && (p.tip.x - a.tip.x).hypot(p.tip.y - a.tip.y) <= 1e-6)
-        && cut.below(Vec2::new(b.tip.x, b.tip.y), b.tip.z)
+        && lb.z < la.z
+        && poses.iter().all(|p| {
+            let l = frame.local(p.tip);
+            frame.holds(p) && (l.x - la.x).hypot(l.y - la.y) <= 1e-6
+        })
+        && cut.below(Vec2::new(lb.x, lb.y), lb.z)
+}
+
+/// Whether `poses` (the known end of a rapid from an unknown place) stand on the line a retract
+/// from `bottom` went out along, with its axis, no lower than where it started.
+fn on_way_out(poses: &[Pose], bottom: &Pose) -> bool {
+    !poses.is_empty()
+        && poses.iter().all(|p| {
+            p.axis_angle(bottom) <= 1e-9 && (p.tip - bottom.tip).cross(bottom.axis).len() <= 1e-6 && (p.tip - bottom.tip).dot(bottom.axis) >= -1e-9
+        })
 }
 
 /// The poses along a rapid from `from` (the block's start; `None` where it is not known: only

@@ -566,7 +566,9 @@ fn operations(plan: &mut Plan, set: &FeatureSet, tools: &[Pick], flats: &[&Pick]
         }
         if !pk.walls_vertical {
             plan.check.push(format!(
-                "{}: its walls are not upright (rounded, chamfered or drafted where they meet the floor): its pocket and wall finish follow                  the floor's outline, inside the walls, and leave them; finish the walls with a `waterline` or `parallel` operation over                  its bounds [[{}, {}], [{}, {}]]",
+                "{}: its walls are not upright (rounded, chamfered or drafted where they meet the floor): its pocket and wall finish follow \
+                 the floor's outline, inside the walls, and leave them; finish the walls with a `waterline` or `parallel` operation over \
+                 its bounds [[{}, {}], [{}, {}]]",
                 pk.id,
                 num(pk.bounds[0][0]),
                 num(pk.bounds[0][1]),

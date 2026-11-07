@@ -1610,7 +1610,11 @@ pub(super) fn reply_value(reply: CamJobReply, compact: bool) -> Result<Value> {
             .operations
             .iter()
             .enumerate()
-            .map(|(i, r)| op_line(i, r, reply.derived_heights.iter().find(|d| d.op_index == i), reply.tool_choices.iter().find(|c| c.op_index == i)))
+            .map(|(k, r)| {
+                // Numbered, and looked up, by the job operation it comes from.
+                let i = reply.op_of.get(k).copied().unwrap_or(k);
+                op_line(i, r, reply.derived_heights.iter().find(|d| d.op_index == i), reply.tool_choices.iter().find(|c| c.op_index == i))
+            })
             .collect();
         CamJobOutput::Compact(Box::new(CamJobCompactReply {
             compact: true,

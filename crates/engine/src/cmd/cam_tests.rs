@@ -2719,6 +2719,14 @@ fn the_simulation_runs_on_a_4th_axis() {
     assert!(sim["rapids_in_material"].as_array().is_some_and(Vec::is_empty), "{sim}");
     assert!(r["program_head"].as_array().unwrap().iter().any(|l| l == "G0 Z22.2132"), "{r}");
     assert_eq!(sim["gouge"]["cells"], 0, "{sim}");
+    // With the block given as a box stock, the simulation still models the round bar through
+    // its corners, so the ways down stop above that bar too, not 1 mm above the box's face.
+    let mut boxed = side_pocket_job();
+    boxed["stock"] = json!({"box": {"min": [-20, -15, -15], "max": [20, 15, 15]}});
+    let r = run(&mut s, "cam.job", json!({"job": boxed, "dry_run": true, "simulate": true}));
+    assert_clean(&r);
+    assert!(r["simulation"]["rapids_in_material"].as_array().is_some_and(Vec::is_empty), "{r}");
+    assert!(r["program_head"].as_array().unwrap().iter().any(|l| l == "G0 Z22.2132"), "{r}");
     // Retracting outside the bar it passes.
     let mut job = side_pocket_job();
     job["operations"][0]["operation"]["heights"]["retract"] = json!(22);
@@ -3345,6 +3353,21 @@ fn cutting_below_the_stocks_bottom_is_refused_for_every_operation() {
     assert!(below(&r).is_empty(), "{r}");
     let r = run(&mut s, "cam.job", job(json!([contour(-21.0), holes(-22.5)]), None));
     assert!(below(&r).is_empty(), "{r}");
+    // The stock standing on a parallel given as a fixture (6 mm tall, clear of the cuts): the
+    // cuts may go through into the room it stands the stock up in, down to its bottom (Z-26),
+    // as they are checked against it; below that they are refused.
+    run(&mut s, "solid.box", json!({"length": 50, "width": 2, "height": 6, "corner": [-25, -6, -26], "operation": "new", "body_name": "Parallel"}));
+    let on_parallel = |ops: Value| {
+        let mut j = job(ops, Some(&stock));
+        j["job"]["bodies"] = json!(["Plate"]);
+        j["job"]["fixtures"] = json!(["Parallel"]);
+        j
+    };
+    let r = run(&mut s, "cam.job", on_parallel(json!([contour(-21.0), holes(-22.5)])));
+    assert!(below(&r).is_empty() && r["gouge"]["pass"] == true, "{r}");
+    let r = run(&mut s, "cam.job", on_parallel(json!([contour(-27.0)])));
+    let found = below(&r);
+    assert!(found.len() == 1 && found[0].contains("1 mm below the lowest fixture (Z-26)"), "{r}");
 }
 
 // Profiles, heights and tools worked out for an agent, and refusals with a fix (cam_agent.rs).
@@ -3608,6 +3631,19 @@ fn the_compact_reply_keeps_what_an_agent_needs() {
     let r = run(&mut s, "cam.job", json!({"job": agent_job(ops), "dry_run": true, "compact": true}));
     assert_eq!(r["passed"], false, "{r}");
     assert!(r["failures"][0]["fix"].as_str().is_some_and(|f| f.contains("heights.bottom")), "{r}");
+    // After an indexed pattern (one job operation, several in the program) each line is numbered
+    // and given the worked-out heights of the job operation it comes from.
+    let mut s = square_block();
+    let mut last = face_op("last", 40.0);
+    last["name"] = json!("last");
+    last.as_object_mut().unwrap().remove("heights");
+    let job = faces_job(json!([{"type": "indexed_pattern", "count": 2, "operation": face_op("face", 40.0)}, last]));
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true, "compact": true}));
+    let lines: Vec<&str> = r["operations"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert_eq!(lines.len(), 3, "{r}");
+    assert!(lines[0].starts_with("0 `face A0`") && !lines[0].contains("worked out"), "{lines:?}");
+    assert!(lines[1].starts_with("0 `face A180`") && !lines[1].contains("worked out"), "{lines:?}");
+    assert!(lines[2].starts_with("1 `last`") && lines[2].contains("worked out"), "{lines:?}");
 }
 
 /// The new keys are as strict as the rest: a misspelt key in a tool spec, partial heights, a
@@ -4176,6 +4212,8 @@ fn a_wall_rounded_at_its_foot_still_rises_to_its_top() {
     let id = p["id"].as_str().unwrap();
     let said = sug["check"].as_array().unwrap().iter().any(|c| c.as_str().unwrap().contains(id) && c.as_str().unwrap().contains("not upright"));
     assert!(said, "{sug}");
+    // Said in one line of words, not with the source's indentation in it.
+    assert!(sug["check"].as_array().unwrap().iter().all(|c| !c.as_str().unwrap().contains("  ")), "{sug}");
 }
 
 #[test]

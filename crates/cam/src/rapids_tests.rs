@@ -5,7 +5,7 @@
 use solidcore_record::{Vec2, Vec3};
 
 use crate::foundation_tests::block;
-use crate::gcode5::{MachineOperation, MachineProgram, Post5, emit_program};
+use crate::gcode5::{MachineOperation, MachineProgram, Post5, Rewind, emit_program};
 use crate::indexed::IndexedOperation;
 use crate::kinematics::Machine;
 use crate::rapids::{RAPID_STEP, RapidCheck, RapidHitKind, check_rapids, check_rapids_staged, check_travel};
@@ -454,4 +454,78 @@ fn a_rapid_down_through_what_its_operation_cut_is_not_in_the_stock() {
     assert!(r.pass(), "{r:?}");
     let r = check3(&levels(8.0), &post, Some(&stock));
     assert!(r.hits.iter().any(|h| h.kind == RapidHitKind::Stock && (h.at.x - 8.0).abs() < 1e-6), "{r:?}");
+}
+
+/// The same levels on a round bar, indexed at a quarter turn as well as at A0: the way down
+/// into what the level before cut is along the tool's axis whatever the angle, so the bar does
+/// not count against it there either; where nothing was cut it does.
+#[test]
+fn an_indexed_rapid_down_through_its_own_cut_is_not_in_the_stock_at_any_angle() {
+    let machine = Machine::four_axis_a();
+    let post = Post5::mach3_4axis();
+    let bar = Stock::Cylinder { radius: 16.0, x_min: -30.0, x_max: 30.0 };
+    let far = block(Vec3::new(100.0, 100.0, -10.0), Vec3::new(101.0, 101.0, -9.0));
+    let stock_hits = |a: f64, x: f64| {
+        let v = Vec3::new;
+        let moves = vec![
+            Move::Rapid { to: v(-5.0, 0.0, 30.0) },
+            Move::Rapid { to: v(-5.0, 0.0, 18.0) },
+            Move::Feed { to: v(-5.0, 0.0, 15.0), feed: 100.0 },
+            Move::Feed { to: v(5.0, 0.0, 15.0), feed: 300.0 },
+            Move::Rapid { to: v(5.0, 0.0, 30.0) },
+            Move::Rapid { to: v(x, 0.0, 30.0) },
+            // Down at rapid to half a millimetre above the level just cut, inside the bar.
+            Move::Rapid { to: v(x, 0.0, 15.5) },
+            Move::Feed { to: v(x, 0.0, 14.0), feed: 100.0 },
+            Move::Feed { to: v(5.0, 0.0, 14.0), feed: 300.0 },
+            Move::Rapid { to: v(5.0, 0.0, 30.0) },
+        ];
+        let p = program(vec![MachineOperation::Indexed(IndexedOperation {
+            name: "levels".into(),
+            tool: flat(1, 6.0),
+            spindle_rpm: 12000.0,
+            coolant: false,
+            rotary: vec![a],
+            path: Toolpath { moves },
+        })]);
+        let text = emit_program(&p, &post, &machine).unwrap();
+        let r = check_rapids(&text, &p, &post, &machine, &far, &far, Some(&bar), 0.01, RAPID_STEP).unwrap();
+        r.hits.into_iter().filter(|h| h.kind == RapidHitKind::Stock).collect::<Vec<_>>()
+    };
+    for a in [0.0, std::f64::consts::FRAC_PI_2, std::f64::consts::PI] {
+        assert!(stock_hits(a, -5.0).is_empty(), "A {a}: {:?}", stock_hits(a, -5.0));
+        let elsewhere = stock_hits(a, 8.0);
+        assert!(elsewhere.iter().any(|h| (h.depth - 0.5).abs() < 0.02), "A {a}: {elsewhere:?}");
+    }
+}
+
+/// A rewind draws the tool out of a wrapped cut, returns home, turns A a whole turn back and
+/// comes down at rapid to just above where it left: that way down is the way it went out, so
+/// the bar does not count against it, though only its end is known after the return home.
+#[test]
+fn a_rewinds_rapid_back_to_where_it_left_the_cut_is_not_in_the_stock() {
+    let machine = Machine::four_axis_a_with(Vec3::ZERO, false, Some((-std::f64::consts::TAU, std::f64::consts::TAU)));
+    let mut post = Post5::mach3_4axis();
+    post.safe_rotate = vec!["G28 G91 Z0.".into(), "G90".into()];
+    post.rewind = Some(Rewind { distance: 25.0, retract_feed: 500.0, plunge_feed: 250.0 });
+    let far = block(Vec3::new(100.0, 100.0, -10.0), Vec3::new(101.0, 101.0, -9.0));
+    // Three turns at radius 15 into a bar of radius 17, 10 mm along X a turn.
+    let n = 360;
+    let at = |k: usize| rotary_pose(10.0 * k as f64 / 120.0, std::f64::consts::TAU * k as f64 / 120.0, 15.0);
+    let mut moves = vec![Move5::Rapid { to: rotary_pose(0.0, 0.0, 25.0) }, Move5::Feed { to: at(0), feed: 200.0 }];
+    moves.extend((1..=n).map(|k| Move5::Feed { to: at(k), feed: 300.0 }));
+    moves.push(Move5::Feed { to: rotary_pose(30.0, 0.0, 25.0), feed: 1000.0 });
+    let p = program(vec![MachineOperation::Continuous(Operation5 {
+        name: "helix".into(),
+        tool: flat(1, 4.0),
+        spindle_rpm: 12000.0,
+        coolant: false,
+        path: Toolpath5 { moves },
+        plunge_feed: None,
+    })]);
+    let text = emit_program(&p, &post, &machine).unwrap();
+    assert!(text.contains("G0 A-360"), "a rewind: {text}");
+    let bar = Stock::Cylinder { radius: 17.0, x_min: -5.0, x_max: 40.0 };
+    let r = check_rapids(&text, &p, &post, &machine, &far, &far, Some(&bar), 0.01, RAPID_STEP).unwrap();
+    assert!(!r.hits.iter().any(|h| h.kind == RapidHitKind::Stock), "{r:?}");
 }

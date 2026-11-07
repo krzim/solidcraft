@@ -9,7 +9,7 @@ use solidcraft_cam::indexed::{IndexedOperation, frame_for_index};
 use solidcraft_cam::kinematics::Machine;
 use solidcraft_cam::rapids::{RAPID_STEP, check_rapids_staged, check_travel};
 use solidcraft_cam::stock::{FaceParams, Stock, default_face_overhang, default_face_stepover, face};
-use solidcraft_cam::{Frame, Heights, Move5, Toolpath};
+use solidcraft_cam::{Frame, Heights, Move5, Surface, Toolpath};
 
 use super::{Ctx, Planned, Surfaces, cam_err, finite_point, num, v3};
 use crate::Result;
@@ -45,16 +45,30 @@ pub(super) fn stock_of(cmd: &str, job: &CamJob, surfaces: &Surfaces, tol: f64, n
     Ok(Some(stock))
 }
 
-/// The stock as the reply shows it.
 /// Fails each operation whose lowest cut goes below a box stock's bottom by more than `tol` on
 /// a machine without rotaries: below it are the parallels, the vise's floor or the table that
-/// hold the stock. The deepest point of every cutting move with the tool upright counts (a
+/// hold the stock, or below the lowest fixture that reaches under it. The deepest point of every cutting move with the tool upright counts (a
 /// drill's point included); facing is refused earlier, when it is planned.
-pub(super) fn check_below_stock(planned: &[Planned], stock: &Stock, machine: &Machine, tol: f64, failures: &mut Vec<String>) {
+pub(super) fn check_below_stock(
+    planned: &[Planned],
+    stock: &Stock,
+    fixtures: Option<&Surface>,
+    machine: &Machine,
+    tol: f64,
+    failures: &mut Vec<String>,
+) {
     let Stock::Box { min, .. } = *stock else { return };
     if !machine.rotaries.is_empty() {
         return;
     }
+    // Fixtures that reach below the stock (parallels it stands on, a vise's jaws) are what holds
+    // it there, and every cut is checked against them: a cut through the stock may go on down
+    // to where the lowest of them reaches (what is below that, the vise's floor or the table, is
+    // not modelled).
+    let held = fixtures
+        .map(|f| f.triangles().iter().flat_map(|t| t.iter().map(|p| p.z)).fold(f64::INFINITY, f64::min))
+        .filter(|z| z.is_finite() && *z < min.z);
+    let floor = held.unwrap_or(min.z);
     for p in planned {
         let lowest = p
             .poses
@@ -65,19 +79,32 @@ pub(super) fn check_below_stock(planned: &[Planned], stock: &Stock, machine: &Ma
                 _ => None,
             })
             .fold(f64::INFINITY, f64::min);
-        if lowest.is_finite() && lowest < min.z - tol {
-            failures.push(format!(
-                "below the stock: operation `{}` cuts down to Z{}, {} mm below the stock's bottom (Z{}), into what holds the stock (parallels, the vise's floor or the table): raise its bottom to Z{} or above, or give a stock that reaches as deep as the cut (set on a spoil board or on parallels clear of the cut)",
+        if !(lowest.is_finite() && lowest < floor - tol) {
+            continue;
+        }
+        failures.push(match held {
+            Some(z) => format!(
+                "below the stock: operation `{}` cuts down to Z{}, {} mm below the lowest fixture (Z{}) under the stock's bottom (Z{}), into what holds them (the vise's floor or the table): raise its bottom to Z{} or above, or model what the stock stands on as fixtures reaching as deep as the cut",
+                p.report.name,
+                num(lowest),
+                num(z - lowest),
+                num(z),
+                num(min.z),
+                num(z)
+            ),
+            None => format!(
+                "below the stock: operation `{}` cuts down to Z{}, {} mm below the stock's bottom (Z{}), into what holds the stock (parallels, the vise's floor or the table): raise its bottom to Z{} or above, give a stock that reaches as deep as the cut (set on a spoil board), or give the parallels it stands on as `fixtures` (the cut is then checked against them)",
                 p.report.name,
                 num(lowest),
                 num(min.z - lowest),
                 num(min.z),
                 num(min.z)
-            ));
-        }
+            ),
+        });
     }
 }
 
+/// The stock as the reply shows it.
 pub(super) fn stock_report(stock: &Stock) -> StockReport {
     match *stock {
         Stock::Box { min, max } => {
