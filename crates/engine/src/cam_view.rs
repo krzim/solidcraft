@@ -14,7 +14,7 @@ use solidcore_record::Vec3;
 use solidcraft_cam::findings::{FindingEvent, Severity};
 use solidcraft_cam::machine_model::{MeshPart, Mount, PartShape, nose_above_tip};
 use solidcraft_cam::playback::{MoveKind, Playback};
-use solidcraft_cam::sim::{Grid, StockShape};
+use solidcraft_cam::sim::StockShape;
 use solidcraft_cam::stock_mesh::{CLASS_TOOL, display_step, tile_mesh};
 use solidcraft_cam::tool_mesh::ToolMeshes;
 use solidcraft_geom::prelude::*;
@@ -271,20 +271,14 @@ pub fn bounds(s: &Session) -> Option<Aabb3> {
     Some(Aabb3 { min: b.min + v.origin, max: b.max + v.origin })
 }
 
-/// Two unit vectors square to `a` and to each other.
-fn frame_of(a: Vec3) -> (Vec3, Vec3) {
-    let pick = if a.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
-    let u = a.cross(pick).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0));
-    (u, a.cross(u))
-}
-
-/// `m` moved so that its origin is at `at` and its +Z along `axis` (its X along `u`).
-fn placed(m: &Mesh, at: Vec3, axis: Vec3) -> Mesh {
-    let (u, v) = frame_of(axis);
+/// `m` moved so that its origin is at `at` and its X, Y and Z along `frame` (the spindle's own
+/// frame against the work: a part on the spindle stands where the collision check puts it).
+fn placed(m: &Mesh, at: Vec3, frame: [Vec3; 3]) -> Mesh {
+    let [u, v, w] = frame;
     let mut out = m.clone();
     out.normals.clear();
     for p in &mut out.positions {
-        *p = at + u * p.x + v * p.y + axis * p.z;
+        *p = at + u * p.x + v * p.y + w * p.z;
     }
     out
 }
@@ -339,7 +333,6 @@ fn scene_in_work(v: &CamView, sc: &mut Scene) {
     let plan = p.plan();
     let tl = p.timeline();
     let (now, frac) = p.at();
-    let rotary = matches!(plan.grid(), Grid::Radii { .. });
     // Tools coloured in the order the program uses them.
     let mut used: Vec<u8> = Vec::new();
     for c in &tl.tool_changes {
@@ -425,6 +418,7 @@ fn scene_in_work(v: &CamView, sc: &mut Scene) {
     }
     // The tool, its holder and the spindle's parts at the pose now.
     let Some(pose) = p.pose_now() else { return };
+    let frame = p.head_frame_now();
     let step = plan.step(now);
     let tool = step.as_ref().and_then(|st| p.tool(st.slot));
     if let Some(t) = tool
@@ -433,19 +427,17 @@ fn scene_in_work(v: &CamView, sc: &mut Scene) {
         if v.layers.tool {
             for m in [&meshes.cutting, &meshes.shank] {
                 if !m.triangles.is_empty() {
-                    sc.meshes.push(SceneMesh::solid(Arc::new(placed(m, pose.tip, pose.axis)), colors::TOOL));
+                    sc.meshes.push(SceneMesh::solid(Arc::new(placed(m, pose.tip, frame)), colors::TOOL));
                 }
             }
         }
         if v.layers.holder && !meshes.holder.triangles.is_empty() {
-            sc.meshes.push(SceneMesh::solid(Arc::new(placed(&meshes.holder, pose.tip, pose.axis)), colors::HOLDER));
+            sc.meshes.push(SceneMesh::solid(Arc::new(placed(&meshes.holder, pose.tip, frame)), colors::HOLDER));
         }
     }
     let setup = p.setup();
-    let a = plan.joints(now, frac).and_then(|j| j.rotary.first().copied()).unwrap_or(0.0);
-    // Table-fixed things turn with the work frame on a 4th axis: by -A about X.
-    let (sa, ca) = (-a).sin_cos();
-    let turn = move |q: Vec3| if rotary { Vec3::new(q.x, q.y * ca - q.z * sa, q.y * sa + q.z * ca) } else { q };
+    // Things on the bed turn against the work as the rotaries turn it.
+    let turn = |q: Vec3| p.bed_point_now(q);
     if v.layers.machine
         && let (Some(model), Some(t)) = (&setup.model, tool)
     {
@@ -462,12 +454,12 @@ fn scene_in_work(v: &CamView, sc: &mut Scene) {
                     }
                 };
                 let m = box_mesh(lo, hi, &|q| q);
-                sc.meshes.push(SceneMesh { opacity: 0.6, ..SceneMesh::solid(Arc::new(placed(&m, nose, pose.axis)), colors::MACHINE) });
+                sc.meshes.push(SceneMesh { opacity: 0.6, ..SceneMesh::solid(Arc::new(placed(&m, nose, frame)), colors::MACHINE) });
             }
         } else {
             for mp in meshes {
                 let c = Rgb((mp.color[0] * 255.0) as u8, (mp.color[1] * 255.0) as u8, (mp.color[2] * 255.0) as u8);
-                sc.meshes.push(SceneMesh::solid(Arc::new(placed(&mp.mesh, nose, pose.axis)), c));
+                sc.meshes.push(SceneMesh::solid(Arc::new(placed(&mp.mesh, nose, frame)), c));
             }
         }
     }

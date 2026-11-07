@@ -17,7 +17,7 @@
 //! down as a trapezoid (or a triangle when it is too short to reach its top speed), slowing at
 //! a corner to the speed both blocks share times the cosine of the turn (to a stop at a right
 //! angle or more, and between a rapid and a cut), round an arc to `√(a·r)`; spindle starts and
-//! tool changes wait their time. Ported from krzim/dmc2-gcode-sim (MIT, same author).
+//! tool changes wait their time. Ported from krzim's own G-code simulator (MIT, same author).
 //!
 //! A dwell's `P` is read in the unit the post writes it in ([`DwellUnit`]), which must be the
 //! unit the controller is set to read (some read `G4 P` in seconds, others in milliseconds).

@@ -3410,3 +3410,30 @@ fn pictures_of_the_simulation_view() {
         picture(&s, "example-dome-60-machine.png", 2.2);
     }
 }
+
+#[test]
+fn the_pictures_machine_part_stands_where_the_collision_check_puts_it() {
+    let mut s = dome();
+    let dir = Dir::new("view-plate");
+    let model = dir.file("m.machine-model.json");
+    std::fs::write(&model, VIEW_MODEL).unwrap();
+    let mut job = dome_job();
+    job["stock"] = json!({"box": {"min": [-20, -20, -20], "max": [20, 20, 8]}});
+    run(&mut s, "cam.view.load", json!({"job": job, "machine_model_path": model, "resolution": 0.5}));
+    run(&mut s, "cam.view.seek", json!({"percent": 50}));
+    let mut sc = solidcraft_render::Scene::default();
+    crate::cam_view::scene(&s, &mut sc);
+    let bounds = |m: &solidcraft_render::SceneMesh| {
+        m.mesh.positions.iter().fold(([f64::MAX; 3], [f64::MIN; 3]), |(lo, hi), p| {
+            ([lo[0].min(p.x), lo[1].min(p.y), lo[2].min(p.z)], [hi[0].max(p.x), hi[1].max(p.y), hi[2].max(p.z)])
+        })
+    };
+    // The tool's axis: the middle of its cutting end.
+    let (tl, th) = bounds(sc.meshes.iter().find(|m| m.color == crate::cam_view::colors::TOOL).expect("the tool is drawn"));
+    let tip = [0.5 * (tl[0] + th[0]), 0.5 * (tl[1] + th[1])];
+    // The Z plate (spindle frame X -40..40, Y 30..45).
+    let (lo, hi) = bounds(sc.meshes.iter().find(|m| m.color == crate::cam_view::colors::MACHINE).expect("the plate is drawn"));
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    assert!(near(lo[0] - tip[0], -40.0) && near(hi[0] - tip[0], 40.0), "X {lo:?} {hi:?} about the tip {tip:?}");
+    assert!(near(lo[1] - tip[1], 30.0) && near(hi[1] - tip[1], 45.0), "Y {lo:?} {hi:?} about the tip {tip:?}");
+}

@@ -358,12 +358,14 @@ fn readout(s: &Snapshot, ui: &mut egui::Ui, t: &Tokens) {
         ui.end_row();
         ui.label(dim(tr("ui.cam_view.position")));
         let m = &st.position.machine;
-        let mut pos = format!("X {:.2}  Y {:.2}  Z {:.2}", m.x, m.y, m.z);
-        if let Some(a) = m.a_deg {
-            pos = format!("{pos}  A {a:.1}°");
-        }
-        ui.label(RichText::new(pos).monospace());
+        ui.label(RichText::new(format!("X {:.2}  Y {:.2}  Z {:.2}", m.x, m.y, m.z)).monospace());
         ui.end_row();
+        // The 4th axis in a row of its own: one row is too narrow for four axes.
+        if let Some(a) = m.a_deg {
+            ui.label(dim("A"));
+            ui.label(RichText::new(format!("{a:.2}°")).monospace());
+            ui.end_row();
+        }
         ui.label(dim(tr("ui.cam_view.feed")));
         let kind = tr(match st.kind.as_str() {
             "rapid" => "ui.cam_view.kind_rapid",
@@ -400,16 +402,18 @@ fn findings(s: &Snapshot, ui: &mut egui::Ui, asks: &mut Vec<(&'static str, Value
             ui.horizontal(|ui| {
                 let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
                 ui.painter().circle_filled(dot.center(), 4.0, if f.error { t.error } else { t.warning });
+                // A finding still to come says when, in its own row: a label after the row's
+                // full-width picker would widen the panel on every frame.
                 let ahead = f.time_s > now + 1e-9;
-                let text = format!("{} {}  {}", tr("ui.cam_view.line"), f.line, f.code);
+                let mut text = format!("{} {}  {}", tr("ui.cam_view.line"), f.line, f.code);
+                if ahead {
+                    text = format!("{text}  ({})", clock(f.time_s));
+                }
                 let key = format!("sc_cam_finding_{}", f.index);
                 let picked = crate::ui_kit::list_picker(ui, &key, &text, false);
                 let picked = picked.backing_on_hover_text(f.message.clone());
                 if picked.clicked() {
                     asks.push(("cam.view.seek", json!({"finding": f.index})));
-                }
-                if ahead {
-                    ui.label(RichText::new(clock(f.time_s)).color(t.text_dim));
                 }
             });
         }

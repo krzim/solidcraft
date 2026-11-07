@@ -479,22 +479,18 @@ fn box_into(b: &mut BlockBuilder, min: Vec3, max: Vec3, at: &dyn Fn(Vec3) -> Vec
     }
 }
 
-/// The workholding and the table, see-through with their edges; on a 4th axis turned with the
-/// work (by -A about X).
+/// The workholding and the table, see-through with their edges; on a 4th axis turned against
+/// the work as the rotary turns it (as the collision check has them, on the bed).
 fn fixture_block(p: &Playback, sc: &mut GpuScene, t: &Tokens, origin: Vec3, take: &mut Take<'_>, drawn: &mut Drawn) {
     let Some(scene) = p.setup().scene.clone() else { return };
     let plan = p.plan();
-    let (now, frac) = p.at();
-    let rotary = matches!(plan.grid(), Grid::Radii { .. });
-    let a = if rotary { plan.joints(now, frac).and_then(|j| j.rotary.first().copied()).unwrap_or(0.0) } else { 0.0 };
+    let turns: Vec<u64> = p.rotary_now().iter().map(|a| a.to_bits()).collect();
     let fixture = sc.color(see_through(t.construction_geom, 70));
     let table = sc.color(see_through(t.grid_major, 45));
     let edge = sc.color(c4(t.construction_geom));
-    let key =
-        hash_of(("fixtures", plan_id(plan), a.to_bits(), fixture.0, table.0, edge.0, origin.x.to_bits(), origin.y.to_bits(), origin.z.to_bits()));
+    let key = hash_of(("fixtures", plan_id(plan), &turns, fixture.0, table.0, edge.0, origin.x.to_bits(), origin.y.to_bits(), origin.z.to_bits()));
     let block = take(key, &mut || {
-        let (sa, ca) = (-a).sin_cos();
-        let turn = move |q: Vec3| if rotary { Vec3::new(q.x, q.y * ca - q.z * sa, q.y * sa + q.z * ca) + origin } else { q + origin };
+        let turn = |q: Vec3| p.bed_point_now(q) + origin;
         let mut b = BlockBuilder::default();
         for o in &scene.obstacles {
             let fill = if o.kind == ObstacleKind::Table { table } else { fixture };
@@ -507,17 +503,11 @@ fn fixture_block(p: &Playback, sc: &mut GpuScene, t: &Tokens, origin: Vec3, take
     }
 }
 
-/// Two unit vectors square to `a` and to each other (as the engine's picture places the tool).
-fn frame_of(a: Vec3) -> (Vec3, Vec3) {
-    let pick = if a.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
-    let u = a.cross(pick).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0));
-    (u, a.cross(u))
-}
-
-/// The rows of the rigid move that puts a part's origin at `at` and its +Z along `axis`.
-pub(crate) fn placement(at: Vec3, axis: Vec3) -> [[f32; 4]; 3] {
-    let a = axis.normalized().unwrap_or(Vec3::new(0.0, 0.0, 1.0));
-    let (u, v) = frame_of(a);
+/// The rows of the rigid move that puts a part's origin at `at` and its X, Y and Z along
+/// `frame` (the spindle's own frame against the work, [`Playback::head_frame_now`]: a part on
+/// the spindle stands where the collision check puts it, and the tool along its axis).
+pub(crate) fn placement(at: Vec3, frame: [Vec3; 3]) -> [[f32; 4]; 3] {
+    let [u, v, a] = frame;
     [
         [u.x as f32, v.x as f32, a.x as f32, at.x as f32],
         [u.y as f32, v.y as f32, a.y as f32, at.y as f32],
@@ -648,7 +638,8 @@ fn tool_parts(v: &CamView, p: &Playback, t: &Tokens, cache: &mut HashMap<(u32, u
     let (now, _) = p.at();
     let Some(tool) = plan.step(now).and_then(|s| p.tool(s.slot)) else { return };
     let at = pose.tip + v.origin;
-    let rows = placement(at, pose.axis);
+    let frame = p.head_frame_now();
+    let rows = placement(at, frame);
     let steel = c4(t.text_dim);
     let holder = c4(t.text.gamma_multiply(0.75).to_opaque());
     if let Some(meshes) = v.tool_mesh(tool.number) {
@@ -671,7 +662,7 @@ fn tool_parts(v: &CamView, p: &Playback, t: &Tokens, cache: &mut HashMap<(u32, u
     }
     let Some(model) = p.setup().model.clone() else { return };
     let nose = at + pose.axis * nose_above_tip(tool, Some(model.as_ref()));
-    let nose_rows = placement(nose, pose.axis);
+    let nose_rows = placement(nose, frame);
     spindle_parts(v, &model, t, cache, nose_rows, drawn);
 }
 

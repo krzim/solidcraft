@@ -14,7 +14,7 @@
 //! the shank rubbing (material above the flutes), the tool's shank or holder or a machine part
 //! coming down on the stock, the cutter, holder or a machine part running into the workholding
 //! or the table, and the spindle nose above its travel ([`crate::machine_model`]). Ported from
-//! krzim/dmc2-gcode-sim (MIT, same author): stepping the simulation, the holder and machine
+//! krzim's own G-code simulator (MIT, same author): stepping the simulation, the holder and machine
 //! checks against the stock as it is, and the findings they give.
 
 use std::sync::Arc;
@@ -26,6 +26,7 @@ use solidcraft_geom::prelude::*;
 use crate::findings::{FindingEvent, FindingLog, Severity};
 use crate::gcode::number;
 use crate::gcode5::{JointWords, parse5};
+use crate::kinematics::{bed_point, head_frame};
 use crate::machine_model::{MachineModel, ZoneOf, clearance, zones};
 use crate::machine_time::{DwellUnit, MachineRates, block_times};
 use crate::multiaxis::Pose;
@@ -379,6 +380,23 @@ impl Playback {
         self.plan.pose(self.cursor.0, self.cursor.1)
     }
 
+    /// The machine's rotary axes now (radians, as written; empty on a 3-axis machine).
+    pub fn rotary_now(&self) -> Vec<f64> {
+        self.plan.joints(self.cursor.0, self.cursor.1).map(|j| j.rotary).unwrap_or_default()
+    }
+
+    /// The spindle's own X, Y and Z now, in work coordinates ([`head_frame`]): how a part on
+    /// the spindle is placed, as the collision check places it.
+    pub fn head_frame_now(&self) -> [Vec3; 3] {
+        head_frame(self.plan.machine(), &self.rotary_now())
+    }
+
+    /// Where a point fixed to the bed (work coordinates with the rotaries at zero) is now, in
+    /// work coordinates ([`bed_point`]): the workholding turns against the work on a 4th axis.
+    pub fn bed_point_now(&self, p: Vec3) -> Vec3 {
+        bed_point(self.plan.machine(), &self.rotary_now(), p)
+    }
+
     /// The time now (seconds from the start).
     pub fn time_now(&self) -> f64 {
         self.timeline.time_at(self.cursor.0, self.cursor.1)
@@ -593,6 +611,9 @@ impl Playback {
                 Grid::Radii { .. } => {
                     // The tool's own envelopes, tilted with it, sampled round their bottoms.
                     let envelopes = tool.envelopes();
+                    // The first envelope is the plain shank only when the tool stands out of
+                    // its holder further than its flutes (as `zones` names them).
+                    let shank = usize::from(tool.stickout.is_some_and(|s| s > tool.flute_length));
                     'poses: for s in first..=n {
                         let Some(pose) = self.plan.pose(i, s as f64 / n as f64) else { continue };
                         let side = pose.axis.cross(Vec3::new(1.0, 0.0, 0.0)).normalized().unwrap_or(Vec3::new(0.0, 1.0, 0.0));
@@ -604,7 +625,7 @@ impl Playback {
                                 for rr in [0.0, 0.5, 1.0] {
                                     let p = c + side * (ca * e.radius * rr) + other * (sa * e.radius * rr);
                                     if self.state.contains(p) {
-                                        let of = if k == 0 && e.bottom <= tool.flute_length + 1e-9 { ZoneOf::Shank } else { ZoneOf::Holder(k) };
+                                        let of = if k < shank { ZoneOf::Shank } else { ZoneOf::Holder(k - shank) };
                                         let (code, what) = stock_hit(of, &tool, None);
                                         ev(&code, Severity::Error, p, 0.0, format!("{what} comes down onto the stock"));
                                         continue 'poses;

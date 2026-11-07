@@ -352,3 +352,197 @@ fn tools_are_drawn_from_their_profile() {
             > tool_meshes(&Tool::new(3, ToolKind::FlatEndmill, 8.0, 9.0), 16).unwrap().cutting.positions.len()
     );
 }
+
+/// Every kind of tool the view draws, each with its closed-form height above the tip at a
+/// distance from its axis (written here from the tools' sizes, not taken from the simulation).
+type HeightAt = Box<dyn Fn(f64) -> f64>;
+
+fn kinds() -> Vec<(Tool, HeightAt)> {
+    let r = 3.0;
+    let bull = 1.0;
+    let drill = 1.0 / (118f64.to_radians() * 0.5).tan();
+    let face_corner = 0.8;
+    let corner = move |c: f64| move |d: f64| if d <= r - c { 0.0 } else { c - (c * c - (d - (r - c)).powi(2)).max(0.0).sqrt() };
+    vec![
+        (Tool::new(1, ToolKind::FlatEndmill, 6.0, 20.0), Box::new(|_d: f64| 0.0)),
+        (Tool::new(2, ToolKind::BallEndmill, 6.0, 20.0), Box::new(move |d: f64| r - (r * r - d * d).max(0.0).sqrt())),
+        (Tool { corner_radius: Some(bull), ..Tool::new(3, ToolKind::BullNose, 6.0, 20.0) }, Box::new(corner(bull))),
+        (Tool { angle_deg: Some(90.0), ..Tool::new(4, ToolKind::Chamfer, 6.0, 20.0) }, Box::new(|d: f64| d)),
+        (Tool { point_angle_deg: Some(118.0), ..Tool::new(5, ToolKind::Drill, 6.0, 20.0) }, Box::new(move |d: f64| drill * d)),
+        (Tool { corner_radius: Some(face_corner), ..Tool::new(6, ToolKind::FaceMill, 6.0, 20.0) }, Box::new(corner(face_corner))),
+    ]
+}
+
+#[test]
+fn every_kind_of_tool_cuts_its_own_profile_along_lines_and_arcs() {
+    let kinds = kinds();
+    let tools: Vec<Tool> = kinds.iter().map(|(t, _)| t.clone()).collect();
+    let wide = StockShape::Box { min: Vec3::new(0.0, 0.0, -10.0), max: Vec3::new(80.0, 80.0, 0.0) };
+    // Tool k: a straight slot along X at y = 6 + 12 k, 2 mm deep, and a half circle of radius 8
+    // about (60, 6 + 12 k), 1.5 mm deep, going round through -Y.
+    let mut text = String::from("G21 G90 G17\n");
+    for (k, t) in tools.iter().enumerate() {
+        let y = 6.0 + 12.0 * k as f64;
+        text.push_str(&format!(
+            "T{n} M6\nS12000 M3\nG0 X5. Y{y:.3} Z5.\nG1 Z-2. F200\nG1 X35. F600\nG0 Z5.\nG0 X68. Y{y:.3}\nG1 Z-1.5 F200\nG2 X52. Y{y:.3} I-8. J0. F600\nG0 Z5.\n",
+            n = t.number
+        ));
+    }
+    text.push_str("M5\nM30\n");
+    let part = block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(80.0, 80.0, -9.0));
+    let mut p = player(&text, &Machine::three_axis(), &tools, &wide, part, None, 1.0e9);
+    p.seek(usize::MAX, 0.0, None).unwrap();
+    for (k, (t, h)) in kinds.iter().enumerate() {
+        let y = 6.0 + 12.0 * k as f64;
+        for i in 0..60 {
+            let d = -2.95 + 0.1 * f64::from(i);
+            let want = (-2.0 + h(d.abs())).min(0.0);
+            let got = height(&p, 20.05, y + d);
+            assert!((got - want).abs() < 1e-9, "{:?} line, {d:+.2} mm off the path: {got} (want {want})", t.kind);
+        }
+        // Across the arc where it is lowest (straight below its centre).
+        for i in 0..60 {
+            let off = -2.95 + 0.1 * f64::from(i);
+            let want = (-1.5 + h(off.abs())).min(0.0);
+            let got = height(&p, 60.05, y - 8.0 + off);
+            assert!((got - want).abs() < 2e-3, "{:?} arc, {off:+.2} mm off the path: {got} (want {want})", t.kind);
+        }
+        // Outside its reach the stock is whole.
+        assert_eq!(height(&p, 20.05, y + 3.15), 0.0, "{:?}", t.kind);
+    }
+}
+
+#[test]
+fn every_kind_of_tool_is_drawn_with_its_own_profile_and_size() {
+    for (t, h) in kinds() {
+        let m = tool_meshes(&t, 48).unwrap();
+        let r = t.diameter * 0.5;
+        let widest = m.cutting.positions.iter().map(|p| p.x.hypot(p.y)).fold(0.0, f64::max);
+        assert!((widest - r).abs() < 1e-9, "{:?}: drawn {} mm across, is {} mm", t.kind, 2.0 * widest, t.diameter);
+        let lowest = m.cutting.positions.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+        assert!(lowest.abs() < 1e-12, "{:?}: the tip is drawn at {lowest}, not at the origin", t.kind);
+        // Every point is on the cutting end's surface, on the side, or on the top's centre.
+        for p in &m.cutting.positions {
+            let rho = p.x.hypot(p.y);
+            let on_end = (p.z - h(rho)).abs() < 1e-9;
+            let on_side = (rho - r).abs() < 1e-9 && p.z >= h(r) - 1e-9;
+            let top = rho < 1e-9 && (p.z - t.flute_length).abs() < 1e-9;
+            assert!(on_end || on_side || top, "{:?}: a point at r {rho}, z {} is off the tool", t.kind, p.z);
+        }
+        assert!(m.cutting.positions.iter().all(|p| p.z <= t.flute_length + 1e-9), "{:?}", t.kind);
+    }
+}
+
+/// The reference cut: when `SOLIDCRAFT_CAM_REFERENCE_CUT` names a folder with `program.nc` (five
+/// tools: T1 flat, T2 ball, T3 bull nose r1, T4 90 degree chamfer, T5 118 degree drill, all 6 mm)
+/// cut on a 40 x 40 x 10 block from (0, 0, -10), and `heights.txt` (the stock heights an
+/// independent heightfield simulator gave on the same 0.1 mm grid: `x0 y0 cell nx ny`, then one
+/// height per cell, row by row), the simulation's stock is held against it cell by cell.
+#[test]
+fn the_stock_matches_an_independent_simulators_cut() {
+    let Some(dir) = std::env::var_os("SOLIDCRAFT_CAM_REFERENCE_CUT").map(std::path::PathBuf::from) else {
+        eprintln!("SOLIDCRAFT_CAM_REFERENCE_CUT is not set: no reference cut to compare with");
+        return;
+    };
+    let text = std::fs::read_to_string(dir.join("program.nc")).unwrap();
+    let reference = std::fs::read_to_string(dir.join("heights.txt")).unwrap();
+    let mut words = reference.split_whitespace().map(|w| w.parse::<f64>().unwrap());
+    let mut next = || words.next().unwrap();
+    let (x0, y0, cell, nx, ny) = (next(), next(), next(), next() as usize, next() as usize);
+    let want: Vec<f64> = words.collect();
+    assert_eq!((nx, ny, want.len()), (400, 400, 160_000), "the reference is on the same 0.1 mm grid");
+    let tools = vec![
+        Tool::new(1, ToolKind::FlatEndmill, 6.0, 20.0),
+        Tool::new(2, ToolKind::BallEndmill, 6.0, 20.0),
+        Tool { corner_radius: Some(1.0), ..Tool::new(3, ToolKind::BullNose, 6.0, 20.0) },
+        Tool { angle_deg: Some(90.0), ..Tool::new(4, ToolKind::Chamfer, 6.0, 20.0) },
+        Tool { point_angle_deg: Some(118.0), ..Tool::new(5, ToolKind::Drill, 6.0, 20.0) },
+    ];
+    let part = block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(40.0, 40.0, -9.0));
+    let mut p = player(&text, &Machine::three_axis(), &tools, &stock(), part, None, 1.0e9);
+    p.seek(usize::MAX, 0.0, None).unwrap();
+    let at = |i: i64, j: i64| (i >= 0 && j >= 0 && (i as usize) < nx && (j as usize) < ny).then(|| want[j as usize * nx + i as usize]);
+    let mut diffs: Vec<f64> = Vec::new();
+    let mut beside_walls = 0usize;
+    for j in 0..ny as i64 {
+        for i in 0..nx as i64 {
+            let Some(r) = at(i, j) else { continue };
+            // The reference stamps the tool every 0.9 cell, so a cell beside a wall sees the
+            // wall at the stamp's offset; those cells are left out.
+            if [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|&(a, b)| at(i + a, j + b).is_some_and(|q| (q - r).abs() > 0.15)) {
+                beside_walls += 1;
+                continue;
+            }
+            let ours = height(&p, x0 + (i as f64 + 0.5) * cell, y0 + (j as f64 + 0.5) * cell);
+            diffs.push(ours - r);
+        }
+    }
+    diffs.sort_by(f64::total_cmp);
+    let q = |f: f64| diffs[((diffs.len() - 1) as f64 * f) as usize];
+    eprintln!(
+        "reference cut: {} cells compared ({beside_walls} beside walls left out); ours - reference: min {:.4}, 1% {:.4}, median {:.4}, 99% {:.4}, max {:.4}",
+        diffs.len(),
+        q(0.0),
+        q(0.01),
+        q(0.5),
+        q(0.99),
+        q(1.0)
+    );
+    // The reference stamps points, so it is never deeper than an exact sweep by more than its
+    // f32 rounding, and lags it by at most the scallop between its stamps.
+    assert!(q(1.0) < 0.01, "the simulation leaves material the reference cut: {} mm", q(1.0));
+    assert!(-q(0.0) < 0.06, "the simulation cuts deeper than the reference: {} mm", -q(0.0));
+}
+
+fn close_to(a: Vec3, b: Vec3, what: &str) {
+    assert!((a.x - b.x).abs().max((a.y - b.y).abs()).max((a.z - b.z).abs()) < 1e-9, "{what}: {a:?}, want {b:?}");
+}
+
+#[test]
+fn a_turn_of_plus_90_brings_the_works_plus_y_up_to_the_tool() {
+    let bar = StockShape::Cylinder { x_min: -10.0, x_max: 10.0, radius: 10.0 };
+    let text = "G21\nT1 M6\nS12000 M3\nG0 X0. Y0. Z30. A90.\nG1 Z8. F100\nG0 Z30.\n";
+    for reversed in [false, true] {
+        let machine = Machine::four_axis_a_with(Vec3::ZERO, reversed, None);
+        let mut p = player(text, &machine, &[flat(4.0)], &bar, cylinder_x(5.0, -15.0, 15.0, 64), None, 1.0e9);
+        let plunge = p.timeline().at_line(5).unwrap();
+        p.seek(plunge, 1.0, None).unwrap();
+        // The side that comes up under the tool: +Y, or -Y on a table wired the other way.
+        let up = if reversed { -1.0 } else { 1.0 };
+        let pose = p.pose_now().unwrap();
+        close_to(pose.tip, Vec3::new(0.0, 8.0 * up, 0.0), "the tip");
+        close_to(pose.axis, Vec3::new(0.0, up, 0.0), "the tool axis");
+        // The spindle's own frame against the work: X stays X, its Z is the tool axis, its +Y
+        // (the machine's back) is the work's -Z (or +Z).
+        let [x, y, z] = p.head_frame_now();
+        close_to(x, Vec3::X, "the spindle's X");
+        close_to(y, Vec3::new(0.0, 0.0, -up), "the spindle's Y");
+        close_to(z, pose.axis, "the spindle's Z");
+        // The bed under the bar is now on the side away from the tool.
+        close_to(p.bed_point_now(Vec3::new(5.0, 0.0, -20.0)), Vec3::new(5.0, -20.0 * up, 0.0), "the bed");
+        // The cut is on that side of the bar, and only there.
+        assert!(!p.state().contains(Vec3::new(0.0, 9.0 * up, 0.0)), "cut under the tool");
+        for q in [Vec3::new(0.0, 0.0, 9.0), Vec3::new(0.0, 0.0, -9.0), Vec3::new(0.0, -9.0 * up, 0.0)] {
+            assert!(p.state().contains(q), "{q:?} is still there");
+        }
+    }
+    // A 3-axis machine's spindle is square to the work.
+    let p =
+        player(&program("G1 Z-1. F100"), &Machine::three_axis(), &[flat(4.0)], &stock(), block(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)), None, 1.0e9);
+    assert_eq!(p.head_frame_now(), [Vec3::X, Vec3::Y, Vec3::Z]);
+}
+
+#[test]
+fn a_holder_on_a_bar_is_named_as_the_holder() {
+    // No plain shank: the flutes end in the holder, whose bottom comes down into the bar.
+    let held = Tool { holder: vec![HolderSection { diameter: 10.0, length: 10.0 }], ..Tool::new(1, ToolKind::FlatEndmill, 4.0, 5.0) };
+    let bar = StockShape::Cylinder { x_min: -10.0, x_max: 10.0, radius: 10.0 };
+    let text = "G21\nT1 M6\nS12000 M3\nG0 X0. Y0. Z30. A0.\nG1 Z4. F100\nG0 Z30.\n";
+    let mut p = player(text, &Machine::four_axis_a(), std::slice::from_ref(&held), &bar, cylinder_x(2.0, -15.0, 15.0, 64), None, 1.0e9);
+    p.seek(usize::MAX, 0.0, None).unwrap();
+    let codes: Vec<&str> = p.findings().events().iter().map(|e| e.code.as_str()).collect();
+    assert!(codes.contains(&"holder-hits-stock"), "{codes:?}");
+    assert!(!codes.contains(&"shank-hits-stock"), "{codes:?}");
+    let holder = p.findings().events().iter().find(|e| e.code == "holder-hits-stock").map(|e| e.message.clone());
+    assert!(holder.as_deref().is_some_and(|m| m.contains("10 mm")), "{holder:?}");
+}

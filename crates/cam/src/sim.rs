@@ -93,7 +93,9 @@ const MAX_REFINED: usize = 1_000_000;
 /// Most tool positions on a 4th axis over the whole program.
 const MAX_STAMPS: usize = 50_000_000;
 /// Most threads one simulation runs on, and the fewest rows (angles) each one takes.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const MAX_THREADS: usize = 16;
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const MIN_BAND: usize = 16;
 /// Iterations of the bisections (each halves the interval).
 const BISECTIONS: usize = 60;

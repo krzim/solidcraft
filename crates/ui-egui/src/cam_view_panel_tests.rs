@@ -139,3 +139,21 @@ fn the_panel_opens_with_a_loaded_view_and_closing_it_closes_the_view() {
     assert!(h.app.session.cam_view.is_none());
     assert!(h.app.cam_player.snapshot.is_none());
 }
+
+#[test]
+fn findings_still_to_come_keep_the_panel_its_own_width() {
+    let mut h = loaded();
+    h.frames(2);
+    let s = h.app.cam_player.snapshot.as_mut().unwrap();
+    s.findings = vec![mark(0, 1.0e6), mark(1, 2.0e6)];
+    let width = |h: &mut crate::scenario::Harness| {
+        h.frames(1);
+        crate::scenario::rect_of("dialog:list:sc_cam_finding_0").map(|r| r.right())
+    };
+    let first = width(&mut h).expect("the finding is listed");
+    for _ in 0..20 {
+        h.frames(1);
+    }
+    let later = width(&mut h).unwrap();
+    assert!((later - first).abs() < 0.5, "the row grew from {first} to {later}: the panel widens every frame");
+}

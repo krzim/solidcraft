@@ -121,7 +121,8 @@ fn a_tool_mesh_is_shaded_round_and_placed_along_its_axis() {
     }
     let side: Vec<&Vec3> = s.normals.iter().filter(|n| n.z.abs() < 1e-9).collect();
     assert!(side.iter().any(|n| n.x.abs() > 1e-3 && n.y.abs() > 1e-3), "the side is smooth, not faceted to the axes");
-    let rows = placement(Vec3::new(1.0, 2.0, 3.0), Vec3::new(1.0, 0.0, 0.0));
+    // A tool lying along +X (the spindle turned a quarter about Y).
+    let rows = placement(Vec3::new(1.0, 2.0, 3.0), [Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(1.0, 0.0, 0.0)]);
     let apply = |p: [f32; 3]| rows.map(|r| r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3]);
     assert_eq!(apply([0.0, 0.0, 0.0]), [1.0, 2.0, 3.0]);
     let up = apply([0.0, 0.0, 10.0]);
@@ -133,4 +134,41 @@ fn colours_come_from_the_theme_and_cycle() {
     let t = Tokens::view();
     assert_eq!(category(&t, 0), t.accent);
     assert_eq!(category(&t, series(&t).len()), t.accent);
+}
+
+/// A machine model whose one spindle part, a side plate, stands off to the spindle's +X.
+const SIDE_PLATE: &str = r#"{"format": "solidcraft.machine_model", "version": 1, "name": "test mill",
+    "spindle": {"nose_gap": 5, "nose_max_above_table": 400},
+    "table": {"size": [300, 200, 15], "cut_allowance": 0.1},
+    "parts": [{"name": "the side plate", "code": "side-plate", "mount": "spindle",
+               "shape": {"box": {"min": [30, -5, 0], "max": [40, 5, 60]}}}]}"#;
+
+#[test]
+fn a_machine_part_is_drawn_on_the_side_of_the_spindle_the_collision_check_puts_it() {
+    let mut h = Harness::new();
+    let job = dome(&mut h);
+    let file = std::env::temp_dir().join(format!("sc-side-plate-{}.machine-model.json", std::process::id()));
+    std::fs::write(&file, SIDE_PLATE).unwrap();
+    h.app.run("cam.view.load", json!({"job": job, "resolution": 0.25, "machine_model_path": file.to_string_lossy()})).unwrap();
+    h.app.run("cam.view.seek", json!({"percent": 50})).unwrap();
+    let _ = std::fs::remove_file(&file);
+    let _ = crate::viewport::build_scene(&h.app);
+    let v = h.app.session.cam_view.as_deref().unwrap();
+    let p = v.playback().unwrap();
+    let pose = p.pose_now().unwrap();
+    let tool = p.tool(p.plan().step(p.at().0).unwrap().slot).unwrap().clone();
+    let model = p.setup().model.clone().unwrap();
+    let nose = pose.tip + v.origin + pose.axis * nose_above_tip(&tool, Some(model.as_ref()));
+    let cache = h.app.cam_player.layer.lock().unwrap();
+    let drawn = cache.last.as_ref().unwrap();
+    let (_, _, places) = drawn.instanced.iter().find(|(k, _, _)| *k == hash_of(("machine", 0usize))).expect("the side plate is drawn");
+    let rows = places[0].0;
+    let apply = |q: [f32; 3]| rows.map(|r| r[0] * q[0] + r[1] * q[1] + r[2] * q[2] + r[3]);
+    // The plate's centre, (35, 0, 30) from the nose, as the collision check's zone has it.
+    let c = apply([35.0, 0.0, 30.0]);
+    let want = nose + Vec3::new(35.0, 0.0, 30.0);
+    assert!(
+        (f64::from(c[0]) - want.x).abs() < 1e-3 && (f64::from(c[1]) - want.y).abs() < 1e-3 && (f64::from(c[2]) - want.z).abs() < 1e-3,
+        "drawn at {c:?}, checked at {want:?}"
+    );
 }
