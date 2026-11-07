@@ -1612,7 +1612,7 @@ pub(super) fn reply_value(reply: CamJobReply, compact: bool) -> Result<Value> {
             .enumerate()
             .map(|(i, r)| op_line(i, r, reply.derived_heights.iter().find(|d| d.op_index == i), reply.tool_choices.iter().find(|c| c.op_index == i)))
             .collect();
-        CamJobOutput::Compact(CamJobCompactReply {
+        CamJobOutput::Compact(Box::new(CamJobCompactReply {
             compact: true,
             passed: reply.passed,
             dry_run: reply.dry_run,
@@ -1625,7 +1625,7 @@ pub(super) fn reply_value(reply: CamJobReply, compact: bool) -> Result<Value> {
             // Everything but how the bodies were tessellated, which every job says.
             notes: reply.notes.into_iter().filter(|n| !n.starts_with(super::TESSELLATION_NOTE)).collect(),
             param_warnings: reply.param_warnings,
-        })
+        }))
     } else {
         CamJobOutput::Full(Box::new(reply))
     };

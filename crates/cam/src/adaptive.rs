@@ -47,8 +47,21 @@ pub const MAX_CELLS: usize = 6_000_000;
 const MAX_STEPS: usize = 3_000_000;
 /// Most walks of one level.
 const MAX_PASSES: usize = 50_000;
-/// Most cell visits of one operation (rasters, distance transforms, searches, clearing).
+/// Most cell visits of one 2D adaptive operation (rasters, distance transforms, searches,
+/// clearing): it plans one level and repeats it.
 const MAX_WORK: f64 = 6.0e9;
+/// Most cell visits of one level of an adaptive roughing, per cell of its raster: some 500
+/// walks' searches and refreshes. A level's work does not depend on how many levels there
+/// are, so a larger stepdown (fewer levels) is never refused where a smaller one is planned.
+pub(crate) const LEVEL_WORK_PER_CELL: f64 = 8000.0;
+/// Fewest cell visits a level of an adaptive roughing is allowed (a small raster).
+const MIN_LEVEL_WORK: f64 = 2.0e8;
+/// About how many cell visits a level of an adaptive roughing takes per cell of its raster (a
+/// plate round a boss: some 3000).
+pub(crate) const TYPICAL_LEVEL_WORK_PER_CELL: f64 = 3000.0;
+/// Most cell visits an adaptive roughing is expected to take, all its levels together (a few
+/// minutes of planning); a job expected to take more is refused before any is done.
+pub(crate) const MAX_ROUGHING_WORK: f64 = 3.0e10;
 /// Points round the tool the planner's engagement estimate looks at.
 const RING: usize = 120;
 /// Headings tried either side of the current one.
@@ -187,12 +200,31 @@ fn check_flutes(tool: &Tool, top: f64, zs: &[f64]) -> Result<()> {
     Ok(())
 }
 
-/// Counts cell visits against [`MAX_WORK`].
-struct Work(std::cell::Cell<f64>);
+/// Counts cell visits: those of the level being planned against its own limit, and all of
+/// them against the operation's.
+struct Work {
+    total: std::cell::Cell<f64>,
+    level: std::cell::Cell<f64>,
+    limit: f64,
+    level_limit: f64,
+}
 
 impl Work {
+    /// The 2D adaptive clearing's: [`MAX_WORK`] for its one planned level.
     fn new() -> Work {
-        Work(std::cell::Cell::new(0.0))
+        Work { total: std::cell::Cell::new(0.0), level: std::cell::Cell::new(0.0), limit: MAX_WORK, level_limit: MAX_WORK }
+    }
+
+    /// An adaptive roughing's: each level's limit scaled to its raster of `cells`, the whole
+    /// operation's that times its `levels`.
+    fn for_levels(levels: usize, cells: usize) -> Work {
+        let level_limit = level_work_limit(cells);
+        Work { total: std::cell::Cell::new(0.0), level: std::cell::Cell::new(0.0), limit: level_limit * levels.max(1) as f64, level_limit }
+    }
+
+    /// A new level starts.
+    fn start_level(&self) {
+        self.level.set(0.0);
     }
 
     fn add(&mut self, n: f64) -> Result<()> {
@@ -200,14 +232,40 @@ impl Work {
     }
 
     fn add_shared(&self, n: f64) -> Result<()> {
-        self.0.set(self.0.get() + n);
-        if self.0.get() > MAX_WORK {
+        self.total.set(self.total.get() + n);
+        self.level.set(self.level.get() + n);
+        if self.level.get() > self.level_limit || self.total.get() > self.limit {
             return Err(CamError::TooLarge(
-                "the adaptive clearing needs too much work; use a larger tool, optimal load or engagement limit, or a smaller region".into(),
+                "the adaptive clearing needs too much work at one level; use a larger tool, optimal load or engagement limit, or a smaller region"
+                    .into(),
             ));
         }
         Ok(())
     }
+}
+
+/// The most cell visits one level of an adaptive roughing over a raster of `cells` may take.
+pub(crate) fn level_work_limit(cells: usize) -> f64 {
+    (cells as f64 * LEVEL_WORK_PER_CELL).max(MIN_LEVEL_WORK)
+}
+
+/// Refuses, before any is done, an adaptive roughing of `levels` levels over a raster of
+/// `cells` that would take minutes of planning ([`MAX_ROUGHING_WORK`] as it typically goes) or
+/// more drop-cutter samples than an operation may take: with the numbers and what to change.
+pub(crate) fn check_roughing_work(levels: usize, cells: usize) -> Result<()> {
+    let expected = levels as f64 * cells as f64 * TYPICAL_LEVEL_WORK_PER_CELL;
+    if !(expected <= MAX_ROUGHING_WORK) {
+        return Err(CamError::TooLarge(format!(
+            "the adaptive roughing has {levels} levels over a raster of {cells} cells: some {expected:.1e} cell visits, minutes of planning (at most {MAX_ROUGHING_WORK:.0e}); use a larger stepdown (fewer levels), a larger tool or optimal load (a coarser raster), or a smaller boundary"
+        )));
+    }
+    if !(levels as f64 * cells as f64 <= crate::surface_ops::MAX_DROPS as f64) {
+        return Err(CamError::TooLarge(format!(
+            "the adaptive roughing has {levels} levels over a raster of {cells} cells, more drop-cutter samples than {}; use a larger stepdown (fewer levels), a larger tool or optimal load (a coarser raster), or a smaller boundary",
+            crate::surface_ops::MAX_DROPS
+        )));
+    }
+    Ok(())
 }
 
 /// A raster of square cells.
@@ -1367,14 +1425,19 @@ pub fn adaptive_roughing(surface: &Surface, tool: &Tool, p: &AdaptiveRoughingPar
         c.validate()?;
         c
     };
+    // Refused at once where the levels over this raster would take minutes; each level is then
+    // held to a limit of its own.
+    check_roughing_work(zs.len(), g.len())?;
     let budget = Budget::new();
-    let mut work = Work::new();
-    let mut steps_taken = 0usize;
+    let mut work = Work::for_levels(zs.len(), g.len());
     // How far down each cell has been cleared by the levels so far.
     let mut floor = vec![p.heights.top; g.len()];
     let mut e = Emit::new(p.heights, p.feeds);
     let (mut helices, mut cut_levels, mut left) = (0usize, 0usize, 0usize);
     for &z in &zs {
+        // Each level's work and walk steps are its own.
+        work.start_level();
+        let mut steps_taken = 0usize;
         let domain = Clear { surface, cutter: grown, grown_by: leave, z, lo: rlo, hi: rhi, budget: &budget };
         let mut allow = Vec::with_capacity(g.len());
         for c in 0..g.len() {

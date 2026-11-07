@@ -481,3 +481,41 @@ fn adaptive_clearing_refuses_tools_that_cannot_clear() {
         assert!(e.to_string().contains(why), "{:?}: {e}", t.kind);
     }
 }
+
+/// The work an adaptive roughing may take is bounded level by level, each level's bound scaled
+/// to its raster and not to how many levels there are, so a larger stepdown (fewer levels) is
+/// never refused where a smaller one is planned (the old bound on the whole operation refused a
+/// 100 x 80 mm plate round a boss at a 4 mm stepdown after 50 s of planning and passed it at
+/// 6 mm). A job that would take minutes is refused at once, with the numbers and what to change.
+#[test]
+fn adaptive_roughing_work_is_bounded_per_level_and_refused_at_once_when_too_large() {
+    use crate::adaptive::{MAX_ROUGHING_WORK, TYPICAL_LEVEL_WORK_PER_CELL, check_roughing_work, level_work_limit};
+    let cells = 400_000;
+    // Monotonic in the number of levels: once refused, refused for every larger number.
+    let first = (1..=200).find(|&n| check_roughing_work(n, cells).is_err()).unwrap();
+    assert!((first..=200).all(|n| check_roughing_work(n, cells).is_err()));
+    assert!((1..first).all(|n| check_roughing_work(n, cells).is_ok()));
+    assert!(first as f64 * cells as f64 * TYPICAL_LEVEL_WORK_PER_CELL > MAX_ROUGHING_WORK);
+    // A 2 mm stepdown down 20 mm of that raster is planned.
+    assert!(check_roughing_work(11, cells).is_ok());
+    // The level's own bound does not shrink with more levels; it grows with the raster.
+    assert!(level_work_limit(2 * cells) > level_work_limit(cells));
+    // Refused at once, naming the fix.
+    let start = std::time::Instant::now();
+    let surface = Surface::new(plate_and_boss()).unwrap();
+    let mut p = roughing_params();
+    p.heights.top = 600.0;
+    p.heights.retract = 610.0;
+    p.heights.clearance = 620.0;
+    p.stepdown = 0.5;
+    p.boundary.rect = Some([Vec2::new(-60.0, -60.0), Vec2::new(60.0, 60.0)]);
+    let e = adaptive_roughing(&surface, &Tool { flute_length: 40.0, ..flat(6.0) }, &p).unwrap_err();
+    assert!(matches!(e, CamError::TooLarge(_)) && e.to_string().contains("larger stepdown"), "{e}");
+    assert!(start.elapsed().as_secs() < 5, "{:?}", start.elapsed());
+    // A plate round a boss at a 1 mm stepdown, more levels than the old bound on the whole
+    // operation let through, is planned.
+    let mut p = roughing_params();
+    p.stepdown = 1.0;
+    let a = adaptive_roughing(&surface, &flat(6.0), &p).unwrap();
+    assert!(a.levels >= 6, "{a:?}");
+}

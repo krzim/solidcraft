@@ -50,7 +50,7 @@ pub const MAX_SAMPLES: usize = 4_000_000;
 /// Most nodes of a waterline's grid.
 pub const MAX_GRID_NODES: usize = 4_000_000;
 /// Most drop-cutter evaluations of one operation, refinement and link checks included.
-const MAX_DROPS: usize = 40_000_000;
+pub(crate) const MAX_DROPS: usize = 40_000_000;
 /// Most levels of one operation.
 const MAX_LEVELS: usize = 10_000;
 /// Most halvings of one base step.

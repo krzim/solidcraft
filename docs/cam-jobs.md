@@ -64,6 +64,10 @@ The command never writes a program that fails one of these unless `allow_unsafe`
 - **Rapids.** Every `G0` of the program as written, the stock and the turns of a 4th axis
   included (see "Stock, facing and rapid safety" below).
 - **Travel.** With a machine whose JSON has `linear_limits`, every position is within them.
+- **Below the stock.** With a `box` stock on a machine without rotaries, no operation cuts
+  below the stock's bottom (by more than the tolerance): what holds the stock is there
+  (parallels, the vise's floor, the table). A failure names the operation, how deep it goes and
+  the fix (raise its bottom, or give a stock that reaches as deep).
 - **Operation checks** that are part of planning, each refusing the job with a message that
   names the operation: a drill's rapid down to the R height over the part round a hole (see
   [Drilling](#drilling)), a face down into the stock or below it (see
@@ -519,6 +523,10 @@ cleared material when there is one with the tool down, by lifting to `retract` o
   adds a level at every flat area of the part (raised by the stock to leave). Levels further
   apart than the tool's `flute_length` are refused: the shank would rub on the wall the flutes
   leave.
+- **Work.** Each level of an `adaptive_roughing` may take a number of raster cell visits in
+  proportion to its raster (not to the number of levels, so a larger stepdown is never refused
+  where a smaller one passes); a job whose levels over its raster would typically take minutes
+  is refused before any is planned, saying how many levels and cells and what to change.
 - **Corners.** An inside corner sharper than the limit allows is not driven into: a fillet
   somewhat larger than the tool's is left there for a finishing contour (`left_area` in the
   report).
@@ -604,7 +612,7 @@ Without them a contour cuts as before; a pocket goes in by a helix.
 | `entry` | both | How the tool goes down into each depth pass: `{"type": "plunge"}` (at the plunge feed), `{"type": "ramp", "angle_deg"?}` (2°: a contour along its lead, back and forth, or before its first tab, else round the loop; a pocket round its ring) or `{"type": "helix", "radius"?, "angle_deg"?}` (90% of the tool's radius, at most all of it, so that no core is left standing; 2°), then once round at the depth. A helix that does not fit is made smaller, then replaced by the ramp, then by the plunge; a contour with `side: on` takes no helix. Give `entry` or `ramp_angle_deg`, not both. Default: a contour plunges (or ramps at `ramp_angle_deg`); a pocket goes in by the helix. |
 | `linking` | both | `clearance` (the default) or `stay_down`. Within a level the tool always stays down where the straight link runs where the passes cut so far, or the one it leads to, have taken the material away (tracked by each pass's distance from the boundary); elsewhere it goes up to the clearance height, or with `stay_down` only to the retract height where the cutter, dropped onto the part all along the link, stays 1 mm below it. With `stay_down` a pocket also goes from one level to the next through the level it has cleared. |
 | `tabs` | contour, outside | `{count \| spacing, width, height, ramp_angle_deg?}`: material left `height` above the bottom to hold a part cut out of the stock, each `width` long along the wall, placed evenly on the profile's straight stretches (away from its corners and the start); the tool rises over each on ramps of `ramp_angle_deg` (30°). Refused when they do not fit or are as high as the cut. |
-| `finish_passes` | contour | Passes round the final wall at full depth after the depth passes (0), `finish_stepover` (5% of the tool's diameter, at most half its radius) apart, the last on the wall; the depth passes leave `finish_passes × finish_stepover` for them. Each is linked in the cut, or by its lead. Not with `side: on`. Refused where a finishing pass would reach into a notch, a neck or a gap between parts that the pass before it did not fit in (it would cut a full slot at full depth). |
+| `finish_passes` | contour | Passes round the final wall at full depth after the depth passes (0), `finish_stepover` (5% of the tool's diameter, at most half its radius) apart, the last on the wall; the depth passes leave `finish_passes × finish_stepover` for them. Each is linked in the cut, or by its lead. Not with `side: on`. Refused where a finishing pass would reach into a notch, a neck or a gap between parts that the pass before it did not fit in (it would cut a full slot at full depth). On a wall deeper than the tool's `flute_length` each finishing pass goes down in steps no deeper than the flutes, evenly from `top`, the last at `bottom` (a tool whose shank is wider than its cutter is refused there); the spring pass stays at the bottom. |
 | `spring_pass` | contour | Go round the last pass once more (false). |
 
 No cut of a contour or a pocket goes down faster than the plunge feed: a ramp, a helix and the

@@ -348,5 +348,5 @@ pub fn refusals_in(text: &str) -> Option<Value> {
 #[serde(untagged)]
 pub enum CamJobOutput {
     Full(Box<CamJobReply>),
-    Compact(CamJobCompactReply),
+    Compact(Box<CamJobCompactReply>),
 }
