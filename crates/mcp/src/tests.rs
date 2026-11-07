@@ -3924,7 +3924,8 @@ fn a_refused_cam_job_returns_its_refusals_as_structured_content() {
     let mut s = server();
     tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20, "corner": [-20, -15, 0]}}));
     let job = json!({"machine": "3axis", "post": "mach3", "tools": [{"number": 4, "kind": "flat_endmill", "diameter": 4, "flute_length": 12, "spindle_rpm": 12000, "feed": 800}],
-        "operations": [{"name": "p", "type": "pocket", "tool": 7, "polygon": [[-8, -5], [8, -5], [8, 5], [-8, 5]]}]});
+        "operations": [{"name": "p", "type": "pocket", "tool": 7, "polygon": [[-8, -5], [8, -5], [8, 5], [-8, 5]],
+            "heights": {"clearance": 30, "retract": 22, "top": 20, "bottom": 15}}]});
     let params = json!({"job": job, "dry_run": true});
     let r = raw_tool(&mut s, "execute", json!({"command": "cam.job", "params": params}));
     assert_eq!(r["result"]["isError"], true, "{r}");
@@ -3933,4 +3934,95 @@ fn a_refused_cam_job_returns_its_refusals_as_structured_content() {
     assert!(refusal["fix"].as_str().is_some_and(|f| f.contains("4 (4 mm flat end mill)")), "{r}");
     let r = raw_tool(&mut s, "batch", json!({"commands": [{"command": "cam.job", "params": params}]}));
     assert_eq!(r["result"]["structuredContent"]["cam_refusals"][0]["check"], "tool", "{r}");
+}
+
+/// `screenshot {cam_job}`: an agent sees a CAM job's toolpaths over the part as an image, with
+/// the job's extents and checks as text, and no G-code written; arguments that do not go with
+/// a CAM picture are refused.
+#[test]
+fn a_screenshot_shows_a_cam_jobs_toolpaths() {
+    let mut s = server();
+    tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 20, "width": 20, "height": 10, "corner": [-10, -10, -10]}}));
+    let job = json!({
+        "machine": "3axis",
+        "post": "linuxcnc_4axis",
+        "tools": [{"number": 1, "kind": "flat_endmill", "diameter": 4, "flute_length": 10, "spindle_rpm": 10000, "feed": 600, "plunge_feed": 150}],
+        "operations": [{
+            "name": "outline", "type": "contour", "tool": 1, "polygon": [[-10, -10], [10, -10], [10, 10], [-10, 10]],
+            "heights": {"clearance": 20, "retract": 5, "top": 0, "bottom": -3}, "stepdown": 1.5
+        }]
+    });
+    let r = raw_tool(&mut s, "screenshot", json!({"cam_job": job, "view": "top", "width": 160, "height": 120}));
+    let content = &r["result"]["content"];
+    assert_ne!(r["result"]["isError"], json!(true), "{r}");
+    assert_eq!(content[0]["type"], "image", "{r}");
+    assert!(content[0]["data"].as_str().unwrap().starts_with("iVBORw0KGgo"), "not a PNG");
+    let info: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!((info["source"].as_str(), info["passed"].as_bool()), (Some("cam"), Some(true)), "{info}");
+    assert_eq!(info["image"]["view"], "top", "{info}");
+    assert!(info["operations"][0]["extents"]["summary"].as_str().is_some_and(|t| t.starts_with("cut X")), "{info}");
+    assert!(info["path"].is_null(), "the scratch picture is not kept: {info}");
+    for bad in
+        [json!({"cam_job": job, "camera": {"target": [0, 0, 0], "yaw": 0, "pitch": 0, "distance": 100}}), json!({"cam_job": job, "grid": false})]
+    {
+        let r = raw_tool(&mut s, "screenshot", bad);
+        assert_eq!(r["result"]["isError"], json!(true), "{r}");
+    }
+    let r = raw_tool(&mut s, "screenshot", json!({"cam_job": job, "cam_op": "nope"}));
+    assert!(r["result"]["content"][0]["text"].as_str().is_some_and(|t| t.contains("`outline`")), "{r}");
+}
+
+/// A headless design behind an "app" whose `cam.view` draws the picture but answers with
+/// something other than an object.
+struct OddCamView(Headless);
+
+impl crate::Backend for OddCamView {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let cam = params["command"] == "cam.view";
+        let v = self.0.call(method, params)?;
+        Ok(if cam { json!("drawn") } else { v })
+    }
+    fn has_ui(&self) -> bool {
+        false
+    }
+    fn describe(&self) -> String {
+        "test app".into()
+    }
+}
+
+/// `screenshot {cam_job}` hands `width` and `height` to cam.view as given, so a size it cannot
+/// draw is refused with the range instead of quietly changed; and an app's odd cam.view answer
+/// is kept, never a crash.
+#[test]
+fn a_cam_screenshot_refuses_sizes_it_cannot_draw_and_survives_odd_answers() {
+    let job = json!({
+        "machine": "3axis",
+        "post": "linuxcnc_4axis",
+        "tools": [{"number": 1, "kind": "flat_endmill", "diameter": 4, "flute_length": 10, "spindle_rpm": 10000, "feed": 600, "plunge_feed": 150}],
+        "operations": [{
+            "name": "outline", "type": "contour", "tool": 1, "polygon": [[-10, -10], [10, -10], [10, 10], [-10, 10]],
+            "heights": {"clearance": 20, "retract": 5, "top": 0, "bottom": -3}, "stepdown": 1.5
+        }]
+    });
+    let boxed = json!({"command": "solid.box", "params": {"length": 20, "width": 20, "height": 10, "corner": [-10, -10, -10]}});
+    let mut s = server();
+    tool(&mut s, "execute", boxed.clone());
+    for (size, says) in [(json!({"width": 5}), "`width` must be 16 to 4096"), (json!({"height": 9000}), "`height` must be 16 to 4096")] {
+        let mut a = json!({"cam_job": job});
+        if let (Some(a), Some(size)) = (a.as_object_mut(), size.as_object()) {
+            a.extend(size.clone());
+        }
+        let r = raw_tool(&mut s, "screenshot", a);
+        assert_eq!(r["result"]["isError"], json!(true), "{size}: {r}");
+        assert!(r["result"]["content"][0]["text"].as_str().is_some_and(|t| t.contains(says)), "{size}: {r}");
+    }
+    // A size that is not a number is refused by the tool's own schema, naming the argument.
+    let r = raw_tool(&mut s, "screenshot", json!({"cam_job": job, "width": "wide"}));
+    assert!(r["error"]["message"].as_str().is_some_and(|t| t.contains("`width`")), "{r}");
+    let mut s = Server::new(Box::new(OddCamView(Headless::default())));
+    tool(&mut s, "execute", boxed);
+    let r = raw_tool(&mut s, "screenshot", json!({"cam_job": job, "width": 64, "height": 48}));
+    assert_eq!(r["result"]["content"][0]["type"], "image", "{r}");
+    let info: Value = serde_json::from_str(r["result"]["content"][1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!((info["reply"].as_str(), info["source"].as_str()), (Some("drawn"), Some("cam")), "{info}");
 }

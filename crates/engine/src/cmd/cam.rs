@@ -1295,6 +1295,14 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
 pub(super) fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.job";
     let params: CamJobParams = parse(cmd, p, "")?;
+    let compact = params.compact.unwrap_or(false);
+    let reply = run_job(s, cmd, p, params, None)?;
+    agent::reply_value(reply, compact)
+}
+
+/// `cam.job` (or `cam.view`, as `cmd`) with `params`, read from `raw` (a profile is merged into
+/// its job as given); with `only`, its pictures draw that operation alone.
+fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: Option<&str>) -> Result<CamJobReply> {
     let dry_run = params.dry_run.unwrap_or(false);
     let allow_unsafe = params.allow_unsafe.unwrap_or(false);
 
@@ -1319,7 +1327,8 @@ pub(super) fn job(s: &mut Session, p: &Value) -> Result<Value> {
         }
         sheet::distinct(cmd, output.as_deref(), params.preview.as_deref(), params.setup_sheet.as_deref())?;
     }
-    let loaded = agent::load_job(cmd, p, &params)?;
+    let wanted = pictures::Request::of(cmd, &params, only)?;
+    let loaded = agent::load_job(cmd, raw, &params)?;
     let job: CamJob = loaded.job.clone();
     let base = loaded.base.as_deref();
     if job.operations.is_empty() || job.operations.len() > MAX_OPERATIONS {
@@ -1442,6 +1451,7 @@ pub(super) fn job(s: &mut Session, p: &Value) -> Result<Value> {
             // A drill is checked as its own shape, point and all.
             let hits = tool_gouges(&surfaces.all, &p.tool, &p.poses, allowed, step)
                 .map_err(|e| cam_err(cmd, &format!("operation `{op}`: gouge check"), e))?;
+            pictures::note_problems(&mut p.report, "gouge", &hits);
             let moves = moves_of(&hits);
             if let Some(worst) = hits.iter().max_by(|a, b| a.distance.total_cmp(&b.distance)) {
                 let move_index = p.sources.get(worst.index).copied().unwrap_or(worst.index);
@@ -1507,6 +1517,7 @@ pub(super) fn job(s: &mut Session, p: &Value) -> Result<Value> {
         if !checked.envelopes().is_empty() {
             let hits = holder_collisions_within(&surfaces.all, &checked, &p.poses, 0.0, allowed, step)
                 .map_err(|e| cam_err(cmd, &format!("operation `{op}`: holder check"), e))?;
+            pictures::note_problems(&mut p.report, "holder", &hits);
             let moves = moves_of(&hits);
             p.report.holder_collisions = moves;
             *holder_total.get_or_insert(0) += moves;
@@ -1579,6 +1590,7 @@ pub(super) fn job(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
 
+    pictures::extents(&machine, &post, &program, &mut planned);
     // Said in a dry run too, before anything is written.
     if let Some(path) = &output
         && let Some(ext) = Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -1631,6 +1643,12 @@ pub(super) fn job(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let cut_minutes = machine_time.as_ref().map_or(readback.cut_minutes, |t| t.cut_minutes);
     let rapid_minutes = machine_time.as_ref().map(|t| t.rapid_minutes);
+    let setting = pictures::Setting { machine: &machine, origin, surface: &surfaces.all, tol, name: &name };
+    let images = pictures::write(cmd, s, &wanted, &setting, &planned).map_err(|e| match (e, &outputs.gcode) {
+        (EngineError::Other(m), Some(g)) => EngineError::Other(format!("{m} (the G-code was written to {g})")),
+        (e, _) => e,
+    })?;
+
     let mut reply = CamJobReply {
         name,
         machine: machine.name.clone(),
@@ -1654,12 +1672,13 @@ pub(super) fn job(s: &mut Session, p: &Value) -> Result<Value> {
         notes,
         simulation,
         summary,
+        images,
         param_warnings: Vec::new(),
         failure_details: details,
         ..CamJobReply::default()
     };
     agent.finish(&mut reply);
-    agent::reply_value(reply, params.compact.unwrap_or(false))
+    Ok(reply)
 }
 
 /// `path` as one file is named whatever its spelling: absolute, its folder resolved (links,
@@ -2056,6 +2075,8 @@ mod finish3d;
 mod helical;
 #[path = "cam_leads.rs"]
 mod leads;
+#[path = "cam_image.rs"]
+pub(super) mod pictures;
 #[path = "cam_rates.rs"]
 mod rates;
 #[path = "cam_sheet.rs"]

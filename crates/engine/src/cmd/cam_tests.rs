@@ -4267,3 +4267,239 @@ fn a_hole_left_out_says_what_tool_to_add_not_an_operation_that_is_not_there() {
     assert!(why.contains("(4.8 mm)") && why.contains("\"feature\": \"hole:0\""), "{sug}");
     assert!(why.contains("no drilling operation") && !why.contains("drill it with"), "{why}");
 }
+
+/// Whether two colours are within `within` of each other in every channel.
+fn near_rgb(a: [u8; 3], b: [u8; 3], within: i32) -> bool {
+    a.iter().zip(b).all(|(x, y)| (i32::from(*x) - i32::from(y)).abs() <= within)
+}
+
+/// A PNG `path` decoded: its size and its RGB pixels, rows top to bottom.
+fn png_pixels(path: &str) -> (u32, u32, Vec<[u8; 3]>) {
+    let img = image::open(path).unwrap_or_else(|e| panic!("{path}: {e}")).to_rgb8();
+    let (w, h) = img.dimensions();
+    (w, h, img.pixels().map(|p| p.0).collect())
+}
+
+/// Where the camera of an `images` reply puts the design point `p` on a `w` × `h` picture.
+fn projected(images: &Value, p: [f64; 3], w: u32, h: u32) -> (f64, f64) {
+    let c = &images["camera"];
+    let at = |v: &Value| v.as_f64().unwrap();
+    let cam = solidcraft_render::Camera {
+        target: solidcore_record::Vec3::new(at(&c["target"][0]), at(&c["target"][1]), at(&c["target"][2])),
+        yaw: at(&c["yaw"]),
+        pitch: at(&c["pitch"]),
+        distance: at(&c["distance"]),
+        fov: at(&c["fov"]),
+        ..solidcraft_render::Camera::default()
+    };
+    let (x, y, _) = cam.to_screen(solidcore_record::Vec3::new(p[0], p[1], p[2]), f64::from(w), f64::from(h), 1.0e4).unwrap();
+    (x, y)
+}
+
+/// `cam.job {image, images_dir}`: a picture an agent can look at, drawn headless (no GPU needed),
+/// the operation's colour where its toolpath projects, written only inside the agent's folders;
+/// and the toolpath's extents in work coordinates in the reply.
+#[test]
+fn a_dry_run_draws_the_toolpaths_in_their_colours_inside_the_agents_folders() {
+    let mut s = dome();
+    let dir = Dir::new("image");
+    let root = dir.0.join("allowed");
+    std::fs::create_dir_all(&root).unwrap();
+    let picture = root.join("dome.png").to_string_lossy().into_owned();
+    let pictures = root.join("ops").to_string_lossy().into_owned();
+    let scope = Some(solidcraft_io::vfs::PathScope::new([root.clone()]));
+    let r = solidcraft_io::vfs::scoped(scope.clone(), || {
+        run(&mut s, "cam.job", json!({"job": dome_job(), "dry_run": true, "image": picture, "images_dir": pictures, "width": 320, "height": 200}))
+    });
+    assert_clean(&r);
+    let images = &r["images"];
+    assert_eq!((images["view"].as_str(), images["width"].as_u64(), images["height"].as_u64()), (Some("iso"), Some(320), Some(200)), "{r}");
+    assert_eq!(images["image"], picture.as_str(), "{r}");
+    assert_eq!(images["legend"][0], json!({"operation": "finish", "colour": "orange", "rgb": "#f07800"}), "{r}");
+    assert!(images["key"].as_array().is_some_and(|k| k.len() >= 6), "{r}");
+    let one = root.join("ops").join("01-finish.png");
+    assert_eq!(images["images"], json!([one.to_string_lossy()]), "{r}");
+    // A dry run writes the pictures, never a program.
+    assert!(r["outputs"]["gcode"].is_null(), "{r}");
+    for path in [picture.clone(), one.to_string_lossy().into_owned()] {
+        let (w, h, px) = png_pixels(&path);
+        assert_eq!((w, h), (320, 200), "{path}");
+        let colours: std::collections::BTreeSet<[u8; 3]> = px.iter().copied().collect();
+        assert!(colours.len() > 50, "{path}: a picture, not a blank: {} colours", colours.len());
+        // The finish is orange where its toolpath projects: inside the box its extents span.
+        let e = &r["operations"][0]["extents"]["all"];
+        let (mut x0, mut x1, mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+        for k in 0..8usize {
+            let c = |i: usize| e[(k >> i) & 1][i].as_f64().unwrap();
+            let (x, y) = projected(images, [c(0), c(1), c(2)], w, h);
+            (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
+        }
+        let orange: Vec<(u32, u32)> =
+            px.iter().enumerate().filter(|(_, c)| near_rgb(**c, [240, 120, 0], 30)).map(|(i, _)| (i as u32 % w, i as u32 / w)).collect();
+        let on_path = |x: u32, y: u32| (x0 - 6.0..=x1 + 6.0).contains(&f64::from(x)) && (y0 - 6.0..=y1 + 6.0).contains(&f64::from(y));
+        let inside = orange.iter().filter(|(x, y)| on_path(*x, *y)).count();
+        assert!(orange.len() > 200 && inside * 10 >= orange.len() * 9, "{path}: {} orange pixels, {inside} on the path's box", orange.len());
+    }
+    // The extents, in work coordinates: the ball's tip stays above the floor; the feed moves start
+    // at the retract height, where the plunges begin.
+    let x = &r["operations"][0]["extents"];
+    let (lo, hi) = (x["cut"][0][2].as_f64().unwrap(), x["cut"][1][2].as_f64().unwrap());
+    assert!((-1.0 - 1e-6..1.0).contains(&lo) && (hi - 15.0).abs() < 1e-6, "{x}");
+    assert_eq!(x["all"][1][2].as_f64(), Some(30.0), "rapids up to the clearance: {x}");
+    assert!(x["rotary"].as_array().is_some_and(Vec::is_empty) && x["summary"].as_str().is_some_and(|t| t.starts_with("cut X -")), "{x}");
+    // Outside the folders nothing is computed or written.
+    let outside = dir.file("dome.png");
+    let e = solidcraft_io::vfs::scoped(scope.clone(), || {
+        s.execute("cam.job", &json!({"job": dome_job(), "dry_run": true, "image": outside})).unwrap_err()
+    });
+    assert!(e.to_string().contains("outside the folders this agent may use"), "{e}");
+    let e =
+        solidcraft_io::vfs::scoped(scope.clone(), || s.execute("cam.view", &json!({"job": dome_job(), "path": dir.file("view.png")})).unwrap_err());
+    assert!(e.to_string().contains("outside the folders this agent may use"), "{e}");
+    assert!(!PathBuf::from(&outside).exists() && !dir.0.join("view.png").exists());
+    // Every refusal says what to change.
+    for (p, says) in [
+        (json!({"job": dome_job(), "dry_run": true, "view": "top"}), "give `image`"),
+        (json!({"job": dome_job(), "dry_run": true, "image": picture, "view": "sideways"}), "iso, top, bottom"),
+        (json!({"job": dome_job(), "dry_run": true, "image": picture, "width": 5}), "16 to 4096"),
+        (json!({"job": dome_job(), "dry_run": true, "image": ""}), "must not be empty"),
+        (json!({"job": dome_job(), "output": picture, "image": picture}), "a file of its own"),
+    ] {
+        let e = solidcraft_io::vfs::scoped(scope.clone(), || s.execute("cam.job", &p).unwrap_err());
+        assert!(e.to_string().contains(says), "{p}: {e}");
+    }
+}
+
+/// `cam.view` on a 4th-axis job looks from the front (from -Y, the A axis level across the
+/// picture) and draws the A axis; the extents give the A range the program turns through.
+#[test]
+fn a_4axis_view_looks_along_the_a_axis_and_gives_its_range() {
+    let mut s = bar();
+    let dir = Dir::new("view");
+    let path = dir.file("bar.png");
+    let r = solidcraft_io::vfs::scoped(Some(solidcraft_io::vfs::PathScope::new([dir.0.clone()])), || {
+        run(&mut s, "cam.view", json!({"job": barrel_job(), "path": path, "width": 300, "height": 200}))
+    });
+    assert_eq!(r["passed"], true, "{r}");
+    assert_eq!(r["path"], path.as_str(), "{r}");
+    let image = &r["image"];
+    assert_eq!(image["view"], "front", "{r}");
+    assert_eq!((image["camera"]["yaw"].as_f64(), image["camera"]["pitch"].as_f64()), (Some(0.0), Some(0.0)), "{r}");
+    assert!(image["key"].as_array().unwrap().iter().any(|k| k.as_str().is_some_and(|k| k.contains("rotary table's axis"))), "{r}");
+    let (w, h, px) = png_pixels(&path);
+    assert_eq!((w, h), (300, 200));
+    // The A axis runs level across the picture through work zero.
+    let (_, y) = projected(image, [0.0, 0.0, 0.0], w, h);
+    let row = y.round() as u32;
+    let dark = (0..w)
+        .filter(|x| (row.saturating_sub(1)..=row + 1).any(|y| px.get((y * w + x) as usize).is_some_and(|c| near_rgb(*c, [35, 35, 45], 30))))
+        .count();
+    assert!(dark > 20, "{dark} pixels of the A axis on row {row}");
+    assert!(px.iter().filter(|c| near_rgb(**c, [240, 120, 0], 30)).count() > 100, "the barrel finish is drawn");
+    let op = &r["operations"][0];
+    assert_eq!((op["name"].as_str(), op["drawn"].as_bool()), (Some("barrel"), Some(true)), "{r}");
+    let a = &op["extents"]["rotary"][0];
+    assert_eq!(a["letter"], "A", "{r}");
+    assert!(a["max_deg"].as_f64().unwrap() - a["min_deg"].as_f64().unwrap() >= 330.0, "{r}");
+    assert!(op["extents"]["summary"].as_str().is_some_and(|t| t.contains("; A ")), "{r}");
+    // A refusal names what there is.
+    let e = s.execute("cam.view", &json!({"job": barrel_job(), "path": path, "op": "nope"})).unwrap_err();
+    assert!(e.to_string().contains("no operation `nope`") && e.to_string().contains("`barrel`"), "{e}");
+    for p in [
+        json!({}),
+        json!({"path": ""}),
+        json!({"job": barrel_job()}),
+        json!({"job": barrel_job(), "path": path, "width": 0}),
+        json!({"job": barrel_job(), "path": path, "view": 7}),
+        json!({"job": barrel_job(), "path": path, "dry_run": true}),
+        json!({"job": barrel_job(), "job_path": "x.json", "path": path}),
+    ] {
+        match s.execute("cam.view", &p) {
+            Err(EngineError::Internal(_, msg)) => panic!("{p}: panicked: {msg}"),
+            Err(_) => {}
+            Ok(v) => panic!("{p}: accepted: {v}"),
+        }
+    }
+}
+
+/// The rotary extents are the angles the written program turns through: a long helix on an A
+/// that stops at ±360° is unwound by rewinds, so its range stays within the limits and matches
+/// what `cam.check` reads from the file, operation by operation (chaining the poses' angles
+/// would report thousands of degrees the machine never turns).
+#[test]
+fn rotary_extents_are_what_the_written_program_turns() {
+    let mut s = bar();
+    let dir = Dir::new("unwound");
+    let mut post = run(&mut s, "cam.posts", json!({"name": "mach3"}))["post"].clone();
+    post["rewind"] = json!({"distance": 25.0, "retract_feed": 500.0, "plunge_feed": 250.0});
+    std::fs::write(dir.0.join("rewind.post.json"), post.to_string()).unwrap();
+    let helix = |name: &str| {
+        json!({"name": name, "type": "rotary_finish", "tool": 3, "pattern": {"type": "helix", "pitch": 2},
+               "clearance": 25, "retract": 15, "range": [-15, 15]})
+    };
+    let job = json!({
+        "machine": "4axis_a", "a_limits_deg": [-360, 360], "post_path": "rewind.post.json", "tools": [ball(3, 4.0)],
+        "operations": [helix("first helix"), helix("second helix")]
+    });
+    let job_path = dir.file("helix.cam.json");
+    std::fs::write(&job_path, job.to_string()).unwrap();
+    let out = dir.file("helix.tap");
+    let r = solidcraft_io::vfs::scoped(Some(solidcraft_io::vfs::PathScope::new([dir.0.clone()])), || {
+        run(&mut s, "cam.job", json!({"job_path": job_path, "output": out}))
+    });
+    assert_eq!(r["passed"], true, "{r}");
+    let c = run(&mut s, "cam.check", json!({"path": out}));
+    let file = &c["rotary_ranges"][0];
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for op in r["operations"].as_array().unwrap() {
+        let a = &op["extents"]["rotary"][0];
+        assert_eq!(a["letter"], "A", "{op}");
+        let (a0, a1) = (a["min_deg"].as_f64().unwrap(), a["max_deg"].as_f64().unwrap());
+        assert!(a0 >= -360.0 - 1e-6 && a1 <= 360.0 + 1e-6, "{}: A {a0}..{a1} beyond the limits the program keeps to: {op}", op["name"]);
+        assert!(a1 - a0 >= 330.0, "{op}");
+        (lo, hi) = (lo.min(a0), hi.max(a1));
+    }
+    let (f0, f1) = (file["min_deg"].as_f64().unwrap(), file["max_deg"].as_f64().unwrap());
+    assert!((lo - f0).abs() < 0.01 && (hi - f1).abs() < 0.01, "extents A {lo}..{hi}, the written program A {f0}..{f1}");
+}
+
+/// A dry run of a job that gouges says where: each failing operation's extents list the places
+/// (work coordinates, move, depth), its summary names the first, and the picture marks them
+/// with red crosses an agent can see.
+#[test]
+fn a_gouging_dry_run_shows_where_the_gouges_are() {
+    let mut s = dome();
+    let dir = Dir::new("gouge");
+    let path = dir.file("gouge.png");
+    // A contour round a 10 mm square down to Z 0 runs through the dome.
+    let job = json!({
+        "name": "through the dome", "machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 4.0)],
+        "operations": [{
+            "name": "ring", "type": "contour", "tool": 1, "polygon": [[-5, -5], [5, -5], [5, 5], [-5, 5]],
+            "heights": {"clearance": 30, "retract": 15, "top": 7, "bottom": 0}, "stepdown": 2
+        }]
+    });
+    let r = solidcraft_io::vfs::scoped(Some(solidcraft_io::vfs::PathScope::new([dir.0.clone()])), || {
+        run(&mut s, "cam.view", json!({"job": job, "path": path, "view": "top", "width": 320, "height": 240}))
+    });
+    assert_eq!(r["passed"], false, "{r}");
+    let x = &r["operations"][0]["extents"];
+    let problems = x["problems"].as_array().unwrap_or_else(|| panic!("no problems listed: {x}"));
+    assert!(!problems.is_empty() && problems.len() <= 20, "{x}");
+    let first = &problems[0];
+    assert_eq!(first["check"], "gouge", "{x}");
+    assert!(first["distance"].as_f64().is_some_and(|d| d > 0.0) && first["move_index"].is_u64(), "{x}");
+    let at: Vec<f64> = first["at"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    // The tool's centre runs 2 mm outside the square, inside the dome (radius 12, its top at 7).
+    let out = at[0].abs().max(at[1].abs());
+    assert!(out > 6.0 && out < 8.0 && (0.0..7.0).contains(&at[2]), "{at:?}");
+    assert!(x["summary"].as_str().is_some_and(|t| t.contains("; gouge at X ")), "{x}");
+    assert!(r["image"]["key"].as_array().unwrap().iter().any(|k| k.as_str().is_some_and(|k| k.contains("red crosses"))), "{r}");
+    let (w, h, px) = png_pixels(&path);
+    let (cx, cy) = projected(&r["image"], [at[0], at[1], at[2]], w, h);
+    let red = (0..px.len())
+        .filter(|&i| near_rgb(px[i], [255, 0, 0], 25))
+        .filter(|&i| (f64::from(i as u32 % w) - cx).abs() <= 8.0 && (f64::from(i as u32 / w) - cy).abs() <= 8.0)
+        .count();
+    assert!(red >= 6, "{red} red pixels at the first gouge ({cx}, {cy})");
+}

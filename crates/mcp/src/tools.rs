@@ -304,7 +304,12 @@ pub fn tool_definitions_with(opts: Options) -> Vec<Value> {
              capped. `view` first turns the camera to a standard view or a saved named view (view.save), `camera` to              any camera (as view.apply). \
              `grid: false` and `axes: false` leave the ground grid (on Z 0) and the origin's axes out of a model render. \
              A body whose appearance is see-through (appearance.assign with an `opacity` below 1) is drawn see-through, \
-             so what is inside it shows: that is how to look at the body a cut would remove inside the material it meets.",
+             so what is inside it shows: that is how to look at the body a cut would remove inside the material it meets. \
+             `cam_job` (a CAM job object) or `cam_job_path` (its .json file) draws that job's toolpaths over the part instead \
+             (cam.view: planned and checked as a dry run, no G-code written): one colour per operation (`cam_op` for one), \
+             rapids dashed, entries ringed, the tool where it starts cutting, work zero's axes and a rotary table's axis; \
+             `view` is then a standard view (default iso, front with a rotary axis), and the text lists each toolpath's \
+             extents in work coordinates and whether the job's checks pass.",
             obj(
                 json!({
                     "view": string(
@@ -317,6 +322,9 @@ pub fn tool_definitions_with(opts: Options) -> Vec<Value> {
                     "source": {"type": "string", "enum": ["window", "model"], "description": "window = app screenshot, model = model render"},
                     "grid": {"type": "boolean", "description": "false: leave the ground grid out of the render. It lies on Z 0 and cuts through a part that straddles it. Model renders only: default true, or as the app shows it when connected; with `grid` or `axes` a connected screenshot is a model render, and source \"window\" is an error"},
                     "axes": {"type": "boolean", "description": "false: leave the origin's three axes out of the render (see `grid`). Axes hidden with browser.visibility stay hidden"},
+                    "cam_job": {"type": "object", "description": "A CAM job (docs/cam-jobs.md, as cam.job's `job`): draw its toolpaths over the part"},
+                    "cam_job_path": string("A CAM job's .json file (as cam.job's `job_path`): draw its toolpaths over the part"),
+                    "cam_op": string("With cam_job or cam_job_path: draw only the operation of this name"),
                 }),
                 &[],
             ),
@@ -2206,6 +2214,9 @@ fn compare_picture(b: &mut dyn Backend, a: &Map<String, Value>, opts: Options) -
 }
 
 fn capture(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<(Vec<u8>, Value), String> {
+    if ["cam_job", "cam_job_path", "cam_op"].iter().any(|k| a.get(*k).is_some_and(|v| !v.is_null())) {
+        return capture_cam(b, a);
+    }
     // `grid` and `axes` shape a model render; the window shows what it shows.
     let guides: Vec<(&str, bool)> = ["grid", "axes"].into_iter().filter_map(|k| a.get(k).and_then(Value::as_bool).map(|v| (k, v))).collect();
     let window = match str_arg(a, "source") {
@@ -2289,6 +2300,49 @@ fn capture(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<(Vec<u8>, Valu
         }
     }
     Ok((png, reply))
+}
+
+/// `screenshot` with `cam_job` or `cam_job_path`: the job's toolpaths drawn over the part by
+/// `cam.view` (a dry run that writes no G-code), read back as PNG with the command's reply.
+fn capture_cam(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<(Vec<u8>, Value), String> {
+    if let Some(k) = ["camera", "grid", "axes", "source"].into_iter().find(|k| a.get(*k).is_some_and(|v| !v.is_null())) {
+        return Err(format!(
+            "screenshot: `{k}` does not go with `cam_job`: a CAM picture is a model render from a standard `view`, \
+             without the grid, with work zero's axes"
+        ));
+    }
+    let keep = str_arg(a, "path").filter(|p| !p.trim().is_empty()).map(str::to_string);
+    let path = keep.clone().unwrap_or_else(|| {
+        let n = SHOT.fetch_add(1, Ordering::Relaxed);
+        let dir = crate::scratch_dir().unwrap_or_else(vfs::temp_dir);
+        dir.join(format!("cam-{n}.png")).to_string_lossy().to_string()
+    });
+    // Passed on as given: cam.view refuses a size or view it cannot draw and says why.
+    let mut params = Map::new();
+    params.insert("path".into(), json!(path));
+    for (from, to) in [("cam_job", "job"), ("cam_job_path", "job_path"), ("cam_op", "op"), ("view", "view"), ("width", "width"), ("height", "height")]
+    {
+        if let Some(v) = a.get(from).filter(|v| !v.is_null()) {
+            params.insert(to.into(), v.clone());
+        }
+    }
+    let params = Value::Object(params);
+    let drawn = exec(b, "cam.view", params);
+    let read = drawn.as_ref().ok().map(|_| vfs::read(&path, MAX_IMAGE_BYTES).map_err(|e| format!("{path}: {e} (is the app on another machine?)")));
+    if keep.is_none() {
+        let _ = vfs::remove(&path);
+    }
+    let drawn = drawn?;
+    let png = read.unwrap_or_else(|| Err(format!("{path}: no picture")))?;
+    // A connected app answers with an object; anything else is kept under `reply`.
+    let mut info = match drawn {
+        Value::Object(m) => m,
+        other => Map::from_iter([("reply".to_string(), other)]),
+    };
+    info.insert("path".into(), json!(keep));
+    info.insert("source".into(), json!("cam"));
+    info.insert("bytes".into(), json!(png.len()));
+    Ok((png, Value::Object(info)))
 }
 
 /// Standard base64 with padding (RFC 4648).
