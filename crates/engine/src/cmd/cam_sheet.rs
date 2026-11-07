@@ -92,13 +92,25 @@ pub(super) struct Inputs<'a> {
 
 /// Each of the job's fixtures (`names`) in words with where it is in work coordinates (`origin`
 /// is the design point at work zero), from its exact box.
-pub(super) fn fixture_words(s: &crate::Session, names: &[String], origin: Vec3) -> Vec<String> {
+pub(super) fn fixture_words(s: &crate::Session, names: &[String], place: &super::Placement) -> Vec<String> {
     let Ok(st) = s.world_state() else { return names.to_vec() };
     names
         .iter()
         .map(|n| match st.bodies.iter().find(|b| &b.name == n).map(|b| b.body.exact_bounds()) {
             Some(Ok(b)) => {
-                let (lo, hi) = (b.min - origin, b.max - origin);
+                // The box's corners in work coordinates (round them when the part is turned).
+                let (mut lo, mut hi) =
+                    (Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY));
+                for k in 0..8 {
+                    let c = Vec3::new(
+                        if k & 1 == 0 { b.min.x } else { b.max.x },
+                        if k & 2 == 0 { b.min.y } else { b.max.y },
+                        if k & 4 == 0 { b.min.z } else { b.max.z },
+                    );
+                    let w = place.in_work(c);
+                    lo = Vec3::new(lo.x.min(w.x), lo.y.min(w.y), lo.z.min(w.z));
+                    hi = Vec3::new(hi.x.max(w.x), hi.y.max(w.y), hi.z.max(w.z));
+                }
                 format!(
                     "{n}: X {} to {}, Y {} to {}, Z {} to {} (work coordinates)",
                     fmt_num(lo.x, 3),

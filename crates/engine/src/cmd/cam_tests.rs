@@ -1746,6 +1746,99 @@ fn rest_machining_clears_what_the_operations_before_left() {
     assert!(e.to_string().contains("`stock` box"), "{e}");
 }
 
+/// A job's `orientation` turns the part for its setup, about its `origin`: the back of a block
+/// with a pocket cut into its bottom is machined from the same design (op2 after a flip). With
+/// the block turned over (`flip_x`, `flip_y` or half a turn about X) the pocket is open at the
+/// top and the job passes; the same job without the turn cuts into the block. A sketch drawn
+/// on the bottom faces up once turned. Bad orientations are refused.
+#[test]
+fn a_job_orientation_turns_the_part_for_its_setup() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "corner": [-20, -15, -10], "body_name": "Block"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 3, "corner": [-5, -5, -10], "operation": "cut"}));
+    let job = |orientation: Option<Value>| {
+        let mut j = json!({"name": "op2", "machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 4.0)], "origin": [0, 0, -10],
+                           "stock": {"box": {"min": [-21, -16, -10], "max": [21, 16, 0]}},
+                           "operations": [{"name": "back pocket", "type": "pocket", "tool": 1, "polygon": [[-5, -5], [5, -5], [5, 5], [-5, 5]],
+                                           "heights": {"clearance": 20, "retract": 5, "top": 0, "bottom": -3}}]});
+        if let Some(o) = orientation {
+            j["orientation"] = o;
+        }
+        json!({"job": j, "dry_run": true})
+    };
+    for o in [json!("flip_x"), json!("flip_y"), json!({"axis": [1, 0, 0], "angle_deg": 180})] {
+        let r = run(&mut s, "cam.job", job(Some(o.clone())));
+        assert_clean(&r);
+        assert!(r["notes"].as_array().unwrap().iter().any(|n| n.as_str().is_some_and(|n| n.contains("orientation"))), "{o}: {r}");
+    }
+    let r = run(&mut s, "cam.job", job(None));
+    assert_eq!(r["passed"], false, "{r}");
+    assert!(r["gouge"]["worst"].as_f64().is_some_and(|g| g > 1.0), "{r}");
+    // A sketch on the block's bottom, its normal down: work Z along it is the turned block's up.
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, -10], "x_dir": [1, 0, 0], "y_dir": [0, -1, 0]}, "name": "Bottom"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "diameter": 2}));
+    run(&mut s, "sketch.finish", json!({}));
+    let r = run(&mut s, "cam.job", job(Some(json!({"sketch": "Bottom"}))));
+    assert_clean(&r);
+    for bad in
+        [json!("flip_z"), json!({"axis": [0, 0, 0], "angle_deg": 90}), json!({"axis": [1, 0, 0], "angle_deg": 1e308}), json!({"sketch": "Nope"})]
+    {
+        assert!(s.execute("cam.job", &job(Some(bad.clone()))).is_err(), "{bad}");
+    }
+}
+
+/// Op2 starts from what op1 left: op1 roughs round a 40 × 30 mm block down through a stock
+/// 3 mm thicker and 5 mm wider each side, `cam.simulate` writes the stock it leaves as a height
+/// map, and op2, the block turned over (`flip_x`, work zero at the stock's old bottom), takes
+/// that as its `stock`: its stock box is op1's turned, and an adaptive roughing of the 3 mm
+/// left on the back clears only the block's outline, not the margin op1 already cut away.
+#[test]
+fn op2_starts_from_the_stock_op1_left() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10, "corner": [-20, -15, -10], "body_name": "Block"}));
+    let dir = Dir::new("op2");
+    let tools = json!([flat(1, 6.0)]);
+    let op1 = json!({"name": "op1", "machine": "3axis", "post": "mach3_4axis", "tools": tools,
+                     "stock": {"box": {"min": [-25, -20, -13], "max": [25, 20, 0]}},
+                     "operations": [{"name": "round", "type": "adaptive_roughing", "tool": 1, "heights": {"clearance": 10, "retract": 3, "top": 0, "bottom": -13},
+                                     "stepdown": 13, "flats": false, "stock_to_leave": 0, "optimal_load": 1.2, "boundary": {"rect": [[-25, -20], [25, 20]]}}]});
+    let out = dir.file("op1.tap");
+    let r = run(&mut s, "cam.job", json!({"job": op1, "output": out}));
+    assert_clean(&r);
+    let map = dir.file("op1.stock.json");
+    let c = run(&mut s, "cam.simulate", json!({"path": out, "job": op1, "stock_heights": map}));
+    assert_eq!(c["passed"], true, "{c}");
+    let op2 = |stock: Value| {
+        json!({"job": {"name": "op2", "machine": "3axis", "post": "mach3_4axis", "tools": tools, "origin": [0, 0, -13], "orientation": "flip_x",
+                       "stock": stock,
+                       "operations": [{"name": "back", "type": "adaptive_roughing", "tool": 1, "heights": {"clearance": 10, "retract": 3, "top": 0, "bottom": -3},
+                                       "stepdown": 3, "flats": false, "stock_to_leave": 0, "optimal_load": 1.2, "boundary": {"rect": [[-25, -20], [25, 20]]}}]},
+               "dry_run": true})
+    };
+    let whole = run(&mut s, "cam.job", op2(json!({"box": {"min": [-25, -20, -13], "max": [25, 20, 0]}})));
+    assert_clean(&whole);
+    let left = run(&mut s, "cam.job", op2(json!({"simulated": {"path": map}})));
+    assert_clean(&left);
+    let st = &left["stock"];
+    for (k, want) in [("min", [-25.0, -20.0, -13.0]), ("max", [25.0, 20.0, 0.0])] {
+        for (a, w) in st[k].as_array().unwrap().iter().zip(want) {
+            assert!((a.as_f64().unwrap() - w).abs() < 0.1, "{k}: {st}");
+        }
+    }
+    let (lw, ll) = (whole["operations"][0]["cut_length"].as_f64().unwrap(), left["operations"][0]["cut_length"].as_f64().unwrap());
+    eprintln!("op2 on the whole stock {lw:.0} mm, on what op1 left {ll:.0} mm");
+    assert!(ll < 0.8 * lw, "{ll} of {lw}");
+    let w = left["operations"][0]["warnings"].as_array().unwrap();
+    assert!(w.iter().any(|w| w.as_str().is_some_and(|w| w.contains("earlier setup"))), "{w:?}");
+    // Not a height map, or turned on its side: refused.
+    let e = s.execute("cam.job", &op2(json!({"simulated": {"path": out}}))).unwrap_err();
+    assert!(e.to_string().contains("not a stock height map"), "{e}");
+    let mut side = op2(json!({"simulated": {"path": map}}));
+    side["job"]["orientation"] = json!({"axis": [1, 0, 0], "angle_deg": 90});
+    let e = s.execute("cam.job", &side).unwrap_err();
+    assert!(e.to_string().contains("upright or upside down"), "{e}");
+}
+
 /// A block 30 × 20 × 10, its top at Z 0, with its four top edges chamfered 1 mm at 45° when
 /// `chamfered`.
 fn plate(chamfered: bool) -> Session {

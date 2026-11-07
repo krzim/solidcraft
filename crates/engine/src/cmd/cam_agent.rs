@@ -321,7 +321,8 @@ fn exact_box(bodies: &[&Body]) -> std::result::Result<[Vec3; 2], String> {
 impl Geometry {
     /// The bodies of `job` (as `surfaces_of` picks them). `notes` gets a hint for a part body
     /// whose name says it holds the part.
-    pub fn of(s: &Session, job: &CamJob, origin: Vec3, notes: &mut Vec<String>) -> Result<Geometry> {
+    pub fn of(s: &Session, job: &CamJob, place: &super::Placement, notes: &mut Vec<String>) -> Result<Geometry> {
+        let origin = place.origin;
         let st = s.world_state()?;
         let fixtures: Vec<String> = job.fixtures.clone().unwrap_or_default();
         let names: Vec<String> = match &job.bodies {
@@ -334,8 +335,17 @@ impl Geometry {
                 notes.push(format!("body `{n}` is machined as part of the part: if it holds the part, add it to `fixtures`"));
             }
         }
-        let part: Vec<Body> = names.iter().filter_map(|n| st.bodies.iter().find(|b| &b.name == n)).map(|b| b.body.clone()).collect();
-        let fixture_bodies: Vec<Body> = fixtures.iter().filter_map(|n| st.bodies.iter().find(|b| &b.name == n)).map(|b| b.body.clone()).collect();
+        // Turned by the job's `orientation`, exactly.
+        let turned = |b: &Body| -> Result<Body> {
+            match place.matrix() {
+                None => Ok(b.clone()),
+                Some(m) => solidcraft_kernel::transform_matrix(b, m).map_err(|e| crate::EngineError::Other(format!("turning the part: {e}"))),
+            }
+        };
+        let part: Vec<Body> =
+            names.iter().filter_map(|n| st.bodies.iter().find(|b| &b.name == n)).map(|b| turned(&b.body)).collect::<Result<Vec<Body>>>()?;
+        let fixture_bodies: Vec<Body> =
+            fixtures.iter().filter_map(|n| st.bodies.iter().find(|b| &b.name == n)).map(|b| turned(&b.body)).collect::<Result<Vec<Body>>>()?;
         let part_box = exact_box(&part.iter().collect::<Vec<_>>());
         let fixture_box = if fixture_bodies.is_empty() { None } else { exact_box(&fixture_bodies.iter().collect::<Vec<_>>()).ok() };
         let tol = part.iter().map(|b| b.record().tolerance).fold(0.0, f64::max);

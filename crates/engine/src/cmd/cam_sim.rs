@@ -209,6 +209,12 @@ pub(super) fn check_program(
 pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.simulate";
     let params: CamSimulateParams = parse(cmd, p, "")?;
+    if let Some(out) = &params.stock_heights {
+        if out.trim().is_empty() || *out == params.path {
+            return Err(bad(cmd, "`stock_heights` must be a file path other than the G-code file"));
+        }
+        solidcraft_io::vfs::check(out).map_err(|e| EngineError::Other(e.to_string()))?;
+    }
     if let Some(out) = &params.stock_stl {
         if out.trim().is_empty() {
             return Err(bad(cmd, "a file path must not be empty"));
@@ -234,7 +240,7 @@ pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let text = String::from_utf8_lossy(&bytes);
     let surfaces = surfaces_of(cmd, s, &job, v3(origin), tol)?;
     let mut stock_notes = Vec::new();
-    let job_stock = super::cam_stock::stock_of(cmd, &job, &surfaces, tol, &mut stock_notes)?;
+    let job_stock = super::cam_stock::stock_of(cmd, s, &job, base.as_deref(), &surfaces, tol, &mut stock_notes)?;
     let (mut reply, report) = check_program(cmd, &text, &machine, &tools, &surfaces.part, job_stock.as_ref(), tol, params.resolution, deliberate)?;
     reply.path = params.path.clone();
     reply.notes.extend(surfaces.notes);
@@ -243,6 +249,23 @@ pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(out) = &params.stock_stl {
         export_stock(out, &report)?;
         reply.stock_stl = Some(out.clone());
+    }
+    if let Some(out) = &params.stock_heights {
+        let solidcraft_cam::sim::StockGrid::Heights { x0, y0, dx, dy, nx, ny, bottom, top, heights } = report.stock else {
+            return Err(bad(cmd, "`stock_heights` is for a 3-axis job: a 4th axis's stock is not a height map"));
+        };
+        let place = super::placement_of(cmd, s, &job)?;
+        let file = super::cam_stock::StockHeightsFile {
+            format: super::cam_stock::STOCK_HEIGHTS_FORMAT.into(),
+            map: solidcraft_cam::adaptive::HeightMap { x0, y0, dx, dy, nx, ny, heights },
+            bottom,
+            top,
+            origin: [place.origin.x, place.origin.y, place.origin.z],
+            axes: place.axes.map(|a| a.map(|v| [v.x, v.y, v.z])),
+        };
+        let text = serde_json::to_vec(&file).map_err(|e| EngineError::Other(e.to_string()))?;
+        super::write_file(out, &text).map_err(|e| EngineError::Other(format!("{out}: {e}")))?;
+        reply.notes.push(format!("the stock left is written as a height map to {out}"));
     }
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }

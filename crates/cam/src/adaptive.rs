@@ -597,6 +597,20 @@ impl HeightMap {
         self.heights.get(fj as usize * self.nx + fi as usize).copied()
     }
 
+    /// This map with each cell no higher than `other` has it at the cell's centre: what is
+    /// left after both the cuts this map holds and those `other` holds.
+    pub fn lower(&self, other: &HeightMap) -> HeightMap {
+        let heights = (0..self.heights.len())
+            .map(|k| {
+                let (i, j) = (k % self.nx.max(1), k / self.nx.max(1));
+                let c = Vec2::new(self.x0 + (i as f64 + 0.5) * self.dx, self.y0 + (j as f64 + 0.5) * self.dy);
+                let own = self.heights.get(k).copied().unwrap_or(f64::NEG_INFINITY);
+                other.top_at(c).map_or(own, |t| own.min(t))
+            })
+            .collect();
+        HeightMap { heights, ..self.clone() }
+    }
+
     /// The highest top over the disc of radius `rad` about `c` (and a cell round it); `None`
     /// where the disc is off the map.
     fn top_over(&self, c: Vec2, rad: f64) -> Option<f64> {

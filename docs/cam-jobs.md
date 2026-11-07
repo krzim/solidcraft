@@ -146,10 +146,11 @@ silently left at its default. That holds for the tools, the machine and the post
 | `post_path` | A post as a JSON file: the CAM crate's `Post5` (`cam.posts {"name": …}` returns one to start from). This is how a machine maker's own post is matched: copy the closest built-in post and change its header, tool change, spindle, comments, decimals, inverse time and rotary settings until its output matches. |
 | `work_offset` | 1 to 6 (G54 to G59), for posts whose header writes `{work_offset}`. Default: 1. |
 | `origin` | The design point that is work zero, `[x, y, z]`. Default: the design's origin. |
+| `orientation` | How the part is turned for this setup, about `origin` (see Coordinates): `"flip_x"`, `"flip_y"`, `{"axis": [x, y, z], "angle_deg": a}` or `{"sketch": name}`. 3-axis only. Default: none. |
 | `bodies` | The part's bodies by name. Default: every visible body not in `fixtures`. |
 | `fixtures` | Bodies the tool must stay clear of (vises, clamps): in the gouge and holder checks only, never machined. |
 | `tolerance` | 0.0001 to 1 mm (default 0.01): how far a toolpath may be from the part, and how deep a cut into it counts as a gouge. |
-| `stock` | The raw material in work coordinates: `{"box": {"min": [x, y, z], "max": [x, y, z]}}`, `{"cylinder": {"radius", "x_min", "x_max"}}` (a bar about work X, the A axis) or `{"around_part": {"margin": [x, y, z]}}` (the part's box grown by the margin each side). No rapid may pass through it; `face` faces it. Default: none. |
+| `stock` | The raw material in work coordinates: `{"box": {"min": [x, y, z], "max": [x, y, z]}}`, `{"cylinder": {"radius", "x_min", "x_max"}}` (a bar about work X, the A axis) `{"around_part": {"margin": [x, y, z]}}` (the part's box grown by the margin each side) or `{"simulated": {"path"}}` (what an earlier setup left: a height map `cam.simulate` wrote with `stock_heights`, see Coordinates). No rapid may pass through it; `face` faces it. Default: none. |
 | `tools` | The tools, as the CAM crate's `Tool` JSON (below). Give this or `tool_library_path`. |
 | `tool_library_path` | A JSON file holding an array of tools. |
 | `operations` | 1 to 200 operations, run and written in order (below). |
@@ -160,7 +161,24 @@ silently left at its default. That holds for the tools, the machine and the post
 
 ### Coordinates
 
-Work coordinates are the design's coordinates less `origin`. On a 4th axis the rotary axis is
+Work coordinates are the design's coordinates less `origin`, turned about it by the job's
+`orientation` when it has one: `"flip_x"` is half a turn about X (the bottom faces up, Y runs
+the other way), `"flip_y"` half a turn about Y, `{"axis", "angle_deg"}` a right-handed turn
+about that axis, and `{"sketch": name}` puts work X, Y and Z along that sketch's plane's X, Y
+and normal (the tool looks down on the plane; a sketch on a face of the part makes a work
+coordinate system from that face). So op1 and op2 of a part machined from two sides are two
+jobs on the same design: op2 gives the turn and an `origin` on the turned part, and its
+polygons, heights, boundaries and `stock` are in its own (turned) work coordinates. A sketch
+an operation uses must face the tool once turned (draw op2's on the part's back, its normal
+down). Operations by `feature` do not take an `orientation`; `cam.features` and `cam.suggest`
+look at the design as it is. `{"stock": {"simulated": {"path"}}}` starts a job from what an
+earlier setup left: `cam.simulate` with `stock_heights` writes the stock its program leaves as a
+height map, with that job's `origin` and `orientation`, and the later job turns it into its own
+work coordinates (each column of material stays a column: the two setups must keep the part
+upright or upside down, X and Y along X or Y). The rapid and stock checks take the box round it;
+`adaptive` and `adaptive_roughing` plan on the map itself, so op2 clears only what op1 left (a
+40 × 30 mm block roughed round through a stock 5 mm wider each side, then 3 mm off its back
+after `flip_x`: 1196 mm of path against 1976 mm from the whole stock). On a 4th axis the rotary axis is
 work X through work zero: model the part with its turning axis along the design's X through the
 origin, or give `origin` as a point on that axis. A rotary toolpath's tip at angle θ and radius
 ρ is at `(x, ρ sin θ, ρ cos θ)` with `A = θ`: A = +90° brings the work's +Y side up under the
@@ -948,6 +966,7 @@ on the program it has just written when given `simulate: true`.
 | `job` / `job_path` | The job the program was written for: its machine, tools (by `T` number; `T… M6` loads one), part bodies, `origin` and `tolerance`. |
 | `resolution` | The cell size in mm. Default: five times the tolerance, coarser when that would be more than 4 million cells, or when the program's cuts would visit more cells than the simulation allows (a long 4th-axis program: a warning gives the cell used). More than 20 million cells is refused. |
 | `stock_stl` | Write the stock the program leaves as a binary STL file (its top surface, or its round surface on a 4th axis), for a preview. |
+| `stock_heights` | Write the stock the program leaves as a height map (`.json`, 3-axis), with the job's `origin` and `orientation`, for a later setup's `stock: {"simulated": {"path"}}`. |
 
 The reply: `stock` (`kind`: `box` or `cylinder`, its size, and `derived`), `resolution`,
 `cells`, `gouge: {worst, cells}` (the deepest cut into the part beyond the tolerance, and how many

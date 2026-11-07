@@ -32,6 +32,11 @@ pub struct CamSimulateParams {
     /// its round surface on a 4th axis), for a preview. Default: not written.
     #[serde(default)]
     pub stock_stl: Option<String>,
+    /// Where to write the stock the program leaves as a height map (`.json`, 3-axis only) with
+    /// the job's `origin` and `orientation`, for a later setup's `stock: {simulated: {path}}`.
+    /// Default: not written.
+    #[serde(default)]
+    pub stock_heights: Option<String>,
 }
 
 /// What `cam.simulate` returns, and `cam.job`'s `simulation`.

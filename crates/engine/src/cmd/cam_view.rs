@@ -252,7 +252,7 @@ fn load(s: &mut Session, p: &Value) -> Result<Value> {
             let tools = tools_of(cmd, job, base)?;
             let tools = sim::with_thread_cores(&tools, &sim::job_thread_cores(job, &tools));
             let surfaces = surfaces_of(cmd, s, job, v3(origin), tol)?;
-            let job_stock = cam_stock::stock_of(cmd, job, &surfaces, tol, &mut notes)?;
+            let job_stock = cam_stock::stock_of(cmd, s, job, base, &surfaces, tol, &mut notes)?;
             notes.extend(surfaces.notes.iter().cloned());
             notes.extend(loaded.notes.iter().cloned());
             notes.push("a program file is shown: one operation per tool change".into());

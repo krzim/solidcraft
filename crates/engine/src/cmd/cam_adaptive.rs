@@ -202,18 +202,28 @@ pub(super) fn rest_map(
 /// frame, which must look straight down along work X and Y (a 3-axis operation's does), and
 /// how thick a skin it leaves unchased: the simulation's cell and the tolerance.
 fn rest_in(ctx: &Ctx<'_>, name: &str, frame: &Frame) -> Result<Option<(HeightMap, f64, String)>> {
-    let Some((map, count)) = &ctx.rest else { return Ok(None) };
+    // What an earlier setup left, and what the operations before this one cut of it.
+    let (map, note) = match (ctx.start, &ctx.rest) {
+        (None, None) => return Ok(None),
+        (Some(start), None) => (start.clone(), "planned on what an earlier setup left of the stock".to_string()),
+        (start, Some((rest, count))) => (
+            start.map_or_else(|| HeightMap::clone(rest), |s| s.lower(rest)),
+            format!("rest machining: planned on what the {count} operation(s) before it left of the stock"),
+        ),
+    };
     let square = |a: Vec3, b: Vec3| (a.x - b.x).abs().max((a.y - b.y).abs()).max((a.z - b.z).abs()) <= 1e-9;
     if !(square(frame.x, Vec3::new(1.0, 0.0, 0.0)) && square(frame.y, Vec3::new(0.0, 1.0, 0.0)) && square(frame.z, Vec3::new(0.0, 0.0, 1.0))) {
-        return Err(ctx.bad(name, "`rest_from` works in an operation that looks straight down along work X and Y"));
+        return Err(
+            ctx.bad(name, "planning on what earlier operations or setups left works in an operation that looks straight down along work X and Y")
+        );
     }
     let o = frame.origin;
-    let local = HeightMap { x0: map.x0 - o.x, y0: map.y0 - o.y, heights: map.heights.iter().map(|z| z - o.z).collect(), ..HeightMap::clone(map) };
     let skin = REST_TOLERANCE.max(2.0 * ctx.tol);
     let note = format!(
-        "rest machining: planned on what the {count} operation(s) before it left of the stock, simulated on cells of {:.3} mm; material up to {skin:.3} mm thick is left; the engagement is not measured (the measure knows only the whole stock)",
+        "{note}, simulated on cells of {:.3} mm; material up to {skin:.3} mm thick is left; the engagement is not measured (the measure knows only the whole stock)",
         map.dx.max(map.dy)
     );
+    let local = HeightMap { x0: map.x0 - o.x, y0: map.y0 - o.y, heights: map.heights.iter().map(|z| z - o.z).collect(), ..map };
     Ok(Some((local, skin, note)))
 }
 

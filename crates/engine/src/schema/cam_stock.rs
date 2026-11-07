@@ -18,6 +18,18 @@ pub enum StockSpec {
     Cylinder(CylinderStockSpec),
     /// The box round the part's bodies grown by `margin` on every side.
     AroundPart(AroundPartSpec),
+    /// What an earlier setup's program left: a height map `cam.simulate` wrote
+    /// (`stock_heights`), turned into this job's work coordinates by both jobs' `origin` and
+    /// `orientation` (so op2 after a flip starts from op1's result). The rapid checks take the
+    /// box round it; the adaptive clearings plan on the map itself.
+    Simulated(SimulatedStockSpec),
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SimulatedStockSpec {
+    /// The `.json` file `cam.simulate` wrote, read from the job file's folder when relative.
+    pub path: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]

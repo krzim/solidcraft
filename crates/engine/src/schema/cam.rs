@@ -127,6 +127,16 @@ pub struct CamJob {
     /// work X through work zero. Default: the design's origin.
     #[serde(default)]
     pub origin: Option<[f64; 3]>,
+    /// How the part is turned for this setup, about `origin` (which is then work zero): a job
+    /// that machines the back of a part (op2, after a flip) uses the same design as the job
+    /// that machined its front. `"flip_x"` (half a turn about X: the bottom faces up, Y runs
+    /// the other way), `"flip_y"` (half a turn about Y), `{"axis": [x, y, z], "angle_deg": a}`
+    /// (a right-handed turn about that axis), or `{"sketch": name}` (work X, Y and Z along the
+    /// sketch plane's X, Y and normal: the tool looks down on that plane). The operations'
+    /// coordinates (polygons, heights, boundaries) and the `stock` are in the turned work
+    /// coordinates. Operations by `feature` do not take it. Default: none.
+    #[serde(default)]
+    pub orientation: Option<OrientationSpec>,
     /// The bodies that make up the part, by name. Default: every visible body not in `fixtures`.
     #[serde(default)]
     pub bodies: Option<Vec<String>>,
@@ -187,6 +197,18 @@ pub struct CamJob {
     /// use it.
     #[serde(default)]
     pub workholding_path: Option<String>,
+}
+
+/// How a job turns the part (`orientation`).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum OrientationSpec {
+    /// `"flip_x"` or `"flip_y"`.
+    Named(String),
+    /// A turn about an axis through `origin`.
+    Turn { axis: [f64; 3], angle_deg: f64 },
+    /// Work axes along a sketch's plane.
+    Sketch { sketch: String },
 }
 
 /// A machine: a preset's name or the CAM crate's `Machine` JSON.

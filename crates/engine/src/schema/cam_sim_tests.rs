@@ -14,7 +14,7 @@ fn run(s: &mut Session, id: &str, p: Value) -> Value {
 
 #[test]
 fn schemas_and_the_key_check_agree() {
-    assert_keys(input_schema_for::<CamSimulateParams>(), &["job", "job_path", "path", "resolution", "stock_stl"]);
+    assert_keys(input_schema_for::<CamSimulateParams>(), &["job", "job_path", "path", "resolution", "stock_heights", "stock_stl"]);
 }
 
 /// Strict refuses a misspelt key; replies match the output schemas, in Warn without warnings.

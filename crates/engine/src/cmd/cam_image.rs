@@ -347,6 +347,8 @@ pub(super) struct Setting<'a> {
     pub machine: &'a Machine,
     /// Work zero in the design.
     pub origin: Vec3,
+    /// How the job turns the design about `origin`: the picture draws the design as it is.
+    pub place: super::Placement,
     /// The part and fixtures in work coordinates.
     pub surface: &'a Surface,
     pub tol: f64,
@@ -469,7 +471,19 @@ fn camera(view: StandardView, set: &Setting<'_>, planned: &[Planned], ops: &[usi
     {
         b.add(t.up(tool_length(p)));
     }
-    let b = Aabb3 { min: b.min + set.origin, max: b.max + set.origin };
+    let b = {
+        // The work box's corners back in the design, as drawn.
+        let mut d = Aabb3 { min: set.place.unturn(b.min + set.origin), max: set.place.unturn(b.min + set.origin) };
+        for k in 0..8 {
+            let c = Vec3::new(
+                if k & 1 == 0 { b.min.x } else { b.max.x },
+                if k & 2 == 0 { b.min.y } else { b.max.y },
+                if k & 4 == 0 { b.min.z } else { b.max.z },
+            );
+            d.add(set.place.unturn(c + set.origin));
+        }
+        if b.min.is_finite() && b.max.is_finite() { d } else { b }
+    };
     let mut cam = Camera::default();
     cam.set_view(view);
     if b.min.is_finite() && b.max.is_finite() {
@@ -827,7 +841,10 @@ impl<'a> Overlay<'a> {
     /// A point in work coordinates on the picture.
     fn screen(&self, p: Vec3) -> Option<P> {
         let (w, h) = (self.ink.w as f64, self.ink.h as f64);
-        self.cam.to_screen(p + self.set.origin, w, h, self.radius).map(|(x, y, _)| (x, y)).filter(|(x, y)| x.is_finite() && y.is_finite())
+        self.cam
+            .to_screen(self.set.place.unturn(p + self.set.origin), w, h, self.radius)
+            .map(|(x, y, _)| (x, y))
+            .filter(|(x, y)| x.is_finite() && y.is_finite())
     }
 
     /// Whether the part hides the work point `p` from the camera.

@@ -216,12 +216,14 @@ pub(crate) struct Lazy {
     origin: Vec3,
     tol: f64,
     machine: Machine,
+    /// Whether the job turns the part (`orientation`): features are not found in a turned part.
+    turned: bool,
     cell: std::sync::OnceLock<std::result::Result<FeatureSet, String>>,
 }
 
 impl Lazy {
-    pub fn new(bodies: Option<Vec<String>>, fixtures: Vec<String>, origin: Vec3, tol: f64, machine: &Machine) -> Lazy {
-        Lazy { bodies, fixtures, origin, tol, machine: machine.clone(), cell: std::sync::OnceLock::new() }
+    pub fn new(bodies: Option<Vec<String>>, fixtures: Vec<String>, origin: Vec3, tol: f64, machine: &Machine, turned: bool) -> Lazy {
+        Lazy { bodies, fixtures, origin, tol, machine: machine.clone(), turned, cell: std::sync::OnceLock::new() }
     }
 
     /// The axis features are found along for `machine`: `a` with one rotary about X, else `z`.
@@ -233,6 +235,9 @@ impl Lazy {
     }
 
     pub fn get(&self, cmd: &str, s: &Session) -> Result<&FeatureSet> {
+        if self.turned {
+            return Err(bad(cmd, "operations by `feature` do not take the job's `orientation`: give the operation a sketch or a polygon"));
+        }
         let found = self.cell.get_or_init(|| {
             let run = || -> Result<FeatureSet> {
                 let names = part_names(cmd, s, self.bodies.as_deref(), &self.fixtures)?;

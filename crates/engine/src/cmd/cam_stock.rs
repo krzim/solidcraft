@@ -16,6 +16,7 @@ use crate::Result;
 use crate::params::bad;
 use crate::schema::cam::{CamJob, OperationReport, OperationSpec};
 use crate::schema::cam_stock::{FaceOp, RapidHitReport, RapidsReport, StockReport, StockSpec, TravelReport};
+use solidcraft_cam::adaptive::HeightMap;
 
 /// Hits the reply lists in full.
 const LISTED_HITS: usize = 20;
@@ -25,9 +26,58 @@ const FACE_RETRACT: f64 = 2.0;
 const FACE_CLEARANCE: f64 = 10.0;
 
 /// The job's stock, checked; notes what is worth knowing about it.
-pub(super) fn stock_of(cmd: &str, job: &CamJob, surfaces: &Surfaces, tol: f64, notes: &mut Vec<String>) -> Result<Option<Stock>> {
-    let Some(spec) = &job.stock else { return Ok(None) };
+pub(super) fn stock_of(
+    cmd: &str,
+    s: &crate::Session,
+    job: &CamJob,
+    base: Option<&std::path::Path>,
+    surfaces: &Surfaces,
+    tol: f64,
+    notes: &mut Vec<String>,
+) -> Result<Option<Stock>> {
+    Ok(stock_and_start(cmd, s, job, base, surfaces, tol, notes)?.0)
+}
+
+/// The most bytes of a stock height map file.
+const MAX_HEIGHTS_BYTES: usize = 1 << 30;
+
+/// A stock height map as `cam.simulate` writes it (`stock_heights`): the map in the work
+/// coordinates of the job that wrote it, and that job's placement of the design.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct StockHeightsFile {
+    pub format: String,
+    pub map: HeightMap,
+    /// The stock's lowest and highest Z.
+    pub bottom: f64,
+    pub top: f64,
+    /// The design point that was work zero, and the work axes in the design when turned.
+    pub origin: [f64; 3],
+    pub axes: Option<[[f64; 3]; 3]>,
+}
+
+pub(super) const STOCK_HEIGHTS_FORMAT: &str = "solidcraft.stock_heights";
+
+/// The job's stock, and the height map it starts from when it is what an earlier setup left
+/// (`simulated`), in this job's work coordinates.
+pub(super) fn stock_and_start(
+    cmd: &str,
+    s: &crate::Session,
+    job: &CamJob,
+    base: Option<&std::path::Path>,
+    surfaces: &Surfaces,
+    tol: f64,
+    notes: &mut Vec<String>,
+) -> Result<(Option<Stock>, Option<HeightMap>)> {
+    let Some(spec) = &job.stock else { return Ok((None, None)) };
+    let mut start = None;
     let stock = match *spec {
+        StockSpec::Simulated(ref sim) => {
+            let place = super::placement_of(cmd, s, job)?;
+            let (stock, map) = simulated(cmd, &super::beside(base, &sim.path), &place)?;
+            notes.push(format!("the stock is what an earlier setup left ({}), turned into this job's work coordinates", sim.path));
+            start = Some(map);
+            stock
+        }
         StockSpec::Box(b) => {
             finite_point(&[b.min, b.max].concat(), "`stock.box`").map_err(|e| bad(cmd, e))?;
             Stock::Box { min: v3(b.min), max: v3(b.max) }
@@ -42,7 +92,61 @@ pub(super) fn stock_of(cmd: &str, job: &CamJob, surfaces: &Surfaces, tol: f64, n
     if !stock.holds_surface(&surfaces.part, tol) {
         notes.push("the part reaches outside the stock: check the stock against the part's position in work coordinates".into());
     }
-    Ok(Some(stock))
+    Ok((Some(stock), start))
+}
+
+/// Reads the height map at `path` and turns it into the work coordinates of `place`: each of
+/// this job's cells takes the column of the written map under its centre, turned (upright, or
+/// upside down after a flip), its top the higher end of it. The turn between the two setups
+/// must keep the columns upright or upside down, with X and Y along X or Y.
+fn simulated(cmd: &str, path: &str, place: &super::Placement) -> Result<(Stock, HeightMap)> {
+    let bytes = solidcraft_io::vfs::read(path, MAX_HEIGHTS_BYTES).map_err(|e| bad(cmd, format!("`stock.simulated`: {path}: {e}")))?;
+    let file: StockHeightsFile =
+        serde_json::from_slice(&bytes).map_err(|e| bad(cmd, format!("`stock.simulated`: {path} is not a stock height map: {e}")))?;
+    if file.format != STOCK_HEIGHTS_FORMAT {
+        return Err(bad(cmd, format!("`stock.simulated`: {path} is not a `{STOCK_HEIGHTS_FORMAT}` file")));
+    }
+    file.map.validate().map_err(|e| bad(cmd, format!("`stock.simulated`: {e}")))?;
+    finite_point(&[file.bottom, file.top], "the height map's `bottom` and `top`").map_err(|e| bad(cmd, e))?;
+    finite_point(&file.origin, "the height map's `origin`").map_err(|e| bad(cmd, e))?;
+    if let Some(a) = &file.axes {
+        finite_point(&a.concat(), "the height map's `axes`").map_err(|e| bad(cmd, e))?;
+    }
+    let was = super::Placement { origin: v3(file.origin), axes: file.axes.map(|a| a.map(v3)) };
+    // From the written job's work coordinates to this job's, and back.
+    let to = |w: Vec3| place.in_work(was.unturn(w + was.origin));
+    let from = |w: Vec3| was.in_work(place.unturn(w + place.origin));
+    let o = to(Vec3::ZERO);
+    let dir = |d: Vec3| to(d) - o;
+    let (ux, uy, uz) = (dir(Vec3::new(1.0, 0.0, 0.0)), dir(Vec3::new(0.0, 1.0, 0.0)), dir(Vec3::new(0.0, 0.0, 1.0)));
+    let along = |v: Vec3| [v.x.abs(), v.y.abs(), v.z.abs()].iter().filter(|c| (*c - 1.0).abs() < 1e-9).count() == 1;
+    if !(along(ux) && along(uy) && (uz.z.abs() - 1.0).abs() < 1e-9) {
+        return Err(bad(cmd, "`stock.simulated`: the two setups must turn the part so it stays upright or upside down, X and Y along X or Y"));
+    }
+    let m = &file.map;
+    let (sx, sy) = if ux.x.abs() > 0.5 { (m.dx, m.dy) } else { (m.dy, m.dx) };
+    let (nx, ny) = if ux.x.abs() > 0.5 { (m.nx, m.ny) } else { (m.ny, m.nx) };
+    let corners = [Vec3::new(m.x0, m.y0, 0.0), Vec3::new(m.x0 + m.nx as f64 * m.dx, m.y0 + m.ny as f64 * m.dy, 0.0)].map(to);
+    let (x0, y0) = (corners[0].x.min(corners[1].x), corners[0].y.min(corners[1].y));
+    let (zb, zt) = (to(Vec3::new(0.0, 0.0, file.bottom)).z, to(Vec3::new(0.0, 0.0, file.top)).z);
+    let (low, high) = (zb.min(zt), zb.max(zt));
+    let mut heights = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            let c = Vec3::new(x0 + (i as f64 + 0.5) * sx, y0 + (j as f64 + 0.5) * sy, 0.0);
+            let w = from(c);
+            let top = m.top_at(Vec2::new(w.x, w.y)).filter(|t| *t > file.bottom + 1e-9);
+            heights.push(match top {
+                // The column from the bottom to its top, turned: its higher end.
+                Some(t) => to(Vec3::new(w.x, w.y, t)).z.max(to(Vec3::new(w.x, w.y, file.bottom)).z),
+                None => low,
+            });
+        }
+    }
+    let map = HeightMap { x0, y0, dx: sx, dy: sy, nx, ny, heights };
+    map.validate().map_err(|e| bad(cmd, format!("`stock.simulated`: {e}")))?;
+    let stock = Stock::Box { min: Vec3::new(x0, y0, low), max: Vec3::new(x0 + nx as f64 * sx, y0 + ny as f64 * sy, high) };
+    Ok((stock, map))
 }
 
 /// Fails each operation whose lowest cut goes below a box stock's bottom by more than `tol` on

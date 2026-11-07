@@ -466,8 +466,112 @@ struct Surfaces {
     notes: Vec<String>,
 }
 
-/// Every body of `names` tessellated within `chord` into one mesh, moved by `-origin`.
-fn merged_mesh(cmd: &str, st: &solidcraft_doc::ModelState, names: &[String], origin: Vec3, chord: f64, notes: &mut Vec<String>) -> Result<Mesh> {
+/// How a job places the design: turned about `origin` by its `orientation`, then moved so
+/// `origin` is work zero. The turned design is still in design units and place, so everything
+/// that takes `origin` off a design point works on [`Placement::turn`] of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Placement {
+    pub origin: Vec3,
+    /// The work axes' directions in the design, when the part is turned.
+    pub axes: Option<[Vec3; 3]>,
+}
+
+impl Placement {
+    /// The design point `p` turned about `origin`.
+    pub fn turn(&self, p: Vec3) -> Vec3 {
+        self.origin + self.turn_dir(p - self.origin)
+    }
+
+    /// The design direction `d` turned.
+    pub fn turn_dir(&self, d: Vec3) -> Vec3 {
+        match self.axes {
+            None => d,
+            Some([x, y, z]) => Vec3::new(d.dot(x), d.dot(y), d.dot(z)),
+        }
+    }
+
+    /// The turned point `p` back in the design.
+    pub fn unturn(&self, p: Vec3) -> Vec3 {
+        match self.axes {
+            None => p,
+            Some([x, y, z]) => {
+                let d = p - self.origin;
+                self.origin + x * d.x + y * d.y + z * d.z
+            }
+        }
+    }
+
+    /// The design point `p` in work coordinates.
+    pub fn in_work(&self, p: Vec3) -> Vec3 {
+        self.turn(p) - self.origin
+    }
+
+    /// The turn as the kernel's matrix (row vectors: the point times the 3 × 3 part, then the
+    /// last row added), when there is one.
+    pub fn matrix(&self) -> Option<[[f64; 4]; 4]> {
+        let [x, y, z] = self.axes?;
+        // p' = origin + R (p - origin), R's rows x, y, z: p'_j = Σ_i p_i R[j][i] + t_j.
+        let t = self.origin - self.turn_dir(self.origin);
+        Some([[x.x, y.x, z.x, 0.0], [x.y, y.y, z.y, 0.0], [x.z, y.z, z.z, 0.0], [t.x, t.y, t.z, 1.0]])
+    }
+}
+
+/// The job's placement: its `origin` and its `orientation`, checked.
+pub(super) fn placement_of(cmd: &str, s: &Session, job: &CamJob) -> Result<Placement> {
+    use crate::schema::cam::OrientationSpec;
+    let origin = job.origin.unwrap_or([0.0; 3]);
+    finite_point(&origin, "`origin`").map_err(|e| bad(cmd, e))?;
+    let origin = v3(origin);
+    let unit = |v: Vec3, what: &str| -> Result<Vec3> {
+        let len = v.dot(v).sqrt();
+        if v.x.is_finite() && v.y.is_finite() && v.z.is_finite() && len > 1e-12 {
+            Ok(Vec3::new(v.x / len, v.y / len, v.z / len))
+        } else {
+            Err(bad(cmd, format!("{what} must be a finite, non-zero direction")))
+        }
+    };
+    let axes = match &job.orientation {
+        None => None,
+        Some(OrientationSpec::Named(n)) => match n.as_str() {
+            "flip_x" => Some([Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0), Vec3::new(0.0, 0.0, -1.0)]),
+            "flip_y" => Some([Vec3::new(-1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, -1.0)]),
+            "none" => None,
+            other => {
+                return Err(bad(
+                    cmd,
+                    format!("`orientation` is \"flip_x\", \"flip_y\", {{\"axis\", \"angle_deg\"}} or {{\"sketch\"}}, not \"{other}\""),
+                ));
+            }
+        },
+        Some(OrientationSpec::Turn { axis, angle_deg }) => {
+            finite_point(axis, "`orientation.axis`").map_err(|e| bad(cmd, e))?;
+            let a = unit(v3(*axis), "`orientation.axis`")?;
+            if !(angle_deg.is_finite() && angle_deg.abs() <= 3600.0) {
+                return Err(bad(cmd, "`orientation.angle_deg` must be a finite angle"));
+            }
+            let t = -angle_deg.to_radians();
+            // The work axes in the design: the design's own axes turned back.
+            Some([Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)].map(|e| solidcraft_cam::rotate(e, a, t)))
+        }
+        Some(OrientationSpec::Sketch { sketch }) => {
+            let id = match s.doc.find_feature(sketch) {
+                Some(f) if matches!(f.kind, solidcraft_doc::FeatureKind::Sketch { .. }) => f.id,
+                _ => return Err(bad(cmd, format!("`orientation`: no sketch `{sketch}`"))),
+            };
+            let st = s.model.state();
+            let Some(ss) = st.sketch(id) else { return Err(bad(cmd, format!("`orientation`: sketch `{sketch}` has not been solved"))) };
+            let (x, y) = (ss.plane.x, ss.plane.y);
+            let z = unit(x.cross(y), "the sketch's normal")?;
+            let x = unit(x, "the sketch's X")?;
+            Some([x, z.cross(x), z])
+        }
+    };
+    Ok(Placement { origin, axes })
+}
+
+/// Every body of `names` tessellated within `chord` into one mesh, turned and moved to work
+/// coordinates by `place`.
+fn merged_mesh(cmd: &str, st: &solidcraft_doc::ModelState, names: &[String], place: &Placement, chord: f64, notes: &mut Vec<String>) -> Result<Mesh> {
     let mut out = Mesh::default();
     for name in names {
         let Some(b) = st.bodies.iter().find(|b| &b.name == name) else { return Err(bad(cmd, format!("no body `{name}`"))) };
@@ -477,9 +581,9 @@ fn merged_mesh(cmd: &str, st: &solidcraft_doc::ModelState, names: &[String], ori
         let mesh = b.body.mesh(&solidcraft_kernel::MeshTolerance::chord(chord))?;
         let Ok(start) = u32::try_from(out.positions.len()) else { return Err(bad(cmd, "the part has too many triangles")) };
         let smooth = mesh.normals.len() == mesh.positions.len();
-        out.positions.extend(mesh.positions.iter().map(|p| *p - origin));
+        out.positions.extend(mesh.positions.iter().map(|p| place.in_work(*p)));
         if smooth {
-            out.normals.extend(mesh.normals.iter().copied());
+            out.normals.extend(mesh.normals.iter().map(|n| place.turn_dir(*n)));
         } else {
             // Not directions: the surface takes each triangle's own normal instead.
             out.normals.extend(std::iter::repeat_n(Vec3::ZERO, mesh.positions.len()));
@@ -497,6 +601,7 @@ fn merged_mesh(cmd: &str, st: &solidcraft_doc::ModelState, names: &[String], ori
 }
 
 fn surfaces_of(cmd: &str, s: &Session, job: &CamJob, origin: Vec3, tol: f64) -> Result<Surfaces> {
+    let place = Placement { origin, ..placement_of(cmd, s, job)? };
     let st = s.world_state()?;
     let fixtures: Vec<String> = job.fixtures.clone().unwrap_or_default();
     let part: Vec<String> = match &job.bodies {
@@ -521,7 +626,10 @@ fn surfaces_of(cmd: &str, s: &Session, job: &CamJob, origin: Vec3, tol: f64) -> 
         num(origin.y),
         num(origin.z)
     )];
-    let part_mesh = merged_mesh(cmd, &st, &part, origin, chord, &mut notes)?;
+    if place.axes.is_some() {
+        notes.push("the design is turned by the job's `orientation` about its origin before it is machined".into());
+    }
+    let part_mesh = merged_mesh(cmd, &st, &part, &place, chord, &mut notes)?;
     let part_surface = Surface::from_mesh(&part_mesh).map_err(|e| cam_err(cmd, "the part", e))?;
     if part_surface.is_empty() {
         return Err(bad(cmd, "the part's bodies have no surface to machine"));
@@ -530,7 +638,7 @@ fn surfaces_of(cmd: &str, s: &Session, job: &CamJob, origin: Vec3, tol: f64) -> 
         (part_surface.clone(), None)
     } else {
         let mut both = part_mesh;
-        let fix = merged_mesh(cmd, &st, &fixtures, origin, chord, &mut notes)?;
+        let fix = merged_mesh(cmd, &st, &fixtures, &place, chord, &mut notes)?;
         let fixture_surface = Surface::from_mesh(&fix).map_err(|e| cam_err(cmd, "the fixtures", e))?;
         let Ok(start) = u32::try_from(both.positions.len()) else { return Err(bad(cmd, "the part has too many triangles")) };
         both.positions.extend(fix.positions);
@@ -585,7 +693,7 @@ fn polygon_region(cmd: &str, what: &str, pts: &[[f64; 2]]) -> Result<Region2> {
 
 /// The closed profiles of sketch `key` in the coordinates of `frame` (inside work coordinates,
 /// the design less `origin`): the sketch's plane must be square to the frame's Z and face it.
-fn sketch_regions(cmd: &str, s: &Session, key: &str, profiles: Option<&[usize]>, origin: Vec3, frame: &Frame) -> Result<Vec<Region2>> {
+fn sketch_regions(cmd: &str, s: &Session, key: &str, profiles: Option<&[usize]>, place: &Placement, frame: &Frame) -> Result<Vec<Region2>> {
     let id = match s.doc.find_feature(key) {
         Some(f) if matches!(f.kind, solidcraft_doc::FeatureKind::Sketch { .. }) => f.id,
         _ => return Err(bad(cmd, format!("no sketch `{key}`"))),
@@ -598,7 +706,7 @@ fn sketch_regions(cmd: &str, s: &Session, key: &str, profiles: Option<&[usize]>,
     };
     let regions = solidcraft_doc::select_profiles(ss, &sel)?;
     let plane = &ss.plane;
-    let normal = frame.dir_to_local(plane.x.cross(plane.y));
+    let normal = frame.dir_to_local(place.turn_dir(plane.x.cross(plane.y)));
     if !(normal.z > 1.0 - 1e-6) {
         return Err(bad(
             cmd,
@@ -607,10 +715,10 @@ fn sketch_regions(cmd: &str, s: &Session, key: &str, profiles: Option<&[usize]>,
             ),
         ));
     }
-    let lx = frame.dir_to_local(plane.x);
+    let lx = frame.dir_to_local(place.turn_dir(plane.x));
     let turn = lx.y.atan2(lx.x);
     let map = |q: Vec2| {
-        let l = frame.to_local(plane.origin + plane.x * q.x + plane.y * q.y - origin);
+        let l = frame.to_local(place.in_work(plane.origin + plane.x * q.x + plane.y * q.y));
         Vec2::new(l.x, l.y)
     };
     let seg = |s: &Seg2| match *s {
@@ -635,8 +743,10 @@ struct Shared<'a> {
     part: &'a Surface,
     all: &'a Surface,
     origin: Vec3,
+    place: Placement,
     tol: f64,
     stock: Option<&'a solidcraft_cam::stock::Stock>,
+    start: Option<&'a solidcraft_cam::adaptive::HeightMap>,
     chord: f64,
     post: &'a Post5,
     features: &'a features::Lazy,
@@ -657,8 +767,10 @@ impl<'a> Shared<'a> {
             part: self.part,
             all: self.all,
             origin: self.origin,
+            place: self.place,
             tol: self.tol,
             stock: self.stock,
+            start: self.start,
             chord: self.chord,
             post: self.post,
             agent,
@@ -691,8 +803,12 @@ struct Ctx<'a> {
     /// The part and the fixtures.
     all: &'a Surface,
     origin: Vec3,
+    /// The design's placement: `origin` and the job's `orientation`.
+    place: Placement,
     tol: f64,
     stock: Option<&'a solidcraft_cam::stock::Stock>,
+    /// What an earlier setup left of the stock (`stock: {simulated}`), in work coordinates.
+    start: Option<&'a solidcraft_cam::adaptive::HeightMap>,
     /// The chord tolerance the part was tessellated within (mm).
     chord: f64,
     post: &'a Post5,
@@ -744,7 +860,7 @@ impl Ctx<'_> {
             (Some(_), Some(_)) => Err(self.bad(op, "give `sketch` or `polygon`, not both")),
             (None, None) => Err(self.bad(op, "give a `sketch` or a `polygon` to cut")),
             (None, Some(_)) if profiles.is_some() => Err(self.bad(op, "`profiles` goes with `sketch`")),
-            (Some(k), None) => sketch_regions(self.cmd, self.s, &k.0, profiles, self.origin, frame).map_err(|e| match e {
+            (Some(k), None) => sketch_regions(self.cmd, self.s, &k.0, profiles, &self.place, frame).map_err(|e| match e {
                 EngineError::BadParams { msg, .. } => self.bad(op, msg),
                 other => self.bad(op, other),
             }),
@@ -1442,6 +1558,7 @@ struct PlannedJob {
     text: String,
     tol: f64,
     origin: Vec3,
+    place: Placement,
     /// The chord tolerance the part was tessellated within (mm).
     chord: f64,
     /// How deep a cut into the tessellated part is allowed (mm).
@@ -1464,9 +1581,11 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
     if !(tol.is_finite() && (TOLERANCE_RANGE.0..=TOLERANCE_RANGE.1).contains(&tol)) {
         return Err(bad(cmd, "the job's `tolerance` must be from 0.0001 to 1 mm"));
     }
-    let origin = job.origin.unwrap_or([0.0; 3]);
-    finite_point(&origin, "`origin`").map_err(|e| bad(cmd, e))?;
-    let origin = v3(origin);
+    let place = placement_of(cmd, s, job)?;
+    let origin = place.origin;
+    if place.axes.is_some() && !machine_of(cmd, job)?.rotaries.is_empty() {
+        return Err(bad(cmd, "`orientation` turns the part on a 3-axis machine; a 4th axis turns it with its own angles"));
+    }
     if job.work_offset.is_some_and(|w| !(1..=6).contains(&w)) {
         return Err(bad(cmd, "`work_offset` must be 1 to 6 (G54 to G59)"));
     }
@@ -1483,15 +1602,15 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
     let machine_rates = rates::rates_of(cmd, job, base)?;
     let surfaces = surfaces_of(cmd, s, job, origin, tol)?;
     let mut notes = surfaces.notes.clone();
-    let stock = cam_stock::stock_of(cmd, job, &surfaces, tol, &mut notes)?;
+    let (stock, start) = cam_stock::stock_and_start(cmd, s, job, base, &surfaces, tol, &mut notes)?;
     notes.extend(loaded.notes.iter().cloned());
-    let geometry = agent::Geometry::of(s, job, origin, &mut notes)?;
+    let geometry = agent::Geometry::of(s, job, &place, &mut notes)?;
     let agent = agent::Agent::new(cmd, job, geometry, loaded, &machine, &post, machine_rates.as_ref())?;
     if job.work_offset.is_some() && !post.base.writes_work_offset() {
         notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
     }
 
-    let found = features::Lazy::new(job.bodies.clone(), job.fixtures.clone().unwrap_or_default(), origin, tol, &machine);
+    let found = features::Lazy::new(job.bodies.clone(), job.fixtures.clone().unwrap_or_default(), origin, tol, &machine, place.axes.is_some());
     let chord = tol * CHORD_SHARE;
     // How deep a cut into the tessellated part is allowed: the tolerance less what the
     // tessellation itself may be off by.
@@ -1504,8 +1623,10 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
         part: &surfaces.part,
         all: &surfaces.all,
         origin,
+        place,
         tol,
         stock: stock.as_ref(),
+        start: start.as_ref(),
         chord,
         post: &post,
         features: &found,
@@ -1593,6 +1714,7 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
         text,
         tol,
         origin,
+        place,
         chord,
         allowed,
         op_of,
@@ -1718,6 +1840,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         text,
         tol,
         origin,
+        place,
         chord,
         allowed,
         op_of,
@@ -1929,7 +2052,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         notes: &notes,
         program_file: if dry_run { None } else { output.as_deref() },
         stock: stock.as_ref(),
-        fixtures: sheet::fixture_words(s, job.fixtures.as_deref().unwrap_or_default(), origin),
+        fixtures: sheet::fixture_words(s, job.fixtures.as_deref().unwrap_or_default(), &place),
         attention: agent.limits().into_iter().chain(machine_time.iter().flat_map(|t| t.limits.iter().cloned())).collect(),
     });
     let summary = sheet::summary(&setup);
@@ -1959,7 +2082,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
     }
     let cut_minutes = machine_time.as_ref().map_or(readback.cut_minutes, |t| t.cut_minutes);
     let rapid_minutes = machine_time.as_ref().map(|t| t.rapid_minutes);
-    let setting = pictures::Setting { machine: &machine, origin, surface: &surfaces.all, tol, name: &name };
+    let setting = pictures::Setting { machine: &machine, origin, place, surface: &surfaces.all, tol, name: &name };
     let images = pictures::write(cmd, s, &wanted, &setting, &planned).map_err(|e| match (e, &outputs.gcode) {
         (EngineError::Other(m), Some(g)) => EngineError::Other(format!("{m} (the G-code was written to {g})")),
         (e, _) => e,
