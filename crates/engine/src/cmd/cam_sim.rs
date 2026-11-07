@@ -32,7 +32,7 @@ const LISTED: usize = 100;
 
 /// The job of `job` (`raw` as given) or `job_path`, the folder a job file is in, and whether an
 /// operation of it has `gouge_check: false`.
-fn load_job(cmd: &str, job: Option<CamJob>, raw: Option<&Value>, job_path: Option<&String>) -> Result<(CamJob, Option<PathBuf>, bool)> {
+pub(super) fn load_job(cmd: &str, job: Option<CamJob>, raw: Option<&Value>, job_path: Option<&String>) -> Result<(CamJob, Option<PathBuf>, bool)> {
     match (job, job_path) {
         (Some(_), Some(_)) => Err(bad(cmd, "give `job` or `job_path`, not both")),
         (None, None) => Err(bad(cmd, "give the `job` (an object) or a `job_path` (a .json file)")),
@@ -47,7 +47,7 @@ fn load_job(cmd: &str, job: Option<CamJob>, raw: Option<&Value>, job_path: Optio
 
 /// Whether `v` (a job's operations as JSON, an indexed one's inner operation included) has
 /// `gouge_check: false` anywhere.
-fn unchecked(v: &Value) -> bool {
+pub(super) fn unchecked(v: &Value) -> bool {
     match v {
         Value::Object(m) => m.get("gouge_check") == Some(&Value::Bool(false)) || m.values().any(unchecked),
         Value::Array(a) => a.iter().any(unchecked),
@@ -58,7 +58,13 @@ fn unchecked(v: &Value) -> bool {
 /// The stock the program starts from, and whether it was taken from the part: the job's
 /// `stock` when the simulation can model it on this machine, else one round the part (with a
 /// note saying why).
-fn stock_of(cmd: &str, job_stock: Option<&Stock>, part: &Surface, machine: &Machine, notes: &mut Vec<String>) -> Result<(StockShape, bool)> {
+pub(super) fn stock_of(
+    cmd: &str,
+    job_stock: Option<&Stock>,
+    part: &Surface,
+    machine: &Machine,
+    notes: &mut Vec<String>,
+) -> Result<(StockShape, bool)> {
     let rotary = !machine.rotaries.is_empty();
     match job_stock {
         Some(&Stock::Box { min, max }) if !rotary => return Ok((StockShape::Box { min, max }, false)),
@@ -71,7 +77,7 @@ fn stock_of(cmd: &str, job_stock: Option<&Stock>, part: &Surface, machine: &Mach
     Ok((stock, true))
 }
 
-fn stock_report(stock: &StockShape, derived: bool) -> SimStockReport {
+pub(super) fn stock_report(stock: &StockShape, derived: bool) -> SimStockReport {
     match *stock {
         StockShape::Box { min, max } => SimStockReport {
             kind: "box".into(),

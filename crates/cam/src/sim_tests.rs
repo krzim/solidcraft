@@ -1,6 +1,6 @@
 //! Tests of the stock-removal simulation: the tool's swept envelope against closed forms and
 //! brute force, a pocket's floor and walls, gouges and rapids caught, a rotary finish, the
-//! limits, and how long a 50 × 50 mm part takes.
+//! limits, how long a 50 × 50 mm part takes, and the simulation advanced a part at a time.
 
 use std::time::Instant;
 
@@ -9,7 +9,7 @@ use solidcore_record::{Vec2, Vec3};
 use crate::foundation_tests::*;
 use crate::gcode5::{Post5, emit5};
 use crate::kinematics::Machine;
-use crate::sim::{Profile, SimParams, SimReport, StockGrid, StockShape, simulate, stock_around};
+use crate::sim::{Profile, SimParams, SimReport, SimState, StockGrid, StockShape, TILE, plan_sim, simulate, stock_around};
 use crate::*;
 
 fn flat(d: f64) -> Tool {
@@ -556,4 +556,196 @@ fn the_simulation_shapes_every_kind_of_tool() {
     let mut drill = Tool::new(3, ToolKind::Drill, 6.0, 30.0);
     drill.point_angle_deg = Some(90.0);
     assert!((Profile::of(&drill).unwrap().height(2.0) - 2.0).abs() < 1e-9, "a 90 degree point");
+}
+
+/// A small random number generator for chunk sizes.
+fn lcg(seed: &mut u64) -> u64 {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed >> 33
+}
+
+/// `simulate` as its parts: the plan, a state advanced a random number of steps at a time (and,
+/// with `fractions`, to random places inside steps), and the finish.
+fn chunked(
+    text: &str,
+    machine: &Machine,
+    tools: &[Tool],
+    stock: &StockShape,
+    part: &Surface,
+    params: &SimParams,
+    seed: u64,
+    fractions: bool,
+) -> SimReport {
+    let plan = plan_sim(text, machine, tools, stock, params).unwrap();
+    let mut state = SimState::new(&plan);
+    let mut seed = seed;
+    while state.at().0 < plan.moves() {
+        let (k, f) = state.at();
+        let to = k + (lcg(&mut seed) % 4) as usize + usize::from(!fractions);
+        let frac = if fractions { (lcg(&mut seed) % 1000) as f64 / 1000.0 } else { 0.0 };
+        let frac = if to == k { frac.max(f + 0.001).min(1.0) } else { frac };
+        state.advance(&plan, to, frac).unwrap();
+        assert!(state.advance(&plan, 0, 0.0).is_err() || state.at() == (0, 0.0), "cutting back is refused");
+    }
+    state.finish(&plan, part)
+}
+
+fn pocket_program() -> String {
+    let mut moves = String::from(
+        "G0 X13. Y13.
+G0 Z1.
+G1 Z-3. F200
+G1 X27. F800
+Y27.
+X13.
+Y13.
+",
+    );
+    let mut y = 13.0;
+    while y < 27.0 {
+        moves.push_str(&format!(
+            "G1 Y{y:.3}
+X27.
+G1 Y{:.3}
+X13.
+",
+            y + 2.0
+        ));
+        y += 4.0;
+    }
+    moves.push_str(
+        "G2 X20. Y20. I3.5 J3.5
+G0 Z10.
+",
+    );
+    program(&moves)
+}
+
+#[test]
+fn advancing_a_part_at_a_time_leaves_what_one_run_does() {
+    let part = block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(40.0, 40.0, -3.0));
+    let three = Machine::three_axis();
+    let cases: Vec<(String, Tool)> = vec![
+        (pocket_program(), flat(6.0)),
+        (
+            program(
+                "G0 X5. Y20.
+G0 Z1.
+G1 Z-3. F200
+G1 X35. F800
+G3 X5. Y20. I-15. J0.
+G0 Z10.",
+            ),
+            ball(6.0),
+        ),
+        (
+            program(
+                "G0 X25. Y20.
+G0 Z0.
+G2 X25. Y20.001 Z-4. I-5. J0. F500
+G18 G2 X35. Z-4. I5. K0.
+G17
+G0 Z10.",
+            ),
+            bull(6.0, 1.0),
+        ),
+    ];
+    for (text, tool) in &cases {
+        let p = params(0.01, 0.2);
+        let whole = simulate(text, &three, std::slice::from_ref(tool), &stock(), &part, &p).unwrap();
+        for seed in [1, 7, 42] {
+            // Whole steps: bit for bit.
+            assert_eq!(chunked(text, &three, std::slice::from_ref(tool), &stock(), &part, &p, seed, false), whole);
+            // Parts of steps: the same stock, to rounding.
+            let parts = chunked(text, &three, std::slice::from_ref(tool), &stock(), &part, &p, seed, true);
+            let (StockGrid::Heights { heights: a, .. }, StockGrid::Heights { heights: b, .. }) = (&parts.stock, &whole.stock) else { panic!() };
+            assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9), "seed {seed}");
+            close(parts.removed_volume, whole.removed_volume, 1e-6 * whole.removed_volume.max(1.0));
+        }
+    }
+    // On a 4th axis too.
+    let machine = Machine::four_axis_a();
+    let round = cylinder_x(10.0, -15.0, 15.0, 64);
+    let bar = StockShape::Cylinder { x_min: -10.0, x_max: 10.0, radius: 12.0 };
+    let text = "G21
+T1 M6
+G0 X0. Y0. Z30. A0.
+G1 Z10.5 F100
+G1 X4. A200. F2000
+G1 X-4. A0.
+G0 Z30.
+";
+    let p = params(0.01, 0.2);
+    let whole = simulate(text, &machine, &[ball(6.0)], &bar, &round, &p).unwrap();
+    for seed in [3, 9] {
+        assert_eq!(chunked(text, &machine, &[ball(6.0)], &bar, &round, &p, seed, false), whole);
+        // Tool positions along a step are whole pieces of work: exact even part way.
+        assert_eq!(chunked(text, &machine, &[ball(6.0)], &bar, &round, &p, seed, true).stock, whole.stock);
+    }
+}
+
+#[test]
+fn tile_maxima_bound_their_cells() {
+    let plan = plan_sim(&pocket_program(), &Machine::three_axis(), &[flat(6.0)], &stock(), &params(0.01, 0.1)).unwrap();
+    let mut state = SimState::new(&plan);
+    let mut seed = 5u64;
+    let (nx, ny) = (plan.grid().columns(), plan.grid().rows());
+    for to in [3usize, 7, 12, plan.moves()] {
+        state.advance(&plan, to, 0.0).unwrap();
+        for _ in 0..200 {
+            let (a, b) = ((lcg(&mut seed) as usize) % nx, (lcg(&mut seed) as usize) % nx);
+            let (c, d) = ((lcg(&mut seed) as usize) % ny, (lcg(&mut seed) as usize) % ny);
+            let ((i0, i1), (j0, j1)) = ((a.min(b), a.max(b)), (c.min(d), c.max(d)));
+            // Exact over the whole tiles covering the cells asked.
+            let mut brute = f64::NEG_INFINITY;
+            for j in (j0 / TILE * TILE)..((j1 / TILE + 1) * TILE).min(ny) {
+                for i in (i0 / TILE * TILE)..((i1 / TILE + 1) * TILE).min(nx) {
+                    brute = brute.max(state.value(&plan, i, j).unwrap());
+                }
+            }
+            assert_eq!(state.max_in(&plan, (i0, i1), (j0, j1)), brute);
+        }
+    }
+    // Every tile the pocket reaches changed its version; a tile far from it did not.
+    // The pocket is cells 100 to 300 each way (0.1 mm cells), tiles 6 to 18.
+    assert!(state.tile_version(12, 12) > 0);
+    assert_eq!(state.tile_version(0, 0), 0);
+    assert!(state.last_tool(&plan, 200, 200) == 0 && state.last_tool(&plan, 0, 0) == crate::sim::UNCUT);
+}
+
+#[test]
+fn the_shank_rubbing_and_the_spindle_are_seen() {
+    // Two millimetres of flutes, a slot five deep in one pass: three stand above the flutes.
+    let short = Tool::new(1, ToolKind::FlatEndmill, 6.0, 2.0);
+    let text = program(
+        "G0 X5. Y20.
+G0 Z1.
+G1 Z-5. F200
+G1 X35. F800
+M5
+G1 X36.
+G0 Z10.",
+    );
+    let plan = plan_sim(&text, &Machine::three_axis(), std::slice::from_ref(&short), &stock(), &params(0.01, 0.2)).unwrap();
+    let mut state = SimState::new(&plan);
+    state.advance(&plan, plan.moves(), 0.0).unwrap();
+    let slot = (0..plan.moves()).find(|&k| plan.step(k).unwrap().line == 11).unwrap();
+    close(state.removed()[slot].above, 3.0, 1e-9);
+    close(state.removed()[slot].above_at.z, -3.0, 1e-9);
+    // The spindle turns from `S12000 M3` and stops at `M5`.
+    assert_eq!(plan.step(slot).unwrap().rpm, Some(12000.0));
+    assert_eq!(plan.step(slot + 1).unwrap().rpm, Some(0.0));
+    // A program that never says has no speed.
+    let silent = plan_sim(
+        "G21
+G0 X0 Y0 Z5
+G1 Z-1 F100
+",
+        &Machine::three_axis(),
+        &[flat(2.0)],
+        &stock(),
+        &params(0.01, 0.5),
+    )
+    .unwrap();
+    assert_eq!(silent.step(1).unwrap().rpm, None);
 }

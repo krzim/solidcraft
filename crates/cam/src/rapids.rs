@@ -186,8 +186,8 @@ fn line_of(b: &JointWords) -> usize {
 
 /// The operation of every block of `blocks` (read from the program as written), from the
 /// program written again with a marker before every operation; `None` when the two do not move
-/// alike.
-fn owners(program: &MachineProgram, post: &Post5, machine: &Machine, blocks: &[JointWords]) -> Option<Vec<usize>> {
+/// alike. A view uses it to put every block of a job's program under its operation.
+pub fn owners(program: &MachineProgram, post: &Post5, machine: &Machine, blocks: &[JointWords]) -> Option<Vec<usize>> {
     let mut marked = post.clone();
     marked.base.operation_start.insert(0, MARK.into());
     let text = emit_program(program, &marked, machine).ok()?;

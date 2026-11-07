@@ -1,7 +1,7 @@
 //! CAM (`cam.job`, `cam.posts`, `cam.check`): toolpaths for a design's bodies and G-code for a
 //! machine, through the `solidcraft-cam` crate. The job (machine, post, tools, operations) is a
 //! JSON file next to the design, never part of it, so nothing new is saved in a design
-//! (docs/cam-jobs.md).
+//! (docs/cam-jobs.md). The simulation view's commands (`cam.view.*`) are in `cam_view.rs`.
 //!
 //! `cam.job` tessellates the part's bodies from their exact surfaces at a quarter of the job's
 //! tolerance into a surface in work coordinates (the design less the job's origin), runs every
@@ -49,6 +49,8 @@ use crate::{EngineError, Result, Session};
 const JOB_CONTRACT: TypedContract<CamJobParams> = TypedContract::new();
 const POSTS_CONTRACT: TypedContract<CamPostsParams> = TypedContract::new();
 const CHECK_CONTRACT: TypedContract<CamCheckParams> = TypedContract::new();
+
+pub(crate) use view::COMMANDS as VIEW_COMMANDS;
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.job", "CAM Job", crate::checked!("cam.job", job))
@@ -1294,6 +1296,144 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
     }
 }
 
+/// A job planned and its program written in memory: what `cam.job` checks and writes, and what
+/// `cam.view.load` plays.
+struct PlannedJob {
+    name: String,
+    machine: Machine,
+    post_name: String,
+    post: Post5,
+    tools: Vec<Tool>,
+    machine_rates: Option<solidcraft_cam::machine_time::MachineRates>,
+    surfaces: Surfaces,
+    notes: Vec<String>,
+    stock: Option<solidcraft_cam::stock::Stock>,
+    planned: Vec<Planned>,
+    program: MachineProgram,
+    text: String,
+    tol: f64,
+    origin: Vec3,
+    /// The chord tolerance the part was tessellated within (mm).
+    chord: f64,
+    /// How deep a cut into the tessellated part is allowed (mm).
+    allowed: f64,
+    /// The job's operation each planned one comes from (an indexed pattern plans several).
+    op_of: Vec<usize>,
+    agent: agent::Agent,
+}
+
+/// Plans every operation of the job `loaded` (its profile, machine file and tool libraries read)
+/// and writes its program in memory through its post. An operation that cannot be planned
+/// refuses the whole job, every such operation listed.
+fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob> {
+    let job = &loaded.job;
+    let base = loaded.base.as_deref();
+    if job.operations.is_empty() || job.operations.len() > MAX_OPERATIONS {
+        return Err(bad(cmd, format!("a job has 1 to {MAX_OPERATIONS} operations")));
+    }
+    let tol = job.tolerance.unwrap_or(0.01);
+    if !(tol.is_finite() && (TOLERANCE_RANGE.0..=TOLERANCE_RANGE.1).contains(&tol)) {
+        return Err(bad(cmd, "the job's `tolerance` must be from 0.0001 to 1 mm"));
+    }
+    let origin = job.origin.unwrap_or([0.0; 3]);
+    finite_point(&origin, "`origin`").map_err(|e| bad(cmd, e))?;
+    let origin = v3(origin);
+    if job.work_offset.is_some_and(|w| !(1..=6).contains(&w)) {
+        return Err(bad(cmd, "`work_offset` must be 1 to 6 (G54 to G59)"));
+    }
+    let name = match &job.name {
+        Some(n) if n.chars().count() > 200 || n.chars().any(char::is_control) => {
+            return Err(bad(cmd, "the job's `name` must be at most 200 characters, without control characters"));
+        }
+        Some(n) => n.clone(),
+        None => s.doc.name.clone(),
+    };
+    let machine = machine_of(cmd, job)?;
+    let (post_name, post) = post_of(cmd, job, base)?;
+    let tools = tools_of(cmd, job, base)?;
+    let machine_rates = rates::rates_of(cmd, job, base)?;
+    let surfaces = surfaces_of(cmd, s, job, origin, tol)?;
+    let mut notes = surfaces.notes.clone();
+    let stock = cam_stock::stock_of(cmd, job, &surfaces, tol, &mut notes)?;
+    notes.extend(loaded.notes.iter().cloned());
+    let geometry = agent::Geometry::of(s, job, origin, &mut notes)?;
+    let agent = agent::Agent::new(cmd, job, geometry, loaded, &machine, &post)?;
+    if job.work_offset.is_some() && !post.base.writes_work_offset() {
+        notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
+    }
+
+    let found = features::Lazy::new(job.bodies.clone(), job.fixtures.clone().unwrap_or_default(), origin, tol, &machine);
+    let chord = tol * CHORD_SHARE;
+    // How deep a cut into the tessellated part is allowed: the tolerance less what the
+    // tessellation itself may be off by.
+    let allowed = tol - chord;
+    let ctx = Ctx {
+        adaptive: Default::default(),
+        cmd,
+        s,
+        machine: &machine,
+        tools: &tools,
+        part: &surfaces.part,
+        all: &surfaces.all,
+        origin,
+        tol,
+        stock: stock.as_ref(),
+        chord,
+        post: &post,
+        agent: &agent,
+        features: &found,
+    };
+    let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
+    // Arcs are followed far closer than the post's tolerance for the checks, so their chords
+    // are not taken for cuts into the part.
+    let pose_tol = post.base.arc_tolerance.min(allowed * CHECK_ARC_SHARE).max(1e-6);
+    let mut op_of: Vec<usize> = Vec::with_capacity(job.operations.len());
+    let mut refused = Vec::new();
+    for (i, spec) in job.operations.iter().enumerate() {
+        agent.start(i);
+        let before = planned.len();
+        match xrotary::plan_into(&ctx, spec, &post, pose_tol, &mut planned) {
+            Ok(()) => op_of.resize(planned.len(), i),
+            Err(e) => {
+                planned.truncate(before);
+                refused.push(agent.refusal_of(e));
+            }
+        }
+    }
+    if !refused.is_empty() {
+        return Err(agent::refuse(cmd, "the job was not planned", &refused, "Nothing was written."));
+    }
+
+    let program = MachineProgram { name: name.clone(), operations: planned.iter().map(|p| p.op.clone()).collect(), work_offset: job.work_offset };
+    let (text, written) = emit_program_report(&program, &post, &machine).map_err(|e| cam_err(cmd, "writing the program", e))?;
+    // The rewinds' feeds are time at feed of their operations too, so the operations' minutes add
+    // up to the program's as read back.
+    for (p, w) in planned.iter_mut().zip(&written) {
+        p.report.cut_minutes += w.rewind_minutes;
+        p.report.rewinds = w.rewinds;
+    }
+    Ok(PlannedJob {
+        name,
+        machine,
+        post_name,
+        post,
+        tools,
+        machine_rates,
+        surfaces,
+        notes,
+        stock,
+        planned,
+        program,
+        text,
+        tol,
+        origin,
+        chord,
+        allowed,
+        op_of,
+        agent,
+    })
+}
+
 /// `cam.job`.
 pub(super) fn job(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.job";
@@ -1332,93 +1472,27 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
     }
     let wanted = pictures::Request::of(cmd, &params, only)?;
     let loaded = agent::load_job(cmd, raw, &params)?;
-    let job: CamJob = loaded.job.clone();
-    let base = loaded.base.as_deref();
-    if job.operations.is_empty() || job.operations.len() > MAX_OPERATIONS {
-        return Err(bad(cmd, format!("a job has 1 to {MAX_OPERATIONS} operations")));
-    }
-    let tol = job.tolerance.unwrap_or(0.01);
-    if !(tol.is_finite() && (TOLERANCE_RANGE.0..=TOLERANCE_RANGE.1).contains(&tol)) {
-        return Err(bad(cmd, "the job's `tolerance` must be from 0.0001 to 1 mm"));
-    }
-    let origin = job.origin.unwrap_or([0.0; 3]);
-    finite_point(&origin, "`origin`").map_err(|e| bad(cmd, e))?;
-    let origin = v3(origin);
-    if job.work_offset.is_some_and(|w| !(1..=6).contains(&w)) {
-        return Err(bad(cmd, "`work_offset` must be 1 to 6 (G54 to G59)"));
-    }
-    let name = match &job.name {
-        Some(n) if n.chars().count() > 200 || n.chars().any(char::is_control) => {
-            return Err(bad(cmd, "the job's `name` must be at most 200 characters, without control characters"));
-        }
-        Some(n) => n.clone(),
-        None => s.doc.name.clone(),
-    };
-    let machine = machine_of(cmd, &job)?;
-    let (post_name, post) = post_of(cmd, &job, base)?;
-    let tools = tools_of(cmd, &job, base)?;
-    let machine_rates = rates::rates_of(cmd, &job, base)?;
-    let surfaces = surfaces_of(cmd, s, &job, origin, tol)?;
-    let mut notes = surfaces.notes.clone();
-    let stock = cam_stock::stock_of(cmd, &job, &surfaces, tol, &mut notes)?;
-    notes.extend(loaded.notes.iter().cloned());
-    let geometry = agent::Geometry::of(s, &job, origin, &mut notes)?;
-    let agent = agent::Agent::new(cmd, &job, geometry, &loaded, &machine, &post)?;
-    if job.work_offset.is_some() && !post.base.writes_work_offset() {
-        notes.push(format!("post `{post_name}` writes no work offset: the program runs in whichever the controller has active"));
-    }
-
-    let found = features::Lazy::new(job.bodies.clone(), job.fixtures.clone().unwrap_or_default(), origin, tol, &machine);
-    let chord = tol * CHORD_SHARE;
-    // How deep a cut into the tessellated part is allowed: the tolerance less what the
-    // tessellation itself may be off by.
-    let allowed = tol - chord;
-    let ctx = Ctx {
-        adaptive: Default::default(),
-        cmd,
-        s,
-        machine: &machine,
-        tools: &tools,
-        part: &surfaces.part,
-        all: &surfaces.all,
-        origin,
+    let job: &CamJob = &loaded.job;
+    let PlannedJob {
+        name,
+        machine,
+        post_name,
+        post,
+        tools,
+        machine_rates,
+        surfaces,
+        mut notes,
+        stock,
+        mut planned,
+        program,
+        text,
         tol,
-        stock: stock.as_ref(),
+        origin,
         chord,
-        post: &post,
-        agent: &agent,
-        features: &found,
-    };
-    let mut planned: Vec<Planned> = Vec::with_capacity(job.operations.len());
-    // Arcs are followed far closer than the post's tolerance for the checks, so their chords
-    // are not taken for cuts into the part.
-    let pose_tol = post.base.arc_tolerance.min(allowed * CHECK_ARC_SHARE).max(1e-6);
-    // The job's operation each planned one comes from (an indexed pattern plans several).
-    let mut op_of: Vec<usize> = Vec::with_capacity(job.operations.len());
-    let mut refused = Vec::new();
-    for (i, spec) in job.operations.iter().enumerate() {
-        agent.start(i);
-        let before = planned.len();
-        match xrotary::plan_into(&ctx, spec, &post, pose_tol, &mut planned) {
-            Ok(()) => op_of.resize(planned.len(), i),
-            Err(e) => {
-                planned.truncate(before);
-                refused.push(agent.refusal_of(e));
-            }
-        }
-    }
-    if !refused.is_empty() {
-        return Err(agent::refuse(cmd, "the job was not planned", &refused, "Nothing was written."));
-    }
-
-    let program = MachineProgram { name: name.clone(), operations: planned.iter().map(|p| p.op.clone()).collect(), work_offset: job.work_offset };
-    let (text, written) = emit_program_report(&program, &post, &machine).map_err(|e| cam_err(cmd, "writing the program", e))?;
-    // The rewinds' feeds are time at feed of their operations too, so the operations' minutes add
-    // up to the program's as read back.
-    for (p, w) in planned.iter_mut().zip(&written) {
-        p.report.cut_minutes += w.rewind_minutes;
-        p.report.rewinds = w.rewinds;
-    }
+        allowed,
+        op_of,
+        agent,
+    } = plan_job(cmd, s, &loaded)?;
     let rb = readback_program(&text, &program, &post, &machine).map_err(|e| cam_err(cmd, "reading the program back", e))?;
     let machine_time = match &machine_rates {
         Some(r) => Some(rates::time_report(cmd, &text, &machine, &post, r)?),
@@ -1538,7 +1612,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
     // Every rapid of the program as written, and every position against the machine's travel.
     let unchecked: Vec<bool> = planned.iter().map(|p| !p.gouge_check).collect();
     let (rapids, travel) =
-        cam_stock::check_motion(cmd, &job, &text, &program, &post, &machine, &surfaces, stock.as_ref(), &unchecked, tol, &mut failures)?;
+        cam_stock::check_motion(cmd, job, &text, &program, &post, &machine, &surfaces, stock.as_ref(), &unchecked, tol, &mut failures)?;
     let simulation = if params.simulate.unwrap_or(false) {
         let deliberate = planned.iter().any(|p| !p.gouge_check);
         match sim::check_program(cmd, &text, &machine, &tools, &surfaces.part, stock.as_ref(), tol, None, deliberate) {
@@ -2089,6 +2163,8 @@ mod sheet;
 mod sim;
 #[path = "cam_suggest.rs"]
 pub(super) mod suggest;
+#[path = "cam_view.rs"]
+mod view;
 #[path = "cam_xrotary.rs"]
 mod xrotary;
 

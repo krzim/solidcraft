@@ -40,6 +40,19 @@ pub struct MachineRatesSpec {
     /// The travel of X, Y and Z, mm: the reply warns when the program spans more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub travel_mm: Option<[f64; 3]>,
+    /// Acceleration of X and Y (and Z unless `accel_z_mm_s2` is given), mm/s²: the simulation
+    /// view (`cam.view.*`) times its moves with it. `cam.job`'s times leave acceleration out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_mm_s2: Option<f64>,
+    /// Acceleration of Z, where it differs, mm/s².
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_z_mm_s2: Option<f64>,
+    /// Acceleration of the rotaries, degrees/s².
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_a_deg_s2: Option<f64>,
+    /// How long a tool change (`M6`) takes, seconds: the simulation view's timeline waits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_change_seconds: Option<f64>,
 }
 
 /// A spindle speed outside the machine's range.

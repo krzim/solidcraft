@@ -58,6 +58,8 @@ pub(super) struct Loaded {
     pub notes: Vec<String>,
     /// Library tools left out (a kind or key this build does not know), by number.
     pub left_out: Vec<(u32, String)>,
+    /// Whether an operation of the job has `gouge_check: false`.
+    pub unchecked: bool,
 }
 
 /// A refusal of the job as a whole.
@@ -218,7 +220,12 @@ fn library_tools(cmd: &str, base: Option<&Path>, paths: &[String], pick: Option<
 /// file and tool libraries read. Relative paths of the job are left relative to its file's
 /// folder (`base`); a profile's are made relative to the job's folder through the profile's.
 pub(super) fn load_job(cmd: &str, p: &Value, params: &CamJobParams) -> Result<Loaded> {
-    let (raw, base, what) = match (params.job.is_some(), &params.job_path) {
+    load_job_of(cmd, p, params.job.is_some(), params.job_path.as_ref())
+}
+
+/// [`load_job`] for any command that takes a `job` (in `p`, when `has_job`) or a `job_path`.
+pub(super) fn load_job_of(cmd: &str, p: &Value, has_job: bool, job_path: Option<&String>) -> Result<Loaded> {
+    let (raw, base, what) = match (has_job, job_path) {
         (true, Some(_)) => return Err(bad(cmd, "give `job` or `job_path`, not both")),
         (false, None) => return Err(bad(cmd, "give the `job` (an object) or a `job_path` (a .json file)")),
         (true, None) => (p.get("job").cloned().unwrap_or(Value::Null), None, String::new()),
@@ -281,9 +288,10 @@ pub(super) fn load_job(cmd: &str, p: &Value, params: &CamJobParams) -> Result<Lo
         }
         Some(_) => return Err(bad(cmd, "`tool_library_paths` is a list of file paths")),
     }
+    let unchecked = job.get("operations").is_some_and(super::sim::unchecked);
     let job: CamJob = super::parse(cmd, &Value::Object(job), &what)?;
     let notes = left_out.iter().map(|(_, n)| n.clone()).collect();
-    Ok(Loaded { job, base, profile, notes, left_out })
+    Ok(Loaded { job, base, profile, notes, left_out, unchecked })
 }
 
 /// The part's and the fixtures' exact geometry, in design coordinates.

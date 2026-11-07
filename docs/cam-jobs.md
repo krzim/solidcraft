@@ -153,6 +153,8 @@ silently left at its default. That holds for the tools, the machine and the post
 | `operations` | 1 to 200 operations, run and written in order (below). |
 | `machine_rates` | The machine's top rates (below, "Machine rates"): the reply then times the program as the machine runs it and warns about blocks its controller would slow. Default: none. |
 | `machine_rates_path` | A JSON file holding `machine_rates`, read from the job file's folder when relative. |
+| `machine_model_path` | A machine model file for the simulation view (below, "Simulation view"), read from the job file's folder when relative. `cam.job` does not read it. |
+| `workholding_path` | A workholding file for the simulation view, read from the job file's folder when relative. `cam.job` does not read it. |
 
 ### Coordinates
 
@@ -794,6 +796,9 @@ faster than A can turn, in inverse time (`G93`) or not. Give the job the machine
 | `spindle_rpm` | `[lowest, highest]`: the controller runs any other `S` at the nearest end of its range. |
 | `spindle_start_seconds` | How long the controller waits at each spindle start (`M3`, `M4`). |
 | `travel_mm` | `[x, y, z]`: the travel of the linear axes. |
+| `accel_mm_s2`, `accel_z_mm_s2` | Acceleration of X and Y, and of Z, mm/s². Only the simulation view's timeline uses them. |
+| `accel_a_deg_s2` | Acceleration of the rotaries, degrees/s² (the simulation view). |
+| `tool_change_seconds` | How long a tool change (`M6`) takes (the simulation view's timeline). |
 
 A rate left out is not limited. Every rate must be above 0. Unknown keys are refused, in a
 `machine_rates_path` file too.
@@ -903,6 +908,104 @@ depend on how many. A 50 × 50 mm dome finished with a 6 mm ball in parallel pas
 (about 21,000 blocks) simulates on a million cells (0.05 mm) in about 7 seconds on one thread and
 under a second on eight; a 4th-axis finish on a 16 mm long, 20 mm diameter barrel, 1° apart, on
 414,000 cells in about 3 seconds on one thread and under a second on eight.
+
+## Simulation view
+
+`cam.view.load` loads a job's program into the simulation view: the job planned and written in
+memory (as `cam.job` with `dry_run`), or a G-code file of it (`program`). The program is cut
+into the stock move by move as the view plays, with the same exact model as `cam.simulate`
+(cutting part of a move and then the rest leaves what cutting it whole does), and what goes wrong
+is found at the move and place it happens. The view is view state only: nothing is saved in the
+design, and no command of it is an undo step.
+
+The job is read as `cam.job` reads it (its profile merged in, its machine file and tool
+libraries read), and planned and written as `cam.job` writes it, rewinds and all, so the view
+plays the program `cam.job` would write, block for block, each under its operation. A job
+`cam.job` refuses is refused at load with the same refusals ("Refusals", below). The view has no
+compact reply.
+
+| Command | Does |
+| --- | --- |
+| `cam.view.load` | `job` or `job_path`; `program?`; `machine_model_path?`, `workholding_path?` (instead of the job's); `resolution?`; `run_to_end?` (cut it all once at load, so every finding is known, then go back to the start); `colour_by?`. Replies with the moves, the operations (from the job, or one per tool change for a program file), the tool changes, the program's time, the stock, the machine model, the workholding's boxes and what is known to be wrong already. |
+| `cam.view.seek` | Exactly one of `move` (to its end), `line`, `op` (a name or a number, with `at`: `start` or `end`), `time_s`, `percent`, `tool_change`, `finding`, `by` (moves on or back; with `until`: `tool_change`, `op` or `finding`, to the next one). Going back puts the stock back from the nearest copy kept before the target and cuts on from there. |
+| `cam.view.play`, `cam.view.pause` | Whether a window plays the view on, at `speed` times real time or `moves_per_s`, with `loop`. Headless, seek instead. |
+| `cam.view.show` | What is drawn: `toolpaths`, `rapids`, `remaining_path`, `stock`, `part`, `tool`, `holder`, `machine`, `fixtures`, `gouges`, `collisions`, `deviation`; `colour_by`. |
+| `cam.view.state` | Where the tool is: the move and the share of it done, the line and its G-code, the operation, the tool, the tip, the axis and the machine's words (A included), the feed, the spindle's speed, the time, the material removed, and the findings so far by code (`findings: all` lists them). |
+| `cam.view.export_stock` | The stock as cut so far, as an STL file. |
+| `cam.view.close` | Drops the view. |
+
+**What is found.** `rapid-in-stock` (a rapid cutting more than the tolerance), `gouge` (a cell
+cut below the part, measured again in 3D; a warning for an operation with `gouge_check: false`),
+`cut-spindle-off` (cutting after `M5`, once the program has started the spindle), `shank-rubs`
+(material above the flute length where the tool cuts), `shank-hits-stock` and
+`holder-hits-stock` (the shank or a holder section coming down on the stock as it is then),
+`{part}-hits-stock`, `{part}-hits-{kind}` and `cutter-hits-{kind}` (a machine part or the cutter
+against the table, the vise, a clamp, the parallels, the grip or a rotary unit),
+`cutter-into-table` (deeper than the table's `cut_allowance`) and `z-travel` (the spindle nose
+above its travel), and the setup's own: `vise-too-narrow`, `stock-not-gripped`, `shallow-grip`,
+`vise-overhangs-table`, `clamp-off-stock`, `no-clamps`, `stock-off-table`. The machine's checks
+use the model's boxes and cylinders, exactly; on a 4th axis the shank and holder are checked
+against the round stock at points round their bottoms, and machine parts against the
+workholding in the table's frame.
+
+**Time.** Each move is timed with the job's machine rates (or the model's; without either,
+rapids at 5000 mm/min and cuts at their feed). Where the rates give accelerations, a move speeds
+up and slows down as a trapezoid, slowing at a corner to the speed both moves share times the
+cosine of the turn (to a stop between a rapid and a cut, or at a right angle), round an arc to
+√(a·r); spindle starts and tool changes wait their time. A 1000 mm cut at 6000 mm/min with
+2000 mm/s² takes 10.05 s. The machine model's accelerations and tool change fill in what the
+job's rates leave out.
+
+**In the window.** The Simulation panel opens with Simulation View (`ui.start` of
+`cam.view.load`) and whenever a view is loaded, an agent's load too; closing it closes the view.
+It loads a job (and, optionally, a G-code file, a machine model and a workholding), plays,
+pauses and steps the program by move, operation, tool change or finding, at a speed from ×0.25
+to ×256 of the estimated real time, and loops. Its timeline shows the operations as bands, the
+tool changes as ticks, the findings as marks and how far the program has been checked; a click
+or a drag goes there. Under it: the line and its G-code, the operation, the tool, the position
+(A included), the feed, the spindle, the time and the material removed, the findings (a click
+goes to one) and what the view shows. Every action is a `cam.view.*` command. The 3D view draws
+the stock as cut so far coloured by the tool that cut it last, the toolpaths in one colour per
+operation (or tool) with what is still to come dim, rapids dashed and each plunge's foot marked,
+the tool with its shank and holder and the machine's spindle parts at the tool's pose, the
+workholding see-through, and the findings as crosses. The design's own bodies are hidden unless
+`part` is shown. Commands that cut the stock (`load`, `seek`, `export_stock`), from the panel,
+from playing or from an agent over the control channel, run in order off the window thread; the
+window keeps drawing meanwhile. When nothing is asked, the program is checked to its end in the
+background, so every finding is on the timeline.
+
+### Machine model
+
+A machine model file (`"format": "solidcraft.machine_model", "version": 1`) gives the table,
+the spindle and the machine's parts. Unknown keys are refused; every number must be finite.
+
+| Key | Meaning |
+| --- | --- |
+| `name` | Shown in the reply. |
+| `rates` / `rates_path` | Machine rates (as above) when the job gives none, and accelerations. |
+| `spindle` | `nose_gap` (the top of the tool's holder to the spindle nose, mm), `nose_max_above_table?` (the highest the nose gets above the table: the Z-travel check), `rpm?`. |
+| `table` | `size` `[x, y, thickness]`, `corner_radius?`, `cut_allowance?` (how deep the cutter may go into the table top), `holes?: [{x, y, d, depth, label?}]` in the table frame. |
+| `parts` | Up to 1000 of `{name, code, mount, shape}`: `mount` `spindle` (moves with X, Y and Z; Z from the spindle nose), `carriage` (X and Y; Z from the table top), `frame` (Y only; X from the table's centre) or `table` (fixed); `shape` `{"cylinder": {"diameter", "z": [low, high], "center?"}}` or `{"box": {"min", "max"}}`. `code` (kebab-case) is the findings' stem. |
+| `display_meshes` | Up to 64 `{path, mount?, color?}`: a mesh-parts JSON file (`{"parts": [{"name", "mount", "color", "tris": [x, y, z, ...]}]}`) or an STL file. Drawn, never checked. |
+| `kinematics` / `kinematics_path`, `soft_limits` | Kept with the model; the job's machine gives the axes. |
+
+The **table frame** has its origin at the table's front-left top corner, X to the right, Y to
+the back, Z up.
+
+### Workholding
+
+A workholding file (`"format": "solidcraft.workholding", "version": 1`) says how the stock is
+held; the job's stock is placed in it, and work zero follows.
+
+| `holding` | Needs | |
+| --- | --- | --- |
+| `vise` | `vise: {model: {length, width, height, floor, fixed_jaw, moving_jaw, max_opening}, center, quarter_turns?, offset?, grip?}` | The stock against the fixed jaw, on the parallels (or the floor), centred along the jaws at `offset`. `quarter_turns` counter-clockwise from the jaws along X with the fixed jaw at the back. `grip` is a box (work coordinates) the jaws close on instead of the stock. |
+| `clamps` | `stock_at: [x, y]` (its front-left corner on the table), `clamps: [{center, size, height}]` | On the parallels or the table; each clamp a box on the stock's top. |
+| `table` | `table_zero: [x, y, z]` | The program machines the table itself. |
+| `rotary` | `rotary: {axis: [y, z], headstock: {min, max}, chuck: {diameter, length, face_x}, tailstock?, plate?, zero_x?}` | A bar on the A axis; work zero on the axis at `zero_x` (default: the bar's low end at the chuck's face). |
+
+`parallels: {height, thickness, length, inset?, offset?}` go under the stock (along the jaws in a
+vise, under the long edges with clamps).
 
 ## Setup sheet
 

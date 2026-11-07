@@ -12,6 +12,13 @@
 //! velocity rarely stops between them), so the times are a lower bound for short blocks; moves
 //! to and from the machine's home (`G28`) are in machine coordinates and are not timed.
 //!
+//! [`block_times`] times every block on its own for a view that plays the program in time,
+//! and, where the rates give the axes' accelerations, with them: each block speeds up and slows
+//! down as a trapezoid (or a triangle when it is too short to reach its top speed), slowing at
+//! a corner to the speed both blocks share times the cosine of the turn (to a stop at a right
+//! angle or more, and between a rapid and a cut), round an arc to `√(a·r)`; spindle starts and
+//! tool changes wait their time. Ported from the author's own MIT-licensed G-code simulator (MIT, same author).
+//!
 //! A dwell's `P` is read in the unit the post writes it in ([`DwellUnit`]), which must be the
 //! unit the controller is set to read (some read `G4 P` in seconds, others in milliseconds).
 
@@ -123,6 +130,19 @@ pub struct MachineRates {
     /// The travel of X, Y and Z (mm): no program can span more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub travel_mm: Option<[f64; 3]>,
+    /// Acceleration of X and Y (and of Z, unless `accel_z_mm_s2` is given), mm/s²: given, the
+    /// blocks are timed with it ([`block_times`]); left out, at their top rates throughout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_mm_s2: Option<f64>,
+    /// Acceleration of Z, where it differs, mm/s².
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_z_mm_s2: Option<f64>,
+    /// Acceleration of every rotary, degrees/s².
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_a_deg_s2: Option<f64>,
+    /// How long a tool change (`M6`) takes, seconds ([`block_times`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_change_seconds: Option<f64>,
 }
 
 fn rate_ok(v: f64) -> bool {
@@ -145,6 +165,15 @@ impl MachineRates {
         }
         if self.travel_mm.is_some_and(|t| t.iter().any(|&v| !(v > 0.0 && v <= MAX_TRAVEL))) {
             return invalid("the travel of X, Y and Z must be above 0 and at most 100 m");
+        }
+        if [self.accel_mm_s2, self.accel_z_mm_s2, self.accel_a_deg_s2].iter().flatten().any(|&a| !rate_ok(a)) {
+            return invalid(format!("every acceleration must be above 0 and at most {} a second squared", number(MAX_RATE, 0)));
+        }
+        if self.accel_z_mm_s2.is_some() && self.accel_mm_s2.is_none() {
+            return invalid("`accel_z_mm_s2` goes with `accel_mm_s2` (the acceleration of X and Y)");
+        }
+        if self.tool_change_seconds.is_some_and(|s| !(0.0..=MAX_SPINDLE_START).contains(&s)) {
+            return invalid("a tool change must take 0 to 3600 seconds");
         }
         Ok(())
     }
@@ -403,4 +432,218 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
         }
     }
     Ok(t)
+}
+
+/// Why a program waits between moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitKind {
+    SpindleStart,
+    ToolChange,
+}
+
+/// A wait at a line ([`BlockTimes::waits`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Wait {
+    pub line: usize,
+    pub seconds: f64,
+    pub kind: WaitKind,
+}
+
+/// Every block of a program timed ([`block_times`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlockTimes {
+    /// Seconds per block [`parse5`] reads (dwells included), in its order; the first block whose
+    /// every axis is known only says where they are (0).
+    pub seconds: Vec<f64>,
+    /// Each block's line.
+    pub lines: Vec<usize>,
+    /// Spindle starts and tool changes, in line order.
+    pub waits: Vec<Wait>,
+    /// Whether the blocks were timed with acceleration.
+    pub accelerated: bool,
+    /// All of it, seconds.
+    pub total: f64,
+}
+
+/// Time to cover `l` starting at `v0`, cruising at up to `v`, ending at `v1`, speeding up and
+/// slowing down at `a` (consistent units: mm, mm/s, mm/s²).
+pub fn trapezoid(l: f64, v0: f64, v: f64, v1: f64, a: f64) -> f64 {
+    if !(l > 1e-12) || !(v > 0.0) {
+        return 0.0;
+    }
+    if !(a > 0.0 && a.is_finite()) {
+        return l / v;
+    }
+    let (v0, v1) = (v0.clamp(0.0, v), v1.clamp(0.0, v));
+    let d_acc = (v * v - v0 * v0) / (2.0 * a);
+    let d_dec = (v * v - v1 * v1) / (2.0 * a);
+    if d_acc + d_dec <= l {
+        (v - v0) / a + (v - v1) / a + (l - d_acc - d_dec) / v
+    } else {
+        // A triangle: the peak speed it reaches.
+        let vp = ((2.0 * a * l + v0 * v0 + v1 * v1) / 2.0).sqrt();
+        (vp - v0).max(0.0) / a + (vp - v1).max(0.0) / a
+    }
+}
+
+/// One block as [`block_times`] sees it: its length (mm, or degrees for a turn alone), its top
+/// speed (a second), how fast it may speed up (a second squared), where it heads at its start
+/// and end, and whether it is a rapid.
+#[derive(Clone, Copy)]
+struct Leg {
+    length: f64,
+    speed: f64,
+    accel: f64,
+    start: Vec3,
+    end: Vec3,
+    rapid: bool,
+    /// A stop before it (a dwell, an unknown position).
+    stop: bool,
+}
+
+/// The acceleration a move along unit `u` may have when no axis may have more than its own.
+fn accel_along(u: Vec3, xy: f64, z: f64) -> f64 {
+    let mut a = f64::INFINITY;
+    for (c, lim) in [(u.x, xy), (u.y, xy), (u.z, z)] {
+        if c.abs() > 1e-9 {
+            a = a.min(lim / c.abs());
+        }
+    }
+    if a.is_finite() { a } else { xy }
+}
+
+/// Times every block of `text` (absolute G-code, rotaries `letters`, dwells in `dwell`) as a
+/// machine with `rates` runs it; see the module documentation. Without `accel_mm_s2` each block
+/// takes what [`machine_time`] gives it (rapids at their slowest axis, cuts held to the top
+/// feeds), and a turn alone without `accel_a_deg_s2` its top rate throughout.
+pub fn block_times(text: &str, letters: &[AxisLetter], rates: &MachineRates, dwell: DwellUnit) -> Result<BlockTimes> {
+    rates.validate()?;
+    let written = parse5(text, letters)?;
+    let (xy, z, a) = (rates.max_feed_mm_min, rates.feed_z(), rates.max_a_deg_min);
+    let mut out = BlockTimes { accelerated: rates.accel_mm_s2.is_some() || rates.accel_a_deg_s2.is_some(), ..BlockTimes::default() };
+    let mut legs: Vec<Option<Leg>> = Vec::with_capacity(written.len());
+    let mut at: Option<At> = None;
+    let mut stop = true;
+    for w in &written {
+        let (line, linear, rotary) = match w {
+            JointWords::Dwell { line, seconds } => {
+                out.seconds.push(dwell.seconds(*seconds).max(0.0));
+                out.lines.push(*line);
+                legs.push(None);
+                stop = true;
+                continue;
+            }
+            JointWords::Rapid { line, linear, rotary, .. }
+            | JointWords::Feed { line, linear, rotary, .. }
+            | JointWords::Arc { line, linear, rotary, .. } => (*line, *linear, rotary),
+        };
+        out.lines.push(line);
+        let Some(from) = at.replace(At { linear, rotary: rotary.clone() }) else {
+            out.seconds.push(0.0);
+            legs.push(None);
+            stop = true;
+            continue;
+        };
+        let d = linear - from.linear;
+        let turn = turn_deg(&from.rotary, rotary);
+        let dir = d.normalized().unwrap_or(Vec3::ZERO);
+        let (minutes, length, start, end, rapid) = match w {
+            JointWords::Rapid { .. } => {
+                let m = axis_minutes(d, turn, Some(rates.rapid_xyz_mm_min), Some(rates.rapid_z()), rates.rapid_a_deg_min);
+                (m, if d.len() > 1e-12 { d.len() } else { turn }, dir, dir, true)
+            }
+            JointWords::Feed { f, inverse_time, mm_per_unit, .. } => {
+                let len = d.len();
+                let nominal = if *inverse_time {
+                    1.0 / f
+                } else if len > 1e-12 {
+                    len / (f * mm_per_unit)
+                } else {
+                    turn / f
+                };
+                let m = if nominal.is_finite() && nominal > 0.0 { nominal.max(axis_minutes(d, turn, xy, z, a)) } else { 0.0 };
+                (m, if len > 1e-12 { len } else { turn }, dir, dir, false)
+            }
+            JointWords::Arc { center, ccw, f, mm_per_unit, .. } => {
+                let r = (from.linear.x - center.x).hypot(from.linear.y - center.y);
+                let across = r * arc_sweep(from.linear, linear, *center, *ccw).abs();
+                let len = across.hypot(d.z);
+                let nominal = len / (f * mm_per_unit);
+                let per = |dist: f64, rate: Option<f64>| rate.map_or(0.0, |r| dist / r);
+                let m = if nominal.is_finite() && nominal > 0.0 { nominal.max(per(across, xy)).max(per(d.z.abs(), z)) } else { 0.0 };
+                // The tangents at the ends: the radius turned a quarter the way the arc runs.
+                let tangent = |p: Vec3| {
+                    let rad = Vec3::new(p.x - center.x, p.y - center.y, 0.0);
+                    let t = if *ccw { Vec3::new(-rad.y, rad.x, 0.0) } else { Vec3::new(rad.y, -rad.x, 0.0) };
+                    t.normalized().unwrap_or(dir)
+                };
+                (m, len, tangent(from.linear), tangent(linear), false)
+            }
+            JointWords::Dwell { .. } => (0.0, 0.0, dir, dir, false),
+        };
+        let seconds = minutes * 60.0;
+        out.seconds.push(seconds);
+        let accel = match (d.len() > 1e-12, rates.accel_mm_s2) {
+            (true, Some(axy)) => accel_along(dir, axy, rates.accel_z_mm_s2.unwrap_or(axy)),
+            (false, _) => rates.accel_a_deg_s2.unwrap_or(f64::INFINITY),
+            (true, None) => f64::INFINITY,
+        };
+        let mut speed = if seconds > 1e-12 { length / seconds } else { 0.0 };
+        if let JointWords::Arc { center, .. } = w {
+            let r = (from.linear.x - center.x).hypot(from.linear.y - center.y);
+            if r > 1e-9 && accel.is_finite() {
+                speed = speed.min((accel * r).sqrt());
+            }
+        }
+        legs.push(Some(Leg { length, speed, accel, start, end, rapid, stop }));
+        stop = false;
+    }
+    if out.accelerated {
+        // The speed at each junction, then each block a trapezoid between them.
+        let mut v_in = 0.0f64;
+        for k in 0..legs.len() {
+            let Some(Some(leg)) = legs.get(k).copied() else {
+                v_in = 0.0;
+                continue;
+            };
+            if leg.stop {
+                v_in = 0.0;
+            }
+            let v_out = match legs.get(k + 1).copied().flatten() {
+                Some(next) if !next.stop && next.rapid == leg.rapid => leg.speed.min(next.speed) * leg.end.dot(next.start).clamp(0.0, 1.0),
+                _ => 0.0,
+            };
+            if leg.speed > 0.0
+                && leg.accel.is_finite()
+                && let Some(s) = out.seconds.get_mut(k)
+            {
+                *s = trapezoid(leg.length, v_in.min(leg.speed), leg.speed, v_out.min(leg.speed), leg.accel);
+            }
+            v_in = v_out;
+        }
+    }
+    // Spindle starts and tool changes.
+    let mut on = false;
+    for (i, text_line) in text.lines().enumerate() {
+        let n = i + 1;
+        let ws = words(text_line, n)?;
+        let code = |letter: char, v: i64| ws.iter().any(|&(c, x)| c == letter && (x * 10.0).round() as i64 == v * 10);
+        if code('M', 6)
+            && let Some(s) = rates.tool_change_seconds
+        {
+            out.waits.push(Wait { line: n, seconds: s, kind: WaitKind::ToolChange });
+        }
+        if code('M', 3) || code('M', 4) {
+            if !on && let Some(s) = rates.spindle_start_seconds {
+                out.waits.push(Wait { line: n, seconds: s, kind: WaitKind::SpindleStart });
+            }
+            on = true;
+        }
+        if code('M', 5) || code('M', 2) || code('M', 30) {
+            on = false;
+        }
+    }
+    out.total = out.seconds.iter().sum::<f64>() + out.waits.iter().map(|w| w.seconds).sum::<f64>();
+    Ok(out)
 }

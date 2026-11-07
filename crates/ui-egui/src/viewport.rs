@@ -613,6 +613,8 @@ fn scene_key(app: &SolveApp) -> u64 {
     base_scene_key(app).hash(&mut h);
     lod_generation(app).hash(&mut h);
     app.viewport.mesh_lods.generation().hash(&mut h);
+    // The CAM simulation view drawn with the model (its stock, paths and tool).
+    crate::cam_view_layer::scene_key(app).hash(&mut h);
     h.finish()
 }
 
@@ -1567,7 +1569,9 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     let st = crate::open_meshing::shown_world(app);
     // The blocks the last scene built, reused when their bodies come back as they were.
     let mut kept = app.viewport.blocks.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
-    let (mut sc, made) = body_scene(app, &st, |_| true, true, &mut kept);
+    // A CAM simulation view hides the part unless its `part` layer is on: the stock is cut there.
+    let part = crate::cam_view_layer::part_shown(app);
+    let (mut sc, made) = body_scene(app, &st, |_| part, true, &mut kept);
     keep_body_tris(app, &made);
     if let Ok(mut b) = app.viewport.blocks.lock() {
         *b = made;
@@ -1577,6 +1581,7 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     continuity_seams(&mut sc, app);
     isocurves(&mut sc, app);
     crate::edit_in_place::draw_context(app, &mut sc);
+    crate::cam_view_layer::draw(app, &mut sc);
     sc
 }
 

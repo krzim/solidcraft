@@ -36,6 +36,10 @@ pub(super) fn rates_of(cmd: &str, job: &CamJob, base: Option<&Path>) -> Result<O
         spindle_rpm: spec.spindle_rpm,
         spindle_start_seconds: spec.spindle_start_seconds,
         travel_mm: spec.travel_mm,
+        accel_mm_s2: spec.accel_mm_s2,
+        accel_z_mm_s2: spec.accel_z_mm_s2,
+        accel_a_deg_s2: spec.accel_a_deg_s2,
+        tool_change_seconds: spec.tool_change_seconds,
     };
     rates.validate().map_err(|e| cam_err(cmd, "`machine_rates`", e))?;
     Ok(Some(rates))

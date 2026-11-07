@@ -162,7 +162,7 @@ pub fn advance(step: f64, by: f64, total: u32, looping: bool) -> (f64, bool) {
 }
 
 #[derive(Clone, Copy)]
-enum Transport {
+pub(crate) enum Transport {
     Start,
     Back,
     Play,
@@ -171,8 +171,8 @@ enum Transport {
     End,
 }
 
-/// A media button drawn in code: bars and triangles.
-fn transport(ui: &mut egui::Ui, what: Transport, tip: &str) -> egui::Response {
+/// A media button drawn in code: bars and triangles (the CAM simulation's panel uses it too).
+pub(crate) fn transport(ui: &mut egui::Ui, what: Transport, tip: &str) -> egui::Response {
     let t = Tokens::get();
     let (r, resp) = ui.allocate_exact_size(vec2(26.0, 22.0), Sense::click());
     let fill = if resp.hovered() { t.hover } else { t.field };
