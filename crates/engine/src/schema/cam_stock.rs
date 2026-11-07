@@ -44,6 +44,12 @@ pub struct CylinderStockSpec {
 pub struct AroundPartSpec {
     /// How much material there is beyond the part along X, Y and Z, each side, mm (0 or more).
     pub margin: [f64; 3],
+    /// Material above the part's top, mm (0 or more), instead of `margin`'s Z. Default: `margin`'s Z.
+    #[serde(default)]
+    pub top: Option<f64>,
+    /// Material below the part's bottom, mm (0 or more), instead of `margin`'s Z. Default: `margin`'s Z.
+    #[serde(default)]
+    pub bottom: Option<f64>,
 }
 
 /// Faces the stock's top (or `top`) flat down to `bottom`, in levels, in straight passes along
@@ -55,6 +61,9 @@ pub struct AroundPartSpec {
 pub struct FaceOp {
     /// The operation's name, written as a comment in the program.
     pub name: String,
+    /// Plan and write this operation (`false`: kept in the job, turned off). Default: true.
+    #[serde(default)]
+    pub enabled: Option<bool>,
     /// The `number` of the tool it cuts with (a face mill, a flat end mill or a bull nose), or
     /// what the tool must be (`{kind?, diameter?, max_diameter?, …}`).
     pub tool: super::cam_agent::ToolRef,

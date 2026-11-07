@@ -1521,21 +1521,22 @@ fn dropdown_arrow(painter: &egui::Painter, at: egui::Pos2, ink: Color32) {
 }
 
 pub(crate) fn shell_layout(app: &SolveApp) -> crate::shell::LayoutMode {
-    if crate::render_workspace::active(app) { crate::shell::LayoutMode::Floating } else { app.ui.layout }
+    if staged(app) { crate::shell::LayoutMode::Floating } else { app.ui.layout }
+}
+
+/// A workspace that owns its chrome with a stage bar in place of the ribbon (Render, Manufacture).
+pub(crate) fn staged(app: &SolveApp) -> bool {
+    crate::render_workspace::active(app) || crate::manufacture_workspace::active(app)
 }
 
 pub(crate) fn shell_cards(app: &SolveApp, available: Rect) -> crate::shell::Cards {
-    if crate::render_workspace::active(app) {
-        crate::ui_kit::StageBar::cards(available)
-    } else {
-        crate::shell::Cards::new(available, shell_layout(app), reserved_height(app))
-    }
+    if staged(app) { crate::ui_kit::StageBar::cards(available) } else { crate::shell::Cards::new(available, shell_layout(app), reserved_height(app)) }
 }
 
 /// The ribbon is folded to its tab row (`ribbon_tabs_only`, #10112). The Render workspace keeps
 /// its own stage bar whole.
 pub(crate) fn tabs_only(app: &SolveApp) -> bool {
-    app.preferences.ribbon_tabs_only && !crate::render_workspace::active(app)
+    app.preferences.ribbon_tabs_only && !staged(app)
 }
 
 /// The height the ribbon keeps from the view: the tab row alone while it is folded, whose panels
@@ -1697,8 +1698,11 @@ fn ribbon_contents(app: &mut SolveApp, ui: &mut egui::Ui, shape: RibbonShape) ->
             t.secondary_line(&painter, [ws.right_top(), ws.right_bottom()], t.border);
         }
         let render = crate::render_workspace::active(app);
+        let manufacture = crate::manufacture_workspace::active(app);
         if render {
             crate::ui_kit::StageBar::workspace(ui, ws, "ws_render", app.tr("ui.render"), app.tr("ui.ribbon_workspace"));
+        } else if manufacture {
+            crate::ui_kit::StageBar::workspace(ui, ws, "hole", app.tr("ui.manufacture.workspace"), app.tr("ui.ribbon_workspace"));
         } else if folded {
             // Folded to the tab row: the workspace's name and its arrow, on one line.
             let galley = egui::WidgetText::from(egui::RichText::new(app.tr("ui.design")).size(t.font_button).color(t.text)).into_galley(
@@ -1746,6 +1750,10 @@ fn ribbon_contents(app: &mut SolveApp, ui: &mut egui::Ui, shape: RibbonShape) ->
         crate::scenario::publish_target("ribbon:workspace", ws);
         if render {
             crate::render_ui::stage_bar(app, ui, cards.ribbon);
+            return None;
+        }
+        if manufacture {
+            crate::manufacture_ui::stage_bar(app, ui, cards.ribbon);
             return None;
         }
         let tab_click = ribbon_tabs(app, ui, Rect::from_min_max(pos2(ribbon_left, r.top()), pos2(r.right(), r.top() + TAB_ROW_HEIGHT)));
@@ -3659,6 +3667,14 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                 // Close the design shown (asking first when it is unsaved); closing the last one
                 // shows the start page (#5366).
                 Key::W if !mods.shift && !mods.alt => crate::documents::close(app, app.docs.active, false),
+                // In the Manufacture workspace these are the open job's Undo, Redo and Save.
+                Key::Z | Key::Y
+                    if crate::manufacture_workspace::takes_command(app, if k == Key::Z && !mods.shift { "edit.undo" } else { "edit.redo" }) => {}
+                Key::S if !mods.shift && crate::manufacture_workspace::active(app) && app.session.cam_job.is_some() => {
+                    if let Err(e) = app.run("cam.job.save", json!({})) {
+                        app.set_status(e, true);
+                    }
+                }
                 Key::Z => {
                     if !crate::tools::undo_spline_point(app) {
                         drop(app.run("edit.undo", json!({})));

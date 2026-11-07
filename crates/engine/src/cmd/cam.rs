@@ -1105,6 +1105,36 @@ fn spec_name(spec: &OperationSpec) -> Option<&str> {
     })
 }
 
+/// Whether the job plans and writes `spec` (its `enabled`, default true).
+pub(super) fn op_enabled(spec: &OperationSpec) -> bool {
+    let enabled = match spec {
+        OperationSpec::Adaptive(o) => o.enabled,
+        OperationSpec::AdaptiveRoughing(o) => o.enabled,
+        OperationSpec::Contour(o) => o.enabled,
+        OperationSpec::Pocket(o) => o.enabled,
+        OperationSpec::Parallel(o) => o.enabled,
+        OperationSpec::Roughing(o) => o.enabled,
+        OperationSpec::Waterline(o) => o.enabled,
+        OperationSpec::Drill(o) => o.enabled,
+        OperationSpec::Scallop(o) => o.enabled,
+        OperationSpec::SteepShallow(o) => o.enabled,
+        OperationSpec::Pencil(o) => o.enabled,
+        OperationSpec::RestFinish(o) => o.enabled,
+        OperationSpec::Indexed(o) => o.enabled,
+        OperationSpec::RotaryFinish(o) => o.enabled,
+        OperationSpec::RotaryRoughing(o) => o.enabled,
+        OperationSpec::Wrap(o) => o.enabled,
+        OperationSpec::Bore(o) => o.enabled,
+        OperationSpec::ThreadMill(o) => o.enabled,
+        OperationSpec::Face(o) => o.enabled,
+        OperationSpec::Chamfer(o) => o.enabled,
+        OperationSpec::WrapPocket(o) => o.enabled,
+        OperationSpec::WrapContour(o) => o.enabled,
+        OperationSpec::IndexedPattern(o) => o.enabled,
+    };
+    enabled.unwrap_or(true)
+}
+
 /// One operation planned: what the program holds, its poses in work coordinates (for the
 /// checks and the preview), and its report.
 #[derive(Clone)]
@@ -1444,6 +1474,9 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
     if job.operations.is_empty() || job.operations.len() > MAX_OPERATIONS {
         return Err(bad(cmd, format!("a job has 1 to {MAX_OPERATIONS} operations")));
     }
+    if !job.operations.iter().any(op_enabled) {
+        return Err(bad(cmd, "every operation of the job is turned off (`enabled: false`): turn one on to plan the job"));
+    }
     let tol = job.tolerance.unwrap_or(0.01);
     if !(tol.is_finite() && (TOLERANCE_RANGE.0..=TOLERANCE_RANGE.1).contains(&tol)) {
         return Err(bad(cmd, "the job's `tolerance` must be from 0.0001 to 1 mm"));
@@ -1511,6 +1544,9 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
         job.operations.iter().take(side_by_side).enumerate().map(|(i, spec)| (i, spec, std::sync::Mutex::new(Some(agent.fork())))).collect();
     let scope = solidcraft_io::vfs::current_scope();
     let results = solidcraft_kernel::map_on_threads(&work, PLAN_THREADS, |(i, spec, slot)| {
+        if !op_enabled(spec) {
+            return None;
+        }
         let fork = slot.lock().ok().and_then(|mut f| f.take())?;
         solidcraft_io::vfs::scoped(scope.clone(), || {
             fork.start(*i);
@@ -1520,6 +1556,13 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
     });
     let mut results = results.into_iter().map(Option::flatten);
     for (i, spec) in job.operations.iter().enumerate() {
+        if !op_enabled(spec) {
+            // Turned off: kept in the job, neither planned nor written.
+            if i < side_by_side {
+                results.next();
+            }
+            continue;
+        }
         let result = if i < side_by_side {
             results.next().flatten()
         } else {
@@ -1678,7 +1721,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         sheet::distinct(cmd, output.as_deref(), params.preview.as_deref(), params.setup_sheet.as_deref())?;
     }
     let wanted = pictures::Request::of(cmd, &params, only)?;
-    let loaded = agent::load_job(cmd, raw, &params)?;
+    let loaded = agent::load_job(cmd, s, raw, &params)?;
     let job: &CamJob = &loaded.job;
     let PlannedJob {
         name,
@@ -2385,6 +2428,10 @@ pub(super) mod features;
 mod finish3d;
 #[path = "cam_helical.rs"]
 mod helical;
+#[path = "cam_job_edit.rs"]
+pub(crate) mod job_edit;
+#[path = "cam_plan.rs"]
+pub(super) mod job_plan;
 #[path = "cam_leads.rs"]
 mod leads;
 #[path = "cam_image.rs"]

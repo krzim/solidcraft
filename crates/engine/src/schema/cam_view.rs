@@ -16,7 +16,7 @@ use super::cam_sim::SimStockReport;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CamViewLoadParams {
-    /// The job (as `cam.job` takes it). Give this or `job_path`.
+    /// The job (as `cam.job` takes it). Give this or `job_path`; with neither, the open job (`cam.job.open`).
     #[serde(default)]
     pub job: Option<CamJob>,
     /// A `.json` file holding the job.

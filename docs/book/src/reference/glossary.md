@@ -107,6 +107,13 @@ a tree.
   it (in French, *arborescence*), so that "browser" and "web browser" don't share a word. See
   *web browser*.
 
+### clearance height, retract height
+
+The height the tool travels at between cuts, and the height its rapid move down stops at.
+
+- **In SolidCraft:** an operation's `heights.clearance` and `heights.retract`.
+- **For translators:** not the Clearance check (`inspect.clearance`).
+
 ### component
 
 A named container of bodies, sketches, construction geometry and other components that can be
@@ -233,6 +240,12 @@ construction plane.
 - **For translators:** French uses *fonction* for a timeline feature, so "AI features" had to
   become *fonctionnalités IA*. Translate "feature" only in the timeline sense.
 
+### finding
+
+Something a check of a job found: an error, a warning or a note, with its place and its fix.
+
+- **In SolidCraft:** `cam.generate`, `cam.findings`, `cam.finding.go`.
+
 ### folder
 
 One of the browser's fixed sections of a component: Bodies, Sketches, Construction, Joints.
@@ -260,6 +273,24 @@ features are computed.
 - **Don't use:** feature folder, folder (for a group).
 - **Elsewhere:** folder, group.
 - **For translators:** not a rigid group (a joint) and not a fixed browser *folder*.
+
+### machine profile, post, tool library
+
+A file of a machine's settings for jobs; the description of the G-code a machine's controller
+reads; a file of tools.
+
+- **In SolidCraft:** `profile_path`, `post_path` (or a built-in `post`), `tool_library_path`;
+  `cam.library.list`.
+
+### machining job
+
+The file that says how a design is machined: the machine, the post, the tools, the stock, work
+zero, the workholding and the operations in order.
+
+- **In SolidCraft:** a `.cam.json` file beside the design; `cam.job.*`, `cam.op.*`, the
+  Manufacture workspace.
+- **Don't use:** CAM setup, toolpath file.
+- **For translators:** not a print job or a render job.
 
 ### material
 
@@ -302,6 +333,13 @@ component changes every copy. The browser names occurrences with a number, such 
 - **Don't use:** instance, placement.
 - **Elsewhere:** occurrence, instance, component instance.
 - **For translators:** not a *pattern instance*.
+
+### operation (machining)
+
+One cut of a machining job with one tool, such as clearing a pocket or drilling holes.
+
+- **In SolidCraft:** the job's `operations`; `cam.op.*`.
+- **Don't use:** toolpath (that is what an operation plans), feature (a step of the timeline).
 
 ### part number
 
@@ -350,6 +388,12 @@ at Z = 0, with the centre of mass over the origin; the design itself does not mo
 - **Don't use:** bottom face, base face (both say where a face is now, not where it is printed).
 - **Elsewhere:** place on face, lay flat, bed face.
 - **For translators:** the face the part stands on while it prints, not the printer's bed.
+
+### program (G-code), setup sheet
+
+The text file the machine runs, and the page that tells the operator how to set the job up.
+
+- **In SolidCraft:** `cam.post` (`output`, `setup_sheet`).
 
 ### reference edge
 
@@ -430,6 +474,18 @@ a standard size.
 - **Elsewhere:** standard part, library part, fastener, catalogue part.
 - **For translators:** see *Words with more than one meaning*, "part".
 
+### stepdown, stepover
+
+How deep one pass cuts, and how far apart passes are side by side.
+
+- **In SolidCraft:** an operation's `stepdown` and `stepover`.
+
+### stock
+
+The raw material a job starts from.
+
+- **In SolidCraft:** the job's `stock` (`box`, `cylinder`, `around_part`).
+
 ### timeline
 
 The ordered list of a design's features, which SolidCraft computes from first to last.
@@ -439,6 +495,12 @@ The ordered list of a design's features, which SolidCraft computes from first to
 - **Don't use:** feature history, history (for the timeline).
 - **Elsewhere:** timeline, history, feature tree.
 - **For translators:** not the undo history.
+
+### toolpath
+
+The moves the tool's tip makes for one operation.
+
+- **In SolidCraft:** `cam.generate` draws them; `cam.view.*` plays them.
 
 ### turn (of two rounds)
 
@@ -477,6 +539,20 @@ A program that shows web pages, such as the one that runs SolidCraft's web build
 - **For translators:** not the *browser* panel. Where a language uses one word for both, use the
   CAD word for the panel.
 
+### work zero
+
+The point of the design that is the program's origin on the machine.
+
+- **In SolidCraft:** the job's `origin`.
+- **Don't use:** datum, home.
+
+### workholding
+
+What holds the stock on the machine: a vise, clamps, the table or a rotary unit.
+
+- **In SolidCraft:** `workholding_path`, `workholding`; **fixture** is a body of the design that
+  holds the part (`fixtures`).
+
 ## Words with more than one meaning
 
 An English word that means two things can be translated correctly for only one of them while both
@@ -500,6 +576,7 @@ share a catalogue entry. Each meaning below gets its own term and, in time, its 
 | | an open end in the sketch continuity legend | open end | the sketch continuity legend |
 | Clearance | the Clearance command | clearance check | `inspect.clearance` |
 | | a minimum distance field | clearance | the Interference and plastic rules dialogs |
+| | the height a tool travels at between cuts | *clearance height* | a machining operation's `heights.clearance` |
 | Flat | a hole's flat bottom | flat bottom | the Hole dialog's tip |
 | | a hem that lies flat on the sheet | flat hem | the Hem dialog's type |
 | Round | a round relief or corner shape | round (shape) | relief shapes, plastic rests, ruled surface corners |

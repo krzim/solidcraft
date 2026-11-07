@@ -118,6 +118,9 @@ operation! {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IndexedPatternOp {
+    /// Plan and write this operation (`false`: kept in the job, turned off). Default: true.
+    #[serde(default)]
+    pub enabled: Option<bool>,
     /// The A angles, degrees (1 to 200 of them). Give this or `count`.
     #[serde(default)]
     pub a_deg: Option<Vec<f64>>,

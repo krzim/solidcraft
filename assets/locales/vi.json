@@ -5931,7 +5931,7 @@
   "ui.workspace_drawing_description": "Bản vẽ 2D với các hình chiếu, kích thước và khung tên",
   "ui.workspace_footer": "Mọi không gian làm việc đều dùng chung một thiết kế, lịch sử và vùng chọn; chỉ các thẻ ruy-băng thay đổi. Bộ chuyển đổi bị khóa khi đang chỉnh sửa phác thảo hoặc tính năng.",
   "ui.workspace_layout": "Bố cục không gian làm việc",
-  "ui.workspace_manufacture_description": "Cắt lớp, đường chạy dao và thiết lập",
+  "ui.workspace_manufacture_description": "Đường chạy dao, kiểm tra, G-code và bảng thiết lập cho máy phay",
   "ui.workspace_planned": "Dự kiến",
   "ui.workspace_render_description": "Xem trước sản phẩm, cài đặt cảnh và hình ảnh kết xuất",
   "ui.workspace_render_tabs": "Cảnh · Hình ảnh",

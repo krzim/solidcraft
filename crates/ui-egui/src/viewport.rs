@@ -615,6 +615,8 @@ fn scene_key(app: &SolveApp) -> u64 {
     app.viewport.mesh_lods.generation().hash(&mut h);
     // The CAM simulation view drawn with the model (its stock, paths and tool).
     crate::cam_view_layer::scene_key(app).hash(&mut h);
+    // The Manufacture workspace's toolpaths.
+    crate::manufacture_plan_layer::scene_key(app).hash(&mut h);
     h.finish()
 }
 
@@ -1582,6 +1584,7 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     isocurves(&mut sc, app);
     crate::edit_in_place::draw_context(app, &mut sc);
     crate::cam_view_layer::draw(app, &mut sc);
+    crate::manufacture_plan_layer::draw(app, &mut sc);
     sc
 }
 

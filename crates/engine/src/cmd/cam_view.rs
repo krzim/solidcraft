@@ -209,7 +209,7 @@ fn load(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, "`resolution` must be from 0.0001 to 10000 mm"));
     }
     // Read as `cam.job` reads it: its profile merged in, its machine file and tool libraries read.
-    let loaded = agent::load_job_of(cmd, p, params.job.is_some(), params.job_path.as_ref())?;
+    let loaded = agent::load_job_of(cmd, s, p, params.job.is_some(), params.job_path.as_ref())?;
     let (job, base, deliberate) = (&loaded.job, loaded.base.as_deref(), loaded.unchecked);
     let mut notes: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -261,7 +261,18 @@ fn load(s: &mut Session, p: &Value) -> Result<Value> {
     };
     // The machine model and the workholding.
     let model_path = params.machine_model_path.clone().or_else(|| job.machine_model_path.as_ref().map(|p| beside(base, p)));
+    if job.workholding.is_some() && job.workholding_path.is_some() {
+        return Err(bad(cmd, "give the job `workholding` or `workholding_path`, not both"));
+    }
     let hold_path = params.workholding_path.clone().or_else(|| job.workholding_path.as_ref().map(|p| beside(base, p)));
+    // The workholding as text and where it came from: a file, or the job's own `workholding`.
+    let hold = match (&hold_path, &job.workholding) {
+        (Some(path), _) => Some((format!("workholding_path {path}"), read_text(cmd, path, "workholding_path", MAX_JSON_BYTES)?)),
+        (None, Some(inline)) => {
+            Some(("the job's `workholding`".to_string(), serde_json::to_string(inline).map_err(|e| EngineError::Other(e.to_string()))?))
+        }
+        (None, None) => None,
+    };
     let (model, machine_meshes, model_rates) = match &model_path {
         Some(path) => {
             let (m, meshes, r) = model_of(cmd, path, &mut warnings)?;
@@ -288,16 +299,15 @@ fn load(s: &mut Session, p: &Value) -> Result<Value> {
         }
     };
     let (stock, derived) = sim::stock_of(cmd, job_stock.as_ref(), &part, &machine, &mut notes)?;
-    let scene = match (&hold_path, &model) {
+    let scene = match (&hold, &model) {
         (None, _) => None,
         (Some(_), None) => return Err(bad(cmd, "a workholding needs a machine model (its table): give `machine_model_path`")),
-        (Some(path), Some(m)) => {
-            let hold = Workholding::from_json(&read_text(cmd, path, "workholding_path", MAX_JSON_BYTES)?)
-                .map_err(|e| bad(cmd, format!("workholding_path {path}: {e}")))?;
+        (Some((what, text)), Some(m)) => {
+            let hold = Workholding::from_json(text).map_err(|e| bad(cmd, format!("{what}: {e}")))?;
             if hold.holding == Holding::Rotary && machine.rotaries.is_empty() {
                 return Err(bad(cmd, "a rotary unit's workholding needs a machine with a rotary axis"));
             }
-            Some(Arc::new(build(&m.table, &hold, &stock).map_err(|e| cam_err(cmd, &format!("workholding_path {path}"), e))?))
+            Some(Arc::new(build(&m.table, &hold, &stock).map_err(|e| cam_err(cmd, what, e))?))
         }
     };
     let plan = plan_sim(&text, &machine, &tools, &stock, &SimParams { tolerance: tol, resolution: params.resolution })

@@ -5931,7 +5931,7 @@
   "ui.workspace_drawing_description": "رسومات ثنائية الأبعاد بعروض وأبعاد وكتل عنوان",
   "ui.workspace_footer": "كل مساحات العمل تعمل على التصميم والسجل والتحديد نفسها، وتتغير تبويبات الشريط فقط. المبدِّل مقفل أثناء تعديل رسم أو ميزة.",
   "ui.workspace_layout": "تخطيط مساحة العمل",
-  "ui.workspace_manufacture_description": "التقطيع ومسارات الأدوات والإعداد",
+  "ui.workspace_manufacture_description": "مسارات الأداة والفحوص وG-code وأوراق الإعداد لآلة التفريز",
   "ui.workspace_planned": "مُخطط له",
   "ui.workspace_render_description": "معاينة المنتج وإعدادات المشهد والصور المُصيَّرة",
   "ui.workspace_render_tabs": "المشهد · الصورة",

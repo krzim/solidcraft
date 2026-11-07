@@ -17,7 +17,7 @@ use super::cam::{CamJob, RotaryRange};
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CamViewParams {
-    /// The job itself (see docs/cam-jobs.md). Give this or `job_path`.
+    /// The job itself (see docs/cam-jobs.md). Give this or `job_path`; with neither, the open job (`cam.job.open`).
     #[serde(default)]
     pub job: Option<CamJob>,
     /// A `.json` file holding the job, as `cam.job` reads it.

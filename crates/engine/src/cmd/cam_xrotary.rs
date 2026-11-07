@@ -69,7 +69,7 @@ pub(super) fn plan_op(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64, have: u
             for a in angles {
                 let mut op = (*o.operation).clone();
                 rename(&mut op, format!("{name} A{}", num(a)));
-                out.push(plan(ctx, &OperationSpec::Indexed(IndexedOp { name: None, a_deg: a, operation: Box::new(op) }), arc_tol)?);
+                out.push(plan(ctx, &OperationSpec::Indexed(IndexedOp { name: None, enabled: None, a_deg: a, operation: Box::new(op) }), arc_tol)?);
             }
             Ok(out)
         }

@@ -423,16 +423,28 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
         Target::Timeline { feature } => crate::timeline::feature_items(app, *feature),
         Target::Workspace => {
             let rendering = crate::render_workspace::active(app);
+            let machining = crate::manufacture_workspace::active(app);
             let mut v = vec![
-                act("ui.workspace.design", "Design", "ws_design").with(json!({"workspace":"design"})).key(if rendering { "" } else { "current" }),
+                act("ui.workspace.design", "Design", "ws_design").with(json!({"workspace":"design"})).key(if rendering || machining {
+                    ""
+                } else {
+                    "current"
+                }),
                 act("ui.workspace.render", "Render", "ws_render")
                     .with(json!({"workspace":"render"}))
                     .key(if rendering { "current" } else { "" })
                     .on(app.session.active_sketch.is_none() && app.tool.is_none() && app.dialog.is_none() && !app.file_load.busy()),
             ];
-            for (w, icon) in [("Animation", "ws_animate"), ("Simulation", ""), ("Manufacture", ""), ("Drawing", "ws_drawing")] {
+            for (w, icon) in [("Animation", "ws_animate"), ("Simulation", "")] {
                 v.push(act("ui.workspace", w, icon).key("coming later").on(false));
             }
+            v.push(
+                act("ui.workspace.manufacture", "Manufacture", "hole")
+                    .with(json!({"workspace":"manufacture"}))
+                    .key(if machining { "current" } else { "" })
+                    .on(app.session.active_sketch.is_none() && app.tool.is_none() && app.dialog.is_none() && !app.file_load.busy()),
+            );
+            v.push(act("ui.workspace", "Drawing", "ws_drawing").key("coming later").on(false));
             v
         }
         Target::Units => crate::prefs::UNITS
@@ -1806,9 +1818,9 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
             }
         }
         "ui.historyShowHidden" => app.tree.history_show_hidden = p["show"].as_bool().unwrap_or(false),
-        "ui.workspace" | "ui.workspace.design" | "ui.workspace.render" => {
+        "ui.workspace" | "ui.workspace.design" | "ui.workspace.render" | "ui.workspace.manufacture" => {
             if let Some(workspace) = p.get("workspace").and_then(Value::as_str)
-                && let Err(e) = crate::render_workspace::enter(app, workspace == "render")
+                && let Err(e) = crate::manufacture_workspace::switch(app, workspace)
             {
                 app.set_status(e, true);
             }
@@ -3472,7 +3484,9 @@ mod workspace_menu_tests {
         assert!(rows.windows(2).all(|pair| pair[0].bottom() <= pair[1].top()));
         assert!(rows[0].top() > opener.bottom());
         assert_eq!(rows[0].width(), 450.0);
-        assert!(items(&h.app, &Target::Workspace).iter().skip(2).all(|item| !item.enabled));
+        // Manufacture is available; the rest after Design and Render are still to come.
+        assert!(items(&h.app, &Target::Workspace).iter().skip(2).filter(|i| i.id != "ui.workspace.manufacture").all(|item| !item.enabled));
+        assert!(items(&h.app, &Target::Workspace).iter().any(|i| i.id == "ui.workspace.manufacture" && i.enabled));
         h.step(&json!({"click":{"handle":"workspace:menu:animation"}})).unwrap();
         assert!(!crate::render_workspace::active(&h.app));
         assert!(h.app.viewport.context_menu.is_some());

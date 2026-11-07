@@ -10,6 +10,7 @@
 pub mod agent_setup;
 pub mod batch_params;
 pub mod batch_preflight;
+pub mod cam_job_state;
 pub mod cam_view;
 pub mod capture;
 pub mod cmd;
@@ -605,6 +606,9 @@ pub struct Session {
     /// The CAM simulation view (`cam.view.*`): a program played on the simulated stock. View
     /// state: not part of the design and not an undo step.
     pub cam_view: Option<Box<cam_view::CamView>>,
+    /// The open CAM job (`cam.job.open`, `cam.job.new`): the job file the Manufacture workspace
+    /// and `cam.op.*` edit, with its own history. Not part of the design and not an undo step.
+    pub cam_job: Option<Box<cam_job_state::OpenJob>>,
     /// The last CAM job planned (`cam.job`), reused while the job and the design stay the same.
     /// Not part of the design and not an undo step.
     pub(crate) cam_plan: std::sync::Mutex<Option<Box<cmd::cam::PlanCache>>>,
@@ -866,6 +870,7 @@ impl Session {
             isocurves: Vec::new(),
             comb: None,
             cam_view: None,
+            cam_job: None,
             cam_plan: Default::default(),
             status_order: Vec::new(),
             status_activation: Vec::new(),
@@ -1914,6 +1919,26 @@ impl Session {
         }
     }
 
+    /// The design's identity: it changes with every edit of the design, and not with view-only
+    /// commands, which move [`Session::revision`] without changing the model (for the open CAM
+    /// job's results going stale).
+    pub fn model_stamp(&self) -> u64 {
+        Arc::as_ptr(&self.doc) as usize as u64
+    }
+
+    /// Take `other`'s last CAM plan when it is of this same design (a scratch copy's, planned off
+    /// the window thread), so the next run of the same job here plans nothing again.
+    pub fn adopt_cam_plan(&mut self, other: &mut Session) {
+        if !(Arc::ptr_eq(&self.doc, &other.doc) && self.revision == other.revision) {
+            return;
+        }
+        if let (Ok(mut mine), Ok(mut theirs)) = (self.cam_plan.lock(), other.cam_plan.lock())
+            && theirs.is_some()
+        {
+            *mine = theirs.take();
+        }
+    }
+
     /// A scratch copy of the session (same design and model, no history or log) to try
     /// commands on without touching this one.
     pub fn scratch(&self) -> Session {
@@ -1976,6 +2001,7 @@ impl Session {
             isocurves: Vec::new(),
             comb: None,
             cam_view: None,
+            cam_job: self.cam_job.as_deref().map(|j| Box::new(j.scratch())),
             cam_plan: Default::default(),
             status_order: Vec::new(),
             status_activation: Vec::new(),

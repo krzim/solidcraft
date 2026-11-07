@@ -112,6 +112,9 @@ mod loft_rails_dialog_tests;
 mod look_at_tests;
 #[cfg(test)]
 mod manage_dialogs_tests;
+mod manufacture_plan_layer;
+mod manufacture_ui;
+pub mod manufacture_workspace;
 mod material_card_review;
 mod material_editor;
 
@@ -587,6 +590,8 @@ pub struct SolveApp {
     pub cam_panel: Option<cam_view_panel::CamPanel>,
     /// Plays the CAM simulation view and runs its commands off the window thread.
     pub cam_player: cam_view_player::CamPlayer,
+    /// The Manufacture workspace's state (its job is `session.cam_job`).
+    pub manufacture: manufacture_workspace::Manufacture,
     material_card_review: Option<material_card_review::ReviewWindow>,
     /// Context menus, rename box and Properties window.
     pub menu: context_menu::MenuState,
@@ -865,6 +870,7 @@ impl SolveApp {
             bom: None,
             cam_panel: None,
             cam_player: Default::default(),
+            manufacture: Default::default(),
             material_card_review: None,
             menu: context_menu::MenuState::default(),
             gesture: mouse_gesture::State::default(),
@@ -1256,6 +1262,7 @@ impl SolveApp {
         let selected_before = self.session.selection.clone();
         let r = self.session.execute(id, &params).map_err(|e| e.to_string()).and_then(|reply| {
             render_workspace::apply_command(self, id, &reply)?;
+            manufacture_workspace::apply_command(self, id, &reply);
             Ok(reply)
         });
         self.big_operation |= now_ms() - t0 >= recovery_ui::BIG_OPERATION_MS;
@@ -1644,6 +1651,10 @@ impl SolveApp {
         // A tool can be started outside the frame's scope (a direct `start`, a shortcut in
         // `logic`): build its hint in the user's language, not the thread default.
         let _language = crate::i18n::scope(&self.preferences.language);
+        // In the Manufacture workspace, Undo and Redo are the open job's.
+        if manufacture_workspace::takes_command(self, id) {
+            return;
+        }
         if solidcraft_engine::panels::commands::is_command(id) {
             if let Err(why) = self.run(id, json!({})) {
                 self.set_status(why, true);
@@ -3293,6 +3304,7 @@ impl SolveApp {
         timeline::tick_playback(self, ui.ctx());
         cam_view_player::follow(self);
         cam_view_player::tick(self, ui.ctx());
+        manufacture_workspace::tick(self, ui.ctx());
         if !self.embedded && !self.embed_editor {
             toolbar::app_bar(self, ui);
         }
@@ -3332,7 +3344,10 @@ impl SolveApp {
             let floating = render_workspace::active(self) || ui_kit::Container::new(ui.ctx(), ui_kit::Surface::Panel).floating();
             timeline::follow_view_pick(self);
             render_ui::focus_shortcut(self, ui);
-            let show_timeline = self.ui.show_timeline && !render_workspace::active(self) && !self.preferences.history_in_browser;
+            let show_timeline = self.ui.show_timeline
+                && !render_workspace::active(self)
+                && !manufacture_workspace::active(self)
+                && !self.preferences.history_in_browser;
             let left_timeline = show_timeline && self.preferences.timeline_left;
             timeline_left::animate_folds(self, ui.ctx());
             if !floating && !self.embedded {
@@ -3404,7 +3419,9 @@ impl SolveApp {
                 render_ui::shots_strip(self, ui);
                 render_workspace::panel(self, ui);
             }
-            if self.ui.show_browser && !render_ui::focused(self) {
+            if manufacture_workspace::active(self) {
+                manufacture_ui::panels(self, ui);
+            } else if self.ui.show_browser && !render_ui::focused(self) {
                 browser::browser(self, ui);
             }
             // Apply shared Browser/History output before viewport and menu consumers.
@@ -3459,6 +3476,7 @@ impl SolveApp {
         sketch_report::show(self, ui.ctx());
         bom_panel::show(self, ui.ctx());
         cam_view_panel::show(self, ui.ctx());
+        manufacture_ui::confirm(self, ui.ctx());
         material_card_review::show(self, ui.ctx());
         recovery_ui::show(self, ui.ctx());
         mesh_units::show(self, ui.ctx());

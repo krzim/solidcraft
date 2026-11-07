@@ -29,7 +29,7 @@ pub use leads::{EntrySpec, LeadSpec, LinkingSpec, TabsSpec};
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CamJobParams {
-    /// The job itself (see docs/cam-jobs.md). Give this or `job_path`.
+    /// The job itself (see docs/cam-jobs.md). Give this or `job_path`; with neither, the open job (`cam.job.open`).
     #[serde(default)]
     pub job: Option<CamJob>,
     /// A `.json` file holding the job. Relative `post_path` and `tool_library_path` in it are
@@ -187,6 +187,10 @@ pub struct CamJob {
     /// use it.
     #[serde(default)]
     pub workholding_path: Option<String>,
+    /// The workholding written into the job (the same object as a workholding file), instead of
+    /// `workholding_path`. Default: none.
+    #[serde(default)]
+    pub workholding: Option<Map<String, Value>>,
 }
 
 /// A machine: a preset's name or the CAM crate's `Machine` JSON.
@@ -292,6 +296,10 @@ macro_rules! operation {
             /// inside `indexed`, which may carry it instead.
             #[serde(default)]
             pub name: String,
+            /// Plan and write this operation. `false` keeps it in the job, turned off: it is not
+            /// planned or written, and is reported `off`. Default: true.
+            #[serde(default)]
+            pub enabled: Option<bool>,
             /// The `number` of the tool it cuts with, or what the tool must be (`{kind?,
             /// diameter?, max_diameter?, min_diameter?, min_flute_length?, min_stickout?}`).
             pub tool: $crate::schema::cam_agent::ToolRef,
@@ -715,6 +723,9 @@ pub struct IndexedOp {
     /// The operation's name, for an inner operation without one of its own.
     #[serde(default)]
     pub name: Option<String>,
+    /// Plan and write this operation (`false`: kept in the job, turned off). Default: true.
+    #[serde(default)]
+    pub enabled: Option<bool>,
     /// The A angle, degrees.
     pub a_deg: f64,
     /// The 3-axis operation (`adaptive`, `adaptive_roughing`, `contour`, `pocket`, `parallel`,

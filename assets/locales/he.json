@@ -5931,7 +5931,7 @@
   "ui.workspace_drawing_description": "שרטוטי דו־ממד עם מבטים, מידות וטבלאות כותרת",
   "ui.workspace_footer": "כל סביבות העבודה עובדות על אותו תכן, אותו ציר זמן ואותה בחירה; רק הלשוניות ברצועת הכלים משתנות. הבורר נעול בזמן עריכה של סקיצה או פיצ'ר.",
   "ui.workspace_layout": "פריסת סביבת העבודה",
-  "ui.workspace_manufacture_description": "חיתוך לשכבות, מסלולי כלי והכנה לייצור",
+  "ui.workspace_manufacture_description": "מסלולי כלי, בדיקות, G-code ודפי הכנה למכונת כרסום",
   "ui.workspace_planned": "מתוכנן",
   "ui.workspace_render_description": "תצוגה מקדימה של המוצר, הגדרות סצנה ותמונות הדמיה",
   "ui.workspace_render_tabs": "סצנה · תמונה",

@@ -5090,7 +5090,7 @@
   "ui.workspace_drawing_description": "뷰, 치수, 표제란이 있는 2D 도면",
   "ui.workspace_footer": "모든 작업 공간은 같은 디자인, 히스토리, 선택 항목에서 작동하며 리본 탭만 바뀝니다. 스케치나 피처를 편집하는 동안에는 전환기가 잠깁니다.",
   "ui.workspace_layout": "작업 공간 레이아웃",
-  "ui.workspace_manufacture_description": "슬라이싱, 툴패스 및 설정",
+  "ui.workspace_manufacture_description": "밀링 머신용 공구 경로, 검사, G코드, 셋업 시트",
   "ui.workspace_planned": "예정",
   "ui.workspace_render_description": "제품 미리보기, 장면 설정 및 렌더링 이미지",
   "ui.workspace_render_tabs": "장면 · 이미지",

@@ -17,7 +17,7 @@ pub struct CamSimulateParams {
     /// The G-code file, in the job's work coordinates.
     pub path: String,
     /// The job the program was written for (machine, tools, part bodies, origin, tolerance), as
-    /// `cam.job` takes it. Give this or `job_path`.
+    /// `cam.job` takes it. Give this or `job_path`; with neither, the open job (`cam.job.open`).
     #[serde(default)]
     pub job: Option<CamJob>,
     /// A `.json` file holding the job.

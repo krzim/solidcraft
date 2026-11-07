@@ -1078,6 +1078,52 @@ held; the job's stock is placed in it, and work zero follows.
 `parallels: {height, thickness, length, inset?, offset?}` go under the stock (along the jaws in a
 vise, under the long edges with clamps).
 
+## The open job and the Manufacture workspace
+
+A session keeps one job open: the job file the Manufacture workspace shows and `cam.op.*`
+edits. A person and an agent hand the same file back and forth: the agent writes it (or edits
+the open job through the commands below), the person opens the design, enters Manufacture and
+takes it on from there. Nothing of it is saved in the design.
+
+| Command | Does |
+| --- | --- |
+| `cam.job.new` | `path?` (default `<design>.cam.json` beside the saved design), `name?`, `profile_path?`, `discard?`. Nothing is written until it is saved; refused when a file is already at `path`. |
+| `cam.job.open` | `path`, `discard?`. A file that does not read as a job is refused with the key and line (`operations[2].stepovr`). |
+| `cam.job.save` | `path?` (save as), `overwrite?`. Writes the keys in the job's order with the file's own indent and a final newline. Refused when the file changed outside SolidCraft since it was read, unless `overwrite`. |
+| `cam.job.reload` | `discard?`. Reads the file again as one undo step; replies what changed, one line each. |
+| `cam.job.close` | `discard?`. |
+| `cam.job.get` | `job?`. Replies whether the file changed outside (`none`, `changed`, `gone`), the undo and redo steps, whether the last Generate is current, and a summary. |
+| `cam.job.edit` | `set?: {path: value}`, `unset?: [path]`: job keys, dotted paths into objects (`stock.box.max`). |
+| `cam.job.undo`, `cam.job.redo` | The job's own history (up to 200 steps), apart from the design's. |
+| `cam.op.add` | `op: {type, ...}`, `at?`, `a_deg?`. Keys left out stay out; a `tool` left out is `{}` (the job's best tool for it); keys the type needs get starting values. |
+| `cam.op.edit` | `op` (index or name), `set?`, `unset?`, `rename?`, `a_deg?`: one angle wraps the operation in `indexed` (0 unwraps it), several in `indexed_pattern`, `{count, start_deg?}` too. Keys of a wrapped operation are its inner operation's. |
+| `cam.op.remove`, `cam.op.move`, `cam.op.duplicate`, `cam.op.enable` | By index or name. `enabled: false` keeps an operation in the job, neither planned nor written; on removes the key. |
+| `cam.library.list` | `folder?` (default: found above the job's folder). The profiles, posts, tool libraries (with the tools this build leaves out), machines, workholdings and machine models of a library folder. |
+| `cam.generate` | `simulate?`, `resolution?`. Plans and checks the open job as `cam.job {dry_run}` and keeps its findings (each with its operation, place, program line and fix) and every operation's toolpath. A job that cannot be planned is findings too. |
+| `cam.findings`, `cam.finding.go` | The last Generate's findings; going to one selects its operation in the window and frames its place. |
+| `cam.post` | `output?` (default: the job file's name with the post's extension, beside it), `setup_sheet?`, `preview?`, `allow_unsafe?`, `simulate?`. Plans the job and design as they are now (reusing the last plan when nothing changed), so a program is never written from stale results. |
+| `view.manufacture_stage` | `setup`, `operations`, `check` or `program`. |
+
+Every edit is one step of the job's history, and is read with the job's schema before it is
+kept: an edit that would not read is refused and changes nothing, so a person cannot save a job
+an agent cannot run. A command that would drop unsaved edits refuses without `discard`.
+
+`cam.job`, `cam.view`, `cam.view.load` and `cam.simulate` take the open job when they are given
+neither `job` nor `job_path`, its relative paths read from its file's folder, its unsaved edits
+included.
+
+Keys the open job adds to the job file, each written only when used:
+
+- `enabled` on any operation (default true).
+- `workholding` on the job: the workholding written into the job, instead of `workholding_path`.
+- `top` and `bottom` on `stock.around_part`: the material above and below the part, instead of
+  `margin`'s Z.
+
+Edits made outside SolidCraft (an agent, an editor, git) are noticed by the file's time and
+size, and its bytes where there are no file times (the web). The Manufacture workspace looks
+every two seconds: a change under a job without unsaved edits is reloaded as an undo step and
+shown in a message; under unsaved edits a banner offers to load the file or keep the edits.
+
 ## Setup sheet
 
 `cam.job {…, "setup_sheet": "C:/parts/bracket-setup.html"}` writes what the machine operator

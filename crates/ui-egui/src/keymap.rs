@@ -445,6 +445,13 @@ pub fn command_for(app: &SolveApp, key: &str) -> Option<&'static str> {
 /// Sketch (on the selected plane or planar face, else on the plane picked next) and the tool
 /// starts in the new sketch.
 pub fn press(app: &mut SolveApp, key: &str, repeat: bool) {
+    // The Manufacture workspace's Undo and Redo are the open job's, whatever the design's are.
+    if crate::manufacture_workspace::active(app)
+        && let Some(id) = commands_for(app, key).into_iter().find(|id| matches!(*id, "edit.undo" | "edit.redo"))
+        && crate::manufacture_workspace::takes_command(app, id)
+    {
+        return;
+    }
     if let Some(id) = command_for(app, key) {
         // Pressed again while a tool of the same family is out, with Preferences › Sketch asking
         // for it (#2459): before its first point, the family's next mode (wrapping round); once a

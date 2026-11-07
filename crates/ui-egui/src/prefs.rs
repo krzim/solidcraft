@@ -1447,6 +1447,12 @@ preference_settings! {
     /// switches the extent to To Object (off: picks only add profiles, as before). A click into the
     /// Profiles box makes the next picks profiles again.
     extrude_auto_to_object: bool = true, PAGE_TOOLS => check_tr("ui.extrude_auto_to_object");
+    /// Manufacture: save the open machining job's file a moment after every change (a burst of
+    /// edits saves once). Off: the job is saved with its Save button.
+    cam_job_autosave: bool = true, PAGE_TOOLS;
+    /// Manufacture: the library folder of machine profiles, posts, tool libraries and
+    /// workholding files (empty: found above the open job's folder).
+    cam_library_folder: String = String::new(), PAGE_TOOLS;
     /// Extrude turns the view to isometric each time it opens, so the depth can be seen (#9176).
     /// Off (the default): the view stays as it is.
     extrude_view_isometric: bool = false, PAGE_TOOLS => check_id("prefs.extrude_view_isometric");

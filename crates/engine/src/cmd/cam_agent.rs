@@ -106,6 +106,7 @@ fn merge_profile(job: &mut Map<String, Value>, profile: Map<String, Value>, dir:
             "a_reversed" | "a_limits_deg" => has(job, &["machine", "machine_path", &k]),
             "post" | "post_path" => has(job, &["post", "post_path"]),
             "tools" | "tool_library_path" | "tool_library_paths" => has(job, &["tools", "tool_library_path", "tool_library_paths"]),
+            "workholding" | "workholding_path" => has(job, &["workholding", "workholding_path"]),
             "default_heights" | "default_feeds" => {
                 if let (Some(Value::Object(mine)), Value::Object(theirs)) = (job.get_mut(&k), &v) {
                     for (f, x) in theirs {
@@ -132,7 +133,13 @@ fn library_name(path: &str) -> String {
 }
 
 /// The tools of `paths` (read from `base`), or of the one `pick` names.
-fn library_tools(cmd: &str, base: Option<&Path>, paths: &[String], pick: Option<&str>, left_out: &mut Vec<(u32, String)>) -> Result<Vec<Value>> {
+pub(super) fn library_tools(
+    cmd: &str,
+    base: Option<&Path>,
+    paths: &[String],
+    pick: Option<&str>,
+    left_out: &mut Vec<(u32, String)>,
+) -> Result<Vec<Value>> {
     if paths.is_empty() || paths.len() > MAX_LIBRARIES {
         return Err(bad(cmd, format!("`tool_library_paths` names 1 to {MAX_LIBRARIES} files")));
     }
@@ -220,15 +227,22 @@ fn library_tools(cmd: &str, base: Option<&Path>, paths: &[String], pick: Option<
 /// The job of a `cam.job` call: inline or from `job_path`, its profile merged in, a machine
 /// file and tool libraries read. Relative paths of the job are left relative to its file's
 /// folder (`base`); a profile's are made relative to the job's folder through the profile's.
-pub(super) fn load_job(cmd: &str, p: &Value, params: &CamJobParams) -> Result<Loaded> {
-    load_job_of(cmd, p, params.job.is_some(), params.job_path.as_ref())
+pub(super) fn load_job(cmd: &str, s: &crate::Session, p: &Value, params: &CamJobParams) -> Result<Loaded> {
+    load_job_of(cmd, s, p, params.job.is_some(), params.job_path.as_ref())
 }
 
-/// [`load_job`] for any command that takes a `job` (in `p`, when `has_job`) or a `job_path`.
-pub(super) fn load_job_of(cmd: &str, p: &Value, has_job: bool, job_path: Option<&String>) -> Result<Loaded> {
+/// [`load_job`] for any command that takes a `job` (in `p`, when `has_job`) or a `job_path`;
+/// with neither, the session's open job (`cam.job.open`), its relative paths read from its
+/// file's folder.
+pub(super) fn load_job_of(cmd: &str, s: &crate::Session, p: &Value, has_job: bool, job_path: Option<&String>) -> Result<Loaded> {
     let (raw, base, what) = match (has_job, job_path) {
         (true, Some(_)) => return Err(bad(cmd, "give `job` or `job_path`, not both")),
-        (false, None) => return Err(bad(cmd, "give the `job` (an object) or a `job_path` (a .json file)")),
+        (false, None) => match s.cam_job.as_deref() {
+            Some(open) => (open.value.clone(), open.folder(), String::new()),
+            None => {
+                return Err(bad(cmd, "give the `job` (an object) or a `job_path` (a .json file), or open a job first (cam.job.open, cam.job.new)"));
+            }
+        },
         (true, None) => (p.get("job").cloned().unwrap_or(Value::Null), None, String::new()),
         (false, Some(path)) => (read_json(cmd, path, "job_path")?, Path::new(path).parent().map(Path::to_path_buf), format!("job_path {path}")),
     };

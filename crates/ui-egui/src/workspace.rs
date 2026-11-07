@@ -667,7 +667,7 @@ pub fn set_tab_shown(app: &mut crate::SolveApp, tab: &str, shown: bool) {
 
 /// Every design tab stays hidden until the person chooses to show it again.
 pub fn visible_tabs(app: &crate::SolveApp) -> Vec<&'static str> {
-    if crate::render_workspace::active(app) {
+    if crate::render_workspace::active(app) || crate::manufacture_workspace::active(app) {
         return Vec::new();
     }
     let mut tabs: Vec<_> = TABS.iter().copied().filter(|tab| tab_turned_on(app, tab)).collect();
@@ -704,7 +704,7 @@ pub fn starts_a_sketch(app: &crate::SolveApp, id: &str) -> bool {
 /// other tabs to remain usable for the rest of that context. Sketch takes precedence over sheet
 /// metal, and sheet metal over weldments.
 pub fn sync_context(app: &mut crate::SolveApp) {
-    if crate::render_workspace::active(app) {
+    if crate::render_workspace::active(app) || crate::manufacture_workspace::active(app) {
         return;
     }
     let context = app
@@ -762,7 +762,10 @@ pub fn command_tab(app: &crate::SolveApp, id: &str) -> Option<&'static str> {
         return None;
     }
     let (tab, _) = destination(c)?;
-    // The Render workspace owns its entry/exit lifecycle.
+    // The Render and Manufacture workspaces own their entry and exit.
+    if crate::manufacture_workspace::active(app) {
+        return None;
+    }
     let render_closed = render_tab(tab) && !crate::render_workspace::active(app);
     (!render_closed && visible_tabs(app).contains(&tab)).then_some(tab)
 }

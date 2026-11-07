@@ -5931,7 +5931,7 @@
   "ui.workspace_drawing_description": "ビュー、寸法、表題欄を含む2D図面",
   "ui.workspace_footer": "すべてのワークスペースで同じデザイン、履歴、選択を使用し、リボンのタブだけが変わります。スケッチやフィーチャーの編集中は切り替えできません。",
   "ui.workspace_layout": "ワークスペースのレイアウト",
-  "ui.workspace_manufacture_description": "スライス、ツールパス、セットアップ",
+  "ui.workspace_manufacture_description": "フライス盤のツールパス、チェック、G コード、段取りシート",
   "ui.workspace_planned": "予定",
   "ui.workspace_render_description": "製品プレビュー、シーン設定、レンダリング画像",
   "ui.workspace_render_tabs": "シーン · 画像",

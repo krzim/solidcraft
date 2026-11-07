@@ -219,7 +219,7 @@ pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         solidcraft_io::vfs::check(out).map_err(|e| EngineError::Other(e.to_string()))?;
     }
     // Read as `cam.job` reads it: its profile merged in, its machine file and tool libraries read.
-    let loaded = super::agent::load_job_of(cmd, p, params.job.is_some(), params.job_path.as_ref())?;
+    let loaded = super::agent::load_job_of(cmd, s, p, params.job.is_some(), params.job_path.as_ref())?;
     let (job, base, deliberate) = (loaded.job, loaded.base, loaded.unchecked);
     let tol = job.tolerance.unwrap_or(0.01);
     if !(tol.is_finite() && (TOLERANCE_RANGE.0..=TOLERANCE_RANGE.1).contains(&tol)) {

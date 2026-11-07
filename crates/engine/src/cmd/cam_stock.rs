@@ -36,13 +36,37 @@ pub(super) fn stock_of(cmd: &str, job: &CamJob, surfaces: &Surfaces, tol: f64, n
             finite_point(&[c.radius, c.x_min, c.x_max], "`stock.cylinder`").map_err(|e| bad(cmd, e))?;
             Stock::Cylinder { radius: c.radius, x_min: c.x_min, x_max: c.x_max }
         }
-        StockSpec::AroundPart(a) => Stock::around(&surfaces.part.bounds(), v3(a.margin)).map_err(|e| cam_err(cmd, "`stock.around_part`", e))?,
+        StockSpec::AroundPart(a) => around_part(cmd, &surfaces.part.bounds(), &a)?,
     };
     stock.validate().map_err(|e| cam_err(cmd, "`stock`", e))?;
     if !stock.holds_surface(&surfaces.part, tol) {
         notes.push("the part reaches outside the stock: check the stock against the part's position in work coordinates".into());
     }
     Ok(Some(stock))
+}
+
+/// The box round `part` grown by an `around_part` stock's margins: `margin` on every side, its
+/// `top` and `bottom`, when given, above and below instead of `margin`'s Z.
+pub(super) fn around_part(cmd: &str, part: &solidcraft_geom::Aabb3, a: &crate::schema::cam_stock::AroundPartSpec) -> Result<Stock> {
+    for (v, what) in [(a.top, "`stock.around_part.top`"), (a.bottom, "`stock.around_part.bottom`")] {
+        if v.is_some_and(|v| !(v.is_finite() && (0.0..=1.0e4).contains(&v))) {
+            return Err(bad(cmd, format!("{what} must be from 0 to 10 m")));
+        }
+    }
+    let stock = Stock::around(part, v3(a.margin)).map_err(|e| cam_err(cmd, "`stock.around_part`", e))?;
+    let Stock::Box { mut min, mut max } = stock else { return Ok(stock) };
+    if let Some(top) = a.top {
+        max.z = part.max.z + top;
+    }
+    if let Some(bottom) = a.bottom {
+        min.z = part.min.z - bottom;
+    }
+    if !(min.z < max.z) {
+        return Err(bad(cmd, "`stock.around_part`: the part is flat along Z: give the stock some `top` or `bottom`"));
+    }
+    let stock = Stock::Box { min, max };
+    stock.validate().map_err(|e| cam_err(cmd, "`stock.around_part`", e))?;
+    Ok(stock)
 }
 
 /// Fails each operation whose lowest cut goes below a box stock's bottom by more than `tol` on
@@ -210,6 +234,7 @@ fn stock_stages(job: &CamJob, stock: Option<&Stock>) -> Vec<Option<Stock>> {
     let mut left = stock.copied();
     job.operations
         .iter()
+        .filter(|spec| super::op_enabled(spec))
         .map(|spec| {
             let now = left;
             if let (OperationSpec::Face(o), Some(s)) = (spec, left)

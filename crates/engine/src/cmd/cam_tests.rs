@@ -4696,6 +4696,49 @@ const VIEW_VISE: &str = r#"{"format": "solidcraft.workholding", "version": 1, "h
     "parallels": {"height": 10, "thickness": 3, "length": 150}}"#;
 
 #[test]
+fn a_workholding_written_into_the_job_is_the_same_as_its_file() {
+    let mut s = dome();
+    let dir = Dir::new("inline-hold");
+    let (model, vise) = (dir.file("m.machine-model.json"), dir.file("v.workholding.json"));
+    std::fs::write(&model, VIEW_MODEL).unwrap();
+    std::fs::write(&vise, VIEW_VISE).unwrap();
+    let mut job = dome_job();
+    job["stock"] = json!({"box": {"min": [-20, -20, -20], "max": [20, 20, 8]}});
+    job["machine_model_path"] = json!(model);
+    let mut by_file = job.clone();
+    by_file["workholding_path"] = json!(vise);
+    let from_file = run(&mut s, "cam.view.load", json!({"job": by_file, "resolution": 0.5}));
+    job["workholding"] = serde_json::from_str(VIEW_VISE).unwrap();
+    let inline = run(&mut s, "cam.view.load", json!({"job": job, "resolution": 0.5}));
+    assert_eq!(inline["workholding"], from_file["workholding"]);
+    assert_eq!(inline["workholding"]["holding"], "vise");
+    assert_eq!(inline["findings"], from_file["findings"]);
+    // Not both.
+    job["workholding_path"] = json!(vise);
+    let e = s.execute("cam.view.load", &json!({"job": job})).unwrap_err();
+    assert!(e.to_string().contains("not both"), "{e}");
+}
+
+#[test]
+fn a_stock_around_the_part_takes_its_own_top_and_bottom() {
+    // The dome's part reaches from -20 to 20 in X and Y, and from Z -20 to 7.
+    let mut s = dome();
+    let mut job = dome_job();
+    job["stock"] = json!({"around_part": {"margin": [1, 2, 3], "top": 4, "bottom": 0}});
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    let corner = |k: &str| -> Vec<f64> { r["stock"][k].as_array().unwrap().iter().map(|v| (v.as_f64().unwrap() * 1e3).round() / 1e3).collect() };
+    assert_eq!(corner("min"), [-21.0, -22.0, -20.0], "{r}");
+    assert_eq!(corner("max"), [21.0, 22.0, 11.0], "{r}");
+    // Without them, the margin's Z both ways; a negative top is refused.
+    job["stock"] = json!({"around_part": {"margin": [1, 2, 3]}});
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_eq!(r["stock"]["max"][2].as_f64().map(|z| (z * 1e3).round() / 1e3), Some(10.0), "{r}");
+    job["stock"] = json!({"around_part": {"margin": [1, 2, 3], "top": -1}});
+    let e = s.execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("around_part.top"), "{e}");
+}
+
+#[test]
 fn the_simulation_view_loads_seeks_and_reports_a_job() {
     let mut s = dome();
     // Before a load nothing but load is possible.
