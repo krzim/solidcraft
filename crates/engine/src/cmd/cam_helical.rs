@@ -106,6 +106,7 @@ fn planned(ctx: &Ctx<'_>, c: Common<'_>, r: Resolved, kind: &str, path: Toolpath
         feeds: r.feeds,
         tool: r.tool,
         gouge_check: c.gouge_check,
+        band: None,
         report,
         axes: "3-axis".into(),
     })

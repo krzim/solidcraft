@@ -282,3 +282,34 @@ fn blocks_are_timed_with_acceleration_when_the_rates_give_it() {
     assert!(MachineRates { accel_z_mm_s2: Some(100.0), ..plain.clone() }.validate().is_err(), "Z's acceleration alone");
     assert!(MachineRates { tool_change_seconds: Some(-1.0), ..plain }.validate().is_err());
 }
+
+#[test]
+fn returns_home_are_timed_up_to_the_home_and_back_down() {
+    // A rewind as the post writes one: out of the cut, Z home (G28), A back two turns, and down
+    // into the cut again. The trip to Z's home and back is time at rapid too.
+    let text = "\
+G90 G94 G17 G21
+G0 X0. Y0. Z5. A0.
+G1 Z-1. F100.
+G28 G91 Z0.
+G90
+G0 A-720.
+G0 X0. Y0.
+G0 Z5.
+G1 Z-1. F100.
+";
+    let a = [AxisLetter::A];
+    // Home 50 mm above work zero: 51 up at 4000, then down 45 while A turns 720° at 8000°/min.
+    let home = MachineRates { home_z_mm: Some(50.0), ..rates() };
+    let t = machine_time(text, &a, &home, DwellUnit::Seconds).unwrap();
+    close(t.rapid_minutes, 51.0 / 4000.0 + (45.0f64 / 4000.0).max(720.0 / 8000.0), 1e-12);
+    assert_eq!(t.home_returns, 1);
+    // Without the home's height, at least up to the highest Z the program reaches (5).
+    let t = machine_time(text, &a, &rates(), DwellUnit::Seconds).unwrap();
+    close(t.rapid_minutes, 6.0 / 4000.0 + 720.0 / 8000.0, 1e-12);
+    assert_eq!(t.home_returns, 1);
+    // A home below the program, or not finite, is refused.
+    for z in [f64::NAN, f64::INFINITY, -1e9] {
+        assert!(machine_time(text, &a, &MachineRates { home_z_mm: Some(z), ..rates() }, DwellUnit::Seconds).is_err(), "{z}");
+    }
+}

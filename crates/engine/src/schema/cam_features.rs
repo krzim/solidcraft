@@ -6,6 +6,19 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// What a part is made of, for picking tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialSpec {
+    #[serde(alias = "aluminum")]
+    Aluminium,
+    Steel,
+    Stainless,
+    Brass,
+    Plastic,
+    Wood,
+}
+
 /// The direction(s) the tool comes from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -307,10 +320,10 @@ pub struct CamSuggestParams {
     /// The job's tolerance, mm. Default: 0.01.
     #[serde(default)]
     pub tolerance: Option<f64>,
-    /// A machine profile: a JSON file holding either an array of tools (a tool library) or an
-    /// object with `tools` or `tool_library_path`, and optionally `machine` or `machine_path` (a
-    /// file holding the `Machine` JSON), `post` or `post_path`, `a_reversed`, `a_limits_deg`,
-    /// `work_offset` (as a job has them; relative paths are read from the file's folder). Give this, `tools` or `tool_library_path`.
+    /// A machine profile: the same file `cam.job` takes as its `profile_path` (machine, post,
+    /// tool libraries, default heights and feeds; relative paths are read from the file's
+    /// folder), whose path the proposed job names; or a JSON array of tools (a tool library).
+    /// Give this, `tools` or `tool_library_path`.
     #[serde(default)]
     pub profile_path: Option<String>,
     /// The tools to choose from, as a job's `tools`.
@@ -325,6 +338,11 @@ pub struct CamSuggestParams {
     /// Material above the part's top to face off, mm, 0 to 5 (0: no facing). Default: 0.5.
     #[serde(default)]
     pub stock_top: Option<f64>,
+    /// What the part is made of: tools whose description names it (`Al`, `aluminium`,
+    /// `steel`, …) are picked first, and for metals carbide before HSS. Default: none (carbide
+    /// before HSS).
+    #[serde(default)]
+    pub material: Option<MaterialSpec>,
     /// Also run the proposed job through `cam.job` as a dry run and return its report under
     /// `dry_run`. Default: false.
     #[serde(default)]

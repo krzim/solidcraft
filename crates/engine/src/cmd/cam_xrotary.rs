@@ -148,7 +148,7 @@ fn rename(op: &mut Op3Spec, name: String) {
 /// left its heights to be worked out.
 fn op3_clearance(op: &Op3Spec, own_top: f64) -> f64 {
     match op {
-        Op3Spec::Adaptive(o) => o.heights.clearance,
+        Op3Spec::Adaptive(o) => o.heights.and_then(|h| h.clearance).unwrap_or(own_top),
         Op3Spec::AdaptiveRoughing(o) => o.heights.clearance,
         Op3Spec::Contour(o) => o.heights.and_then(|h| h.clearance).unwrap_or(own_top),
         Op3Spec::Pocket(o) => o.heights.and_then(|h| h.clearance).unwrap_or(own_top),
@@ -193,6 +193,7 @@ fn continuous(c: Common<'_>, r: Resolved, kind: &str, path: Toolpath5) -> Planne
         feeds: r.feeds,
         tool: r.tool,
         gouge_check: c.gouge_check,
+        band: None,
         report,
         axes: "4-axis".into(),
     }

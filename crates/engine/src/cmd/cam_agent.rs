@@ -1581,6 +1581,17 @@ impl Agent {
         let fix = if !on_part {
             "the tool runs into a fixture, not the part: keep the operation's polygon or boundary clear of it, raise the clearance, or move the fixture"
                 .to_string()
+        } else if p.band.is_some() && r.kind.ends_with("chamfer") {
+            // The chamfer itself is allowed: this goes past it.
+            format!(
+                "the chamfer mill cuts {} mm past the chamfer it is told to cut (the model need not show the chamfer): check that the profile (`polygon`, `sketch` and `profiles`) runs along the part's edge and that `side` is right, or lower `width` or `tip_offset`",
+                num(d)
+            )
+        } else if p.band.is_some() {
+            format!(
+                "the chamfer mill cuts {} mm past the depth it is told to cut: check that `heights.top` is the face it engraves or spots and that the line or the holes are on that face",
+                num(d)
+            )
         } else {
             let mut f = match self.used(index) {
                 Some((h, _)) => format!(

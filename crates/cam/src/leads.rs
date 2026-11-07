@@ -33,7 +33,7 @@ use crate::ops::{
 };
 use crate::path::{Move, Toolpath, arc_sweep, vertical_quarter};
 use crate::piece::{Piece, wrap};
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolKind};
 use crate::{CamError, Result, invalid};
 
 /// Most tabs on one profile.
@@ -900,7 +900,12 @@ pub fn contour_with(
     check_ramp(params.ramp_angle)?;
     let r = tool.radius();
     let entry = entry_of(opts.entry, params.ramp_angle, r)?;
-    mills(tool, entry.angle())?;
+    if tool.kind == ToolKind::Chamfer && params.side == Side::On {
+        // A V-trace (engraving): the cone's point runs along the line to the depth.
+        traces(tool, cut)?;
+    } else {
+        mills(tool, entry.angle())?;
+    }
     if let Some(l) = &opts.lead {
         l.validate()?;
     }
@@ -1272,4 +1277,14 @@ pub fn pocket_with(
     }
     limit_descent(&mut b.moves, cut.feeds.plunge);
     b.finish()
+}
+
+/// Refuses a V-trace with `tool`, a chamfer mill, deeper than its flutes: along the line its
+/// point cuts a groove as wide as its cone is at the top.
+fn traces(tool: &Tool, cut: &Cut) -> Result<()> {
+    let depth = cut.heights.top - cut.heights.bottom;
+    if !(depth <= tool.flute_length + 1e-9) {
+        return invalid(format!("the trace goes {depth:.4} mm deep, beyond chamfer mill {}'s {} mm flute length", tool.number, tool.flute_length));
+    }
+    Ok(())
 }

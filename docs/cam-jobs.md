@@ -53,9 +53,11 @@ The command never writes a program that fails one of these unless `allow_unsafe`
   against the triangles and the deepest gouge followed to its deepest point. A failure names
   the operation, the move of its toolpath, the G-code line that ends that move (when it is
   found) and the work coordinates of the tool tip there, and says how deep that can be in the
-  exact part. An operation that cuts what the model does not show (an engraving) sets
-  `gouge_check: false`; the reply lists it under `gouge.skipped`, and it is still checked
-  against the fixtures. A drill is checked as its own shape, point and all.
+  exact part. A chamfer mill's own band is allowed: the chamfer a `chamfer` operation is told to
+  cut, the groove of a V-trace (`contour` `side: on`) and the cone of a spotted hole (`drill`)
+  need not be in the model (see [Chamfers](#chamfers)). Any other operation that cuts what the
+  model does not show sets `gouge_check: false`; the reply lists it under `gouge.skipped`, and it
+  is still checked against the fixtures. A drill is checked as its own shape, point and all.
 - **Holder.** For tools with holder data (`stickout` above the flutes, `shank_diameter`,
   `holder`), the shank and holder must not touch the part or a fixture along a cutting move. A
   shank or holder section no wider than the cutter is inside the cutter's endless cylinder, so
@@ -263,7 +265,7 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `pencil` | `heights`; `min_angle_deg` (30); `passes` (0: the crease alone); `stepover` (tool's, else 10% of its diameter); `min_length` (the tool's radius); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` |
 | `rest_finish` | `heights`; `previous_tool` (a tool number of the job); `threshold` (twice the tolerance); `scallop_height` or `stepover`; `overlap` (a quarter of the diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` |
 | `drill` | `sketch` (circle centres, `circles` (true), filtered by `diameter_range: [min, max]`, and lone points, `sketch_points` (true)) or `points: [[x, y], …]`; `heights` (`retract` is the R height, `top` the hole's top, `bottom` its depth); `cycle`: `simple` \| `dwell` \| `peck` \| `chip_break` (simple); `peck` (tool's stepdown, else its diameter); `peck_clearance` (0.5); `back_off` (0.5); `dwell_seconds` (0.5); `to_full_diameter` (false); `stay_at_retract` (false). See [Drilling](#drilling). |
-| `adaptive` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown` (tool's, else its diameter); `optimal_load` (tool's `stepover`, else 10% of its diameter); `min_engagement_deg`, `max_engagement_deg` (from the load: see [Adaptive clearing](#adaptive-clearing)); `helix_diameter` (80% of the tool's); `ramp_angle_deg` (2); `climb`; `stock_to_leave` (0); `tolerance`; `compare` (true); `from_stock` (true: see [Adaptive clearing](#adaptive-clearing)); `rest_from` (none: see Rest machining there) |
+| `adaptive` | `sketch` + `profiles?`, `polygon` or `feature` (its outline, islands and heights; see [Operations on features](#operations-on-features)); `heights` (all four with a sketch or a polygon; with a feature, any left out come from it); `stepdown` (tool's, else its diameter); `optimal_load` (tool's `stepover`, else 10% of its diameter); `min_engagement_deg`, `max_engagement_deg` (from the load: see [Adaptive clearing](#adaptive-clearing)); `helix_diameter` (80% of the tool's); `ramp_angle_deg` (2); `climb`; `stock_to_leave` (0); `tolerance`; `compare` (true); `from_stock` (true: see [Adaptive clearing](#adaptive-clearing)); `rest_from` (none: see Rest machining there) |
 | `adaptive_roughing` | `heights` (`top` is the stock's top); `stepdown`; `optimal_load`; `min_engagement_deg`, `max_engagement_deg`; `helix_diameter`; `ramp_angle_deg`; `climb`; `boundary` (the stock's extent; the part's extent); `stock_to_leave` (0.25); `flats` (true); `tolerance`; `rest_from` (none) |
 | `chamfer` | `sketch` + `profiles?` or `polygon`; `heights: {clearance, retract, top}` (no `bottom`: the depth follows from the width); `width` (across the top); `tip_offset` (0.2); `side`: `outside` \| `inside` (outside); `climb` (true); `tolerance`. A chamfer mill only; see [Chamfers](#chamfers) |
 | `indexed` | `a_deg` and `operation`: any of the 3-axis operations above, run with A held at `a_deg` (3+1); optionally `name`, used when the inner operation has none. The inner operation carries the tool and feeds. |
@@ -348,7 +350,11 @@ where the machine's Z travel ends, never below that clearance; a job that cannot
 naming the operation and the Z it needs), takes the
 `safe_rotate` lines, turns A back by whole turns, comes back at rapid to 1 mm above the cut and
 feeds the rest of the way in at the operation's plunge feed (`plunge_feed` when it has none),
-then goes on. Each operation starts at the whole turn that needs the fewest rewinds, so one that
+then goes on. A rewind leaves witness marks where the tool comes back into a finished surface:
+on a table with limits, finish with `rings` or `lines`, which never rewind; a `helix` winds on
+without rewinds only on a rotary without limits (a machine file whose rotary has no `limits`, or
+`4axis_a` without `a_limits_deg`), for a controller that counts A on past ±360° (no rollover, no
+rotary soft limits). Each operation starts at the whole turn that needs the fewest rewinds, so one that
 begins where the last ended at a limit does not rewind right after its first plunge. A cut that
 ends past a limit by less than 0.0006° (a groove drawn a hair longer than a whole turn, to
 rounding below what the angle is written to) ends at the limit, with no rewind and no turn
@@ -371,8 +377,11 @@ elsewhere are read on a best-effort basis and stop at the first block it cannot 
 
 ## Drilling
 
-A `drill` operation feeds a drill (or a flat end mill, plunging) straight down the tool axis at
-each hole, at the operation's plunge feed. Any other tool is refused. It is a 3-axis operation,
+A `drill` operation feeds a drill (or a flat end mill, plunging, or a chamfer mill or spot drill,
+spotting) straight down the tool axis at each hole, at the operation's plunge feed. Any other tool
+is refused. With a chamfer mill `bottom` is where its point goes: a spot `d` across at the top is
+`d / 2 / tan(angle_deg / 2)` deep (a 90° tool: half the spot's diameter); the cone it cuts is the
+operation's own and is not held against the model (see [Chamfers](#chamfers)). It is a 3-axis operation,
 so it also runs inside `indexed`: its points and heights are then in the frame the angle brings
 under the tool.
 
@@ -662,7 +671,10 @@ A face mill (`kind: "face_mill"`) is a flat end, its inserts' corners rounded by
 `corner_radius` when given; its tool-list name is `FACE MILL`. A chamfer mill (`kind:
 "chamfer"`) has `diameter` (the widest the cone cuts), `tip_diameter` (0 for a pointed tip,
 default 0) and `angle_deg`, the included angle (90 for 45° chamfers, 1 to 179, required); its
-tool-list name is `CHAMFER MILL`. Contours and pockets refuse a chamfer mill. The drop-cutter
+tool-list name is `CHAMFER MILL`. A spot drill is a chamfer mill with no tip (`angle_deg` its
+point angle). Pockets, clearing and a contour beside a line refuse a chamfer mill; a contour
+`side: on` takes one to trace the line to a depth (V-engraving), and `drill` takes one to spot
+holes. The drop-cutter
 and the gouge check know its true shape, a flat tip and a cone, so the finishing operations
 (`parallel`, `waterline`, `rotary_finish`, `wrap`, 5-axis surface finishing) can use one.
 `roughing` and `rotary_roughing` refuse it, since its point leaves ridges between passes that
@@ -687,10 +699,30 @@ reach, wider than `diameter / 2 − tip_diameter / 2 − tip_offset · tan(angle
 than the flutes, is refused with the widest it can cut, never cut narrower. `outside` chamfers a
 part's outline, `inside` an opening's; corners of an outside chamfer are rounded by the cone.
 
-The gouge check holds the cone to the model: chamfer edges the model has chamfered (with
-`solid.chamfer` at the tool's angle) and it passes; a chamfer the model does not show cuts into
-it, so a deburr of a sharp-edged model sets `gouge_check: false`. Inside `indexed` a chamfer runs
-in the frame the A angle brings under the tool.
+The gouge check holds the cone to the part less the chamfer it is told to cut: as if the tool ran
+the chamfer's height (`width / tan(angle_deg / 2)`) higher, where its cone just meets a sharp
+edge, with its tip also held where it really runs. So a chamfer the model shows passes, and so
+does a deburr of a sharp edge the model does not chamfer; a cut past the band fails, such as a
+profile off the part's edge, a wrong `side`, or a tip that runs into a face below. Its fix names
+the profile, `side`, `width` and `tip_offset`. Its retract straight up through the band passes
+the rapid check, and the simulation warns about its cut below the model rather than failing.
+Inside `indexed` a chamfer runs in the frame the A angle brings under the tool.
+
+A contour `side: on` with a chamfer mill traces the line with the point down to `bottom`: a
+V-engraving as wide at the top as the cone is there (a 60° tool 0.3 mm deep: 0.35 mm). Its groove
+is its band (`top − bottom`), so the model need not show the engraving; a trace whose `top` is not
+the face it engraves cuts past its band and fails. A trace deeper than the flutes is refused. A
+`drill` with a chamfer mill spots holes the same way, its band the spot's depth:
+
+```json
+{"name": "engrave", "type": "contour", "tool": 30, "side": "on", "sketch": "Text",
+ "heights": {"clearance": 10, "retract": 2, "top": 0, "bottom": -0.3}}
+```
+
+```json
+{"name": "spot", "type": "drill", "tool": 30, "sketch": "Holes",
+ "heights": {"clearance": 10, "retract": 2, "top": 0, "bottom": -1.5}}
+```
 
 ## Leads, entries, linking and tabs
 
@@ -839,7 +871,8 @@ tolerance each and the wrapped moves within half of it. Cuts are written as shor
 turning A by at most `max_angle_step_deg`, in inverse time where the post says so; A stays
 within the profile's angles, and a post with `rewind` brings a long cut back within the table's
 limits. Everything one level cuts must fit within one turn at that level, or the operation is
-refused. Text engraving is not part of these operations.
+refused. `wrap_contour` with `side: on` engraves text round a bar (a small flat end mill, or a
+chamfer mill), with `gouge_check: false` since the model does not show it.
 
 ### Rings
 
@@ -920,6 +953,7 @@ faster than A can turn, in inverse time (`G93`) or not. Give the job the machine
 | `accel_mm_s2`, `accel_z_mm_s2` | Acceleration of X and Y, and of Z, mm/s². Only the simulation view's timeline uses them. |
 | `accel_a_deg_s2` | Acceleration of the rotaries, degrees/s² (the simulation view). |
 | `tool_change_seconds` | How long a tool change (`M6`) takes (the simulation view's timeline). |
+| `home_z_mm` | Where Z's home is in work coordinates (mm), to time the returns home (`G28`); default the highest Z the program reaches. |
 
 A rate left out is not limited. Every rate must be above 0. Unknown keys are refused, in a
 `machine_rates_path` file too.
@@ -936,7 +970,10 @@ written), blocks that ask a linear axis for more than its top feed, spindle spee
 is the time as written and `rapid_minutes` is `null`.
 
 The times leave out acceleration, so they are a lower bound for programs of many short blocks.
-Moves to and from the machine's home (`G28`) are in machine coordinates and are not timed.
+A return of Z to the machine's home (`G28 … Z`: before a tool change, and in every rewind of a
+post whose `safe_rotate` lines go home) is timed at the Z rapid rate up to `home_z_mm`, Z's home
+in work coordinates, and the next move from there; without it, up to the highest Z the program
+reaches, a lower bound. `home_returns` counts them.
 
 ### Controller settings a post must match
 
@@ -1401,56 +1438,65 @@ the same lookup.
 ### `cam.suggest`
 
 ```json
-{"profile_path": "C:/cam/my-mill.json", "axis": "a", "stock_top": 0.5, "check": true}
+{"profile_path": "C:/cam/my-mill.profile.json", "material": "steel", "stock_top": 0.5, "check": true}
 ```
 
 | Key | Meaning |
 | --- | --- |
-| `profile_path` | A machine profile: a JSON array of tools (a tool library), or an object with `tools` or `tool_library_path` and optionally `machine` or `machine_path` (a file holding the machine JSON), `post` or `post_path`, `a_reversed`, `a_limits_deg`, `work_offset` (as a job has them; relative paths are read from the file's folder). Give this, `tools` or `tool_library_path`. |
+| `profile_path` | The machine profile `cam.job` reads (see [Profiles](#profiles)): its machine, post, tool libraries, default heights and feeds; the proposed job names it as its own `profile_path`. Also taken: a JSON array of tools (a tool library), or an object with only `tools` or `tool_library_path`, `machine` or `machine_path`, `post` or `post_path`, `a_reversed`, `a_limits_deg` and `work_offset`, which the job then carries itself. Give this, `tools` or `tool_library_path`. |
 | `tools`, `tool_library_path` | The tools to choose from, as a job has them. |
 | `bodies`, `origin`, `tolerance` | As `cam.features`; they are copied into the job. |
 | `axis` | `z` or `a`. Default: `a` when the profile's machine has one rotary about X. |
 | `post` | A built-in post. Default: the profile's, else `linuxcnc_4axis`. |
 | `stock_top` | Material faced off the top, 0 to 5 mm (default 0.5; 0: no facing). |
+| `material` | `aluminium`, `steel`, `stainless`, `brass`, `plastic` or `wood`: of the tools that fit, those whose description names the material (`Al`, `DLC`, `steel`, `TiAlN`, …) first; for metals HSS tools last. Default: carbide before HSS. |
 | `check` | Also run the job through `cam.job` as a dry run and return its report as `dry_run`. |
 
-The reply: `job` (a complete job: name, machine, post, origin, bodies, tolerance, only the tools it
-uses, and its operations, which name features), `operations` (each with the features it machines
-and why it was chosen), `tools` (what each is used for), `assumptions`, `check` (what to verify
-before running the program), `skipped` (features left out, tools that could not be used, and why)
-and, with `check`, `dry_run`. Nothing is written.
+The reply: `job` (a complete job: name, the profile or the machine and post, origin, bodies,
+tolerance, only the tools it uses, and its operations, which name features), `operations` (each
+with the features it machines and why it was chosen), `tools` (what each is used for),
+`assumptions`, `check` (what to verify before running the program), `skipped` (features left out,
+tools that could not be used, and why) and, with `check`, `dry_run`. Nothing is written. Each
+operation takes the tool's cutting data for its kind (`cutting_data`), as `cam.job` does.
 
 Only tools with `spindle_rpm` and `feed` are picked. Each pick is tried with the operation itself
 on the feature's exact outline, so a tool is never proposed for a pocket it does not fit. The
 operations, in order:
 
-1. **Facing** (3-axis, when the top is flat and `stock_top` is above 0): a pocket over the part's
-   extent and 1 mm round it, `stock_top` deep, with the largest flat end mill.
-2. **3D roughing** (curved surfaces only): the whole part down to the lowest curved area, 0.25 mm
-   left, with the largest flat end mill.
-3. **Pockets**, roughed with the largest flat end mill the pocket takes (flutes as long as the
-   depth preferred), 0.2 mm left on the walls; islands lower than the rim in bands of their own.
-4. **Holes**, counterbores first, milled as round pockets with the largest flat end mill of at most
-   80% of the hole's diameter. A hole no tool fits is skipped, with the largest diameter that would
-   fit and the operation to add; a drill of its diameter in the library is named, but `cam.job` has
-   no drilling operation to use it yet.
+1. **Facing** (3-axis, when the top is flat and `stock_top` is above 0): a `face` over the part's
+   extent and 1 mm round it, `stock_top` deep, with a face mill (else the largest flat end mill).
+2. **3D roughing** (curved surfaces only): `adaptive_roughing` of the whole part down to the
+   lowest curved area, 0.25 mm left, with the largest flat end mill.
+3. **Pockets**, cleared by `adaptive` on the feature with the largest flat end mill the pocket
+   takes (flutes as long as the depth preferred), 0.2 mm left on the walls; islands lower than the
+   rim in bands of their own. A pocket with no room for adaptive clearing to enter and turn (less
+   than a diameter between the walls the tool keeps off) is a plain `pocket`.
+4. **Holes**, counterbores first: a through hole or one ending in a drill point that a drill of
+   its diameter (within 0.05 mm) matches is drilled with `to_full_diameter`, pecking a diameter at
+   a time when deeper than three diameters, the holes of one drill and depth in one operation; the
+   others are milled as round pockets with the largest flat end mill of at most 80% of the hole's
+   diameter. A hole no tool fits is skipped, with the largest diameter that would fit.
 5. **Pocket walls** finished with a contour by the largest flat end mill whose radius is at most
    the pocket's `min_corner_radius` (when a corner is sharp: the smallest that fits, with a check
    saying what it leaves).
-6. **3D finishing** of surfaces, fillets and chamfers: a parallel finish over their bounds with the
-   largest ball end mill whose radius is at most their smallest radius (else the smallest ball,
-   else a bull nose, else a flat end mill).
+6. **3D finishing** of surfaces and fillets: a parallel finish over their bounds with the largest
+   ball end mill whose radius is at most their smallest radius (else the smallest ball, else a
+   bull nose, else a flat end mill).
 7. **Turned diameters** (axis `a`): a rotary finish along their X range.
-8. **Outer profiles** (3-axis), last: a contour outside with the largest flat end mill that fits
-   their notches, flutes as long as the depth preferred.
+8. **Outer profiles** (3-axis): a contour outside with the largest flat end mill that fits their
+   notches, flutes as long as the depth preferred.
+9. **Chamfers** the model shows along a profile (outside), a pocket's rim or a hole (inside): the
+   `chamfer` operation on that edge, as wide as modelled, with a chamfer mill of the chamfer's
+   angle whose cone reaches it. Others are listed under `skipped`.
 
-Pockets and holes on other sides of a 4th-axis part are `indexed` at their A angles; facing,
-profiles and 3D finishing are 3-axis only. Steps (faces open on some sides) are listed under
-`skipped` with the operation to cut them (a pocket on a step stays inside its outline: give a
-`polygon` past its open sides to clear them). A pocket whose walls are not upright gets a `check`
-line saying its walls are left, with the bounds for a 3D finish. Always run the job with `dry_run: true` first; the
-suggestion is tested to pass on a plate with a pocket, an island and holes, and on a bar with a
-pocket on each side.
+Pockets, holes and chamfers on other sides of a 4th-axis part are `indexed` at their A angles;
+facing, profiles and 3D finishing are 3-axis only. Steps (faces open on some sides) are listed
+under `skipped` with the operation to cut them (a pocket on a step stays inside its outline: give
+a `polygon` past its open sides to clear them). A pocket whose walls are not upright gets a
+`check` line saying its walls are left, with the bounds for a 3D finish. Always run the job with
+`dry_run: true` first; the suggestion is tested to pass on a plate with a pocket, an island,
+holes and a chamfered outline read through a machine profile, and on a bar with a pocket on each
+side.
 
 ## Pictures and extents for agents
 

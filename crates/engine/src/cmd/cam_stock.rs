@@ -317,6 +317,7 @@ pub(super) fn plan_face(ctx: &Ctx<'_>, o: &FaceOp, arc_tol: f64) -> Result<Plann
         feeds: r.feeds,
         tool: r.tool,
         gouge_check: c.gouge_check,
+        band: None,
         report,
         axes: "3-axis".into(),
     })

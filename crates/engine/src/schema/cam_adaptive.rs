@@ -4,7 +4,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::cam::{BoundarySpec, Common, FeedsSpec, HeightsSpec, operation};
+use super::cam::{BoundarySpec, Common, FeedsSpec, HeightsPartial, HeightsSpec, operation};
 use super::types::SketchRef;
 
 operation! {
@@ -22,8 +22,15 @@ operation! {
         /// One closed polygon [[x, y], ...] in the operation's XY.
         #[serde(default)]
         pub polygon: Option<Vec<[f64; 2]>>,
-        /// The Z levels.
-        pub heights: HeightsSpec,
+        /// A feature of the part by its `cam.features` id (`pocket:0`, `face:1`): its exact
+        /// outline, islands and heights. A feature on another side of a 4th-axis part is indexed
+        /// to its A angle. Give this, a `sketch` or a `polygon`.
+        #[serde(default)]
+        pub feature: Option<String>,
+        /// The Z levels: all four with a sketch or a polygon; with a `feature`, any left out come
+        /// from it.
+        #[serde(default)]
+        pub heights: Option<HeightsPartial>,
         /// Most depth per pass, mm. Default: the tool's `stepdown`, else its diameter.
         #[serde(default)]
         pub stepdown: Option<f64>,

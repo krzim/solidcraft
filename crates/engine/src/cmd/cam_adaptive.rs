@@ -236,8 +236,19 @@ fn rest_in(ctx: &Ctx<'_>, name: &str, frame: &Frame, rest_from: bool) -> Result<
 pub(super) fn plan(ctx: &Ctx<'_>, o: &AdaptiveOp, frame: &Frame) -> Result<(Toolpath, Resolved, &'static str)> {
     let c = o.common();
     let r = ctx.resolve(&c)?;
-    let regions = ctx.regions(c.name, o.sketch.as_ref(), o.profiles.as_deref(), o.polygon.as_deref(), frame)?;
-    let cut = Cut { heights: heights(&o.heights), feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter) };
+    let two = super::features::op_cut(
+        ctx,
+        c.name,
+        o.sketch.as_ref(),
+        o.profiles.as_deref(),
+        o.polygon.as_deref(),
+        o.feature.as_deref(),
+        o.heights.as_ref(),
+        frame,
+        None,
+    )?;
+    let regions = two.regions;
+    let cut = Cut { heights: two.heights, feeds: r.feeds, stepdown: or_tool(o.stepdown, r.tool.stepdown, r.tool.diameter) };
     let p = params(
         ctx,
         c.name,

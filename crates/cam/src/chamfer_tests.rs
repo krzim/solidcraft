@@ -640,3 +640,73 @@ fn the_gouge_check_follows_a_tall_cone_as_its_axis_turns() {
     };
     assert!(!gouges(&fin, &c, &turn, 0.01, 0.5).unwrap().is_empty(), "the turn through the fin is a gouge");
 }
+
+#[test]
+fn the_band_check_allows_the_chamfer_it_is_told_to_cut_and_nothing_beyond() {
+    // A chamfer the model does not show: the cone cuts the sharp edge as deep as the chamfer
+    // band, which the band check allows; a profile off the part's edge, or a chamfer wider than
+    // the band it is told to cut, still gouges.
+    let sharp = block(Vec3::new(-10.0, -10.0, -10.0), Vec3::new(10.0, 10.0, 0.0));
+    for tool in [chamfer_mill(6.0, 0.0, 90.0), chamfer_mill(6.0, 0.5, 90.0), chamfer_mill(8.0, 1.0, 60.0)] {
+        let g = chamfer_geometry(&tool, 1.0, DEFAULT_TIP_OFFSET).unwrap();
+        let path = chamfer(&[rect(-10.0, -10.0, 10.0, 10.0)], &tool, &chamfer_params(1.0, Side::Outside)).unwrap();
+        let path5 = Toolpath5::from_3axis(&path, 0.001).unwrap();
+        assert!(!gouges(&sharp, &tool.cutter().unwrap(), &path5, 0.01, 0.2).unwrap().is_empty(), "the plain check finds the chamfer");
+        let hits = band_gouges(&sharp, &tool, &path5, g.height, true, 0.01, 0.2).unwrap();
+        assert!(hits.is_empty(), "{hits:?}");
+        // The modelled chamfer passes too.
+        assert!(band_gouges(&chamfered_block(10.0, 10.0, 1.0), &tool, &path5, g.height, true, 0.01, 0.2).unwrap().is_empty());
+        // 0.3 mm wider than the band: found, about as deep as the cone goes past it.
+        let wider = chamfer(&[rect(-10.0, -10.0, 10.0, 10.0)], &tool, &chamfer_params(1.3, Side::Outside)).unwrap();
+        let hits = band_gouges(&sharp, &tool, &Toolpath5::from_3axis(&wider, 0.001).unwrap(), g.height, true, 0.01, 0.2).unwrap();
+        let worst = hits.iter().map(|h| h.distance).fold(0.0, f64::max);
+        let half = f64::to_radians(tool.angle_deg.unwrap() * 0.5);
+        assert!(worst > 0.5 * 0.3 * half.cos() && worst < 0.3 + 0.05, "{worst}");
+        // Reported where the tool really runs, not where the check lifted it.
+        let lowest = hits.iter().map(|h| h.pose.tip.z).fold(f64::INFINITY, f64::min);
+        assert!(lowest < -1.0, "{lowest}");
+        // A profile 2 mm inside the edge: the tip runs below the top face.
+        let inset = chamfer(&[rect(-8.0, -8.0, 8.0, 8.0)], &tool, &chamfer_params(1.0, Side::Outside)).unwrap();
+        let hits = band_gouges(&sharp, &tool, &Toolpath5::from_3axis(&inset, 0.001).unwrap(), g.height, true, 0.01, 0.2).unwrap();
+        assert!(hits.iter().any(|h| h.distance > 0.1), "{hits:?}");
+    }
+    // A band of 0 is the plain check; hostile bands are refused.
+    let tool = chamfer_mill(6.0, 0.0, 90.0);
+    let path = chamfer(&[rect(-10.0, -10.0, 10.0, 10.0)], &tool, &chamfer_params(1.0, Side::Outside)).unwrap();
+    let path5 = Toolpath5::from_3axis(&path, 0.001).unwrap();
+    assert!(!band_gouges(&sharp, &tool, &path5, 0.0, true, 0.01, 0.2).unwrap().is_empty());
+    for band in [-1.0, f64::NAN, f64::INFINITY, 1e300] {
+        assert!(band_gouges(&sharp, &tool, &path5, band, true, 0.01, 0.2).is_err(), "{band}");
+    }
+}
+
+#[test]
+fn a_chamfer_mill_traces_a_line_to_a_depth_and_spots_holes() {
+    // V-engraving: a contour on the profile with a chamfer mill runs its tip along the line at
+    // the depth asked; beside the line (outside or inside) it is still refused.
+    let tool = chamfer_mill(6.0, 0.0, 60.0);
+    let region = [rect(-10.0, -5.0, 10.0, 5.0)];
+    let cut =
+        Cut { heights: Heights { clearance: 10.0, retract: 2.0, top: 0.0, bottom: -0.4 }, feeds: Feeds { cut: 600.0, plunge: 100.0 }, stepdown: 1.0 };
+    let on = ContourParams { side: Side::On, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+    let path = contour(&region, &tool, &on, &cut).unwrap();
+    let cuts: Vec<Vec3> = path.moves.iter().filter(|m| matches!(m, Move::Feed { .. })).filter_map(Move::target).collect();
+    assert!(cuts.iter().all(|p| p.z >= -0.4 - 1e-9), "{cuts:?}");
+    assert!(cuts.iter().any(|p| (p.x - 10.0).abs() < 1e-9 && (p.z + 0.4).abs() < 1e-9), "{cuts:?}");
+    for side in [Side::Outside, Side::Inside] {
+        let e = contour(&region, &tool, &ContourParams { side, ..on }, &cut).unwrap_err().to_string();
+        assert!(e.contains("tapered"), "{e}");
+    }
+    // Deeper than its flutes: refused.
+    let deep = Cut { heights: Heights { bottom: -11.0, ..cut.heights }, ..cut };
+    assert!(contour(&region, &tool, &on, &deep).is_err());
+    // The trace's band (its depth) lets the true cone cut the top it is told to; a path that
+    // goes deeper than the band does not pass.
+    let flat = block(Vec3::new(-20.0, -20.0, -10.0), Vec3::new(20.0, 20.0, 0.0));
+    let p5 = Toolpath5::from_3axis(&path, 0.001).unwrap();
+    assert!(band_gouges(&flat, &tool, &p5, 0.4, false, 0.01, 0.2).unwrap().is_empty());
+    assert!(!band_gouges(&flat, &tool, &p5, 0.2, false, 0.01, 0.2).unwrap().is_empty());
+    // Spot drilling: a drilling operation takes a chamfer mill as it takes a drill.
+    assert!(crate::drill::check_drilling_tool(&tool).is_ok());
+    assert!(crate::drill::check_drilling_tool(&Tool::new(1, ToolKind::BallEndmill, 6.0, 20.0)).is_err());
+}

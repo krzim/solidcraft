@@ -9,8 +9,9 @@
 //! block that way against a machine's [`MachineRates`]: the cut time as written and as run, the
 //! rapid time, the spindle's start-up waits, and the blocks the controller would slow, with a
 //! warning for each kind. Acceleration is left out (a controller blending moves at constant
-//! velocity rarely stops between them), so the times are a lower bound for short blocks; moves
-//! to and from the machine's home (`G28`) are in machine coordinates and are not timed.
+//! velocity rarely stops between them), so the times are a lower bound for short blocks. A
+//! return of Z to the machine's home (`G28 … Z`, before a tool change or in a rotary's rewind)
+//! is timed up to [`MachineRates::home_z_mm`] and back down from there.
 //!
 //! [`block_times`] times every block on its own for a view that plays the program in time,
 //! and, where the rates give the axes' accelerations, with them: each block speeds up and slows
@@ -143,6 +144,12 @@ pub struct MachineRates {
     /// How long a tool change (`M6`) takes, seconds ([`block_times`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_change_seconds: Option<f64>,
+    /// Where Z's home is, in work coordinates (mm): a return home (`G28` with a `Z` word, as a
+    /// post writes before a tool change or a rewind) takes the tool up there and the next move
+    /// brings it back down, both timed at rapid. Left out, the highest Z the program reaches,
+    /// so the trip is timed at least that far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_z_mm: Option<f64>,
 }
 
 fn rate_ok(v: f64) -> bool {
@@ -175,6 +182,9 @@ impl MachineRates {
         if self.tool_change_seconds.is_some_and(|s| !(0.0..=MAX_SPINDLE_START).contains(&s)) {
             return invalid("a tool change must take 0 to 3600 seconds");
         }
+        if self.home_z_mm.is_some_and(|z| !(z.abs() <= MAX_TRAVEL)) {
+            return invalid("Z's home must be a finite height within 100 m of work zero");
+        }
         Ok(())
     }
 
@@ -199,6 +209,9 @@ pub struct MachineTime {
     pub rapid_minutes: f64,
     /// Time waiting for the spindle to start (minutes).
     pub spindle_minutes: f64,
+    /// Returns of Z to its home (`G28 … Z`) timed among the rapids: tool changes and rewinds.
+    #[serde(default)]
+    pub home_returns: usize,
     /// All of it (minutes).
     pub total_minutes: f64,
     /// Cutting blocks the controller runs slower than written.
@@ -229,6 +242,20 @@ pub struct MachineTime {
 struct At {
     linear: Vec3,
     rotary: Vec<f64>,
+    line: usize,
+}
+
+/// The lines of `text` that return Z to its home (`G28` or `G30` with a `Z` word).
+fn home_lines(text: &str) -> Result<Vec<usize>> {
+    let mut out = Vec::new();
+    for (i, l) in text.lines().enumerate() {
+        let ws = words(l, i + 1)?;
+        let g = |v: i64| ws.iter().any(|&(c, x)| c == 'G' && (x * 10.0).round() as i64 == v);
+        if (g(280) || g(300)) && ws.iter().any(|(c, _)| *c == 'Z') {
+            out.push(i + 1);
+        }
+    }
+    Ok(out)
 }
 
 /// The largest turn of any rotary between two positions, degrees.
@@ -269,6 +296,22 @@ fn peak(slot: &mut Option<(usize, f64)>, line: usize, v: f64) {
 pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dwell: DwellUnit) -> Result<MachineTime> {
     rates.validate()?;
     let written = parse5(text, letters)?;
+    let homes = home_lines(text)?;
+    // Where a return home takes Z: the rates', else at least the highest Z the program reaches.
+    let highest = written
+        .iter()
+        .filter_map(|w| match w {
+            JointWords::Rapid { linear, .. }
+            | JointWords::Feed { linear, .. }
+            | JointWords::Arc { linear, .. }
+            | JointWords::PlaneArc { linear, .. } => Some(linear.z),
+            JointWords::Dwell { .. } => None,
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    let home_z = rates.home_z_mm.unwrap_or(highest);
+    if !homes.is_empty() && highest.is_finite() && home_z < highest - 1e-9 {
+        return invalid(format!("Z's home ({home_z} mm) is below the highest Z the program reaches ({highest} mm)"));
+    }
     let mut t = MachineTime::default();
     let (xy, z, a) = (rates.max_feed_mm_min, rates.feed_z(), rates.max_a_deg_min);
     let mut at: Option<At> = None;
@@ -299,7 +342,13 @@ pub fn machine_time(text: &str, letters: &[AxisLetter], rates: &MachineRates, dw
             }
         }
         // The first block whose every axis is known only says where the axes are.
-        let Some(from) = at.replace(At { linear, rotary: rotary.clone() }) else { continue };
+        let Some(mut from) = at.replace(At { linear, rotary: rotary.clone(), line }) else { continue };
+        // A return home since the last block: up to Z's home at rapid, and on from there.
+        if homes.iter().any(|&h| h > from.line && h < line) && home_z.is_finite() {
+            t.home_returns += 1;
+            t.rapid_minutes += (home_z - from.linear.z).max(0.0) / rates.rapid_z();
+            from.linear.z = home_z;
+        }
         let d = linear - from.linear;
         let turn = turn_deg(&from.rotary, rotary);
         match w {
@@ -567,7 +616,7 @@ pub fn block_times(text: &str, letters: &[AxisLetter], rates: &MachineRates, dwe
             | JointWords::PlaneArc { line, linear, rotary, .. } => (*line, *linear, rotary),
         };
         out.lines.push(line);
-        let Some(from) = at.replace(At { linear, rotary: rotary.clone() }) else {
+        let Some(from) = at.replace(At { linear, rotary: rotary.clone(), line }) else {
             out.seconds.push(0.0);
             legs.push(None);
             stop = true;

@@ -222,7 +222,7 @@ fn load(s: &mut Session, p: &Value) -> Result<Value> {
             notes.extend(pj.notes.iter().cloned());
             let blocks = parse5(&pj.text, &pj.machine.letters()).map_err(|e| cam_err(cmd, "reading the program back", e))?;
             let names: Vec<String> = pj.planned.iter().map(|q| q.report.name.clone()).collect();
-            let unchecked: Vec<bool> = pj.planned.iter().map(|q| !q.gouge_check).collect();
+            let unchecked: Vec<bool> = pj.planned.iter().map(|q| !q.gouge_check || q.band.is_some()).collect();
             let ops = owners(&pj.program, &pj.post, &pj.machine, &blocks).map(|o| (names, o, unchecked));
             if ops.is_none() {
                 notes.push("the program's blocks could not be put under their operations: one operation per tool change is shown".into());

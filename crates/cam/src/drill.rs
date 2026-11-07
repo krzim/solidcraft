@@ -148,13 +148,16 @@ pub fn tip_length(tool: &Tool) -> f64 {
     tool.radius() / half.tan()
 }
 
-/// A drilling operation takes a drill, or a flat end mill to plunge with.
+/// A drilling operation takes a drill, a flat end mill to plunge with, or a chamfer mill (a
+/// spot drill) to spot holes with: its point cuts the cone a drill then starts in.
 pub fn check_drilling_tool(tool: &Tool) -> Result<()> {
     match tool.kind {
-        ToolKind::Drill | ToolKind::FlatEndmill => Ok(()),
-        other => {
-            invalid(format!("a drilling operation needs a drill, or a flat end mill to plunge with; tool {} is a {}", tool.number, other.label()))
-        }
+        ToolKind::Drill | ToolKind::FlatEndmill | ToolKind::Chamfer => Ok(()),
+        other => invalid(format!(
+            "a drilling operation needs a drill, a flat end mill to plunge with, or a chamfer mill to spot with; tool {} is a {}",
+            tool.number,
+            other.label()
+        )),
     }
 }
 
@@ -326,7 +329,7 @@ pub fn drill(points: &[Vec2], tool: &Tool, params: &DrillParams) -> Result<Toolp
 }
 
 /// The poses of `path` moved `h` up their tool axes.
-fn raised(path: &Toolpath5, h: f64) -> Toolpath5 {
+pub(crate) fn raised(path: &Toolpath5, h: f64) -> Toolpath5 {
     let up = |p: Pose| Pose::new(p.up(h), p.axis);
     let moves = path
         .moves

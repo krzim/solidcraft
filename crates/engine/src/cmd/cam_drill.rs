@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use solidcore_record::Vec2;
 use solidcraft_cam::drill::{Cycle, DrillParams, check_approach, drill};
-use solidcraft_cam::{Frame, Toolpath};
+use solidcraft_cam::{Frame, ToolKind, Toolpath};
 use solidcraft_geom::prelude::*;
 use solidcraft_sketch::CurveKind;
 
@@ -59,6 +59,10 @@ pub(super) fn plan(ctx: &Ctx<'_>, o: &DrillOp, frame: &Frame) -> Result<(Toolpat
         part_top: if stay_at_retract { ctx.agent.geo.top_in(frame) } else { None },
     };
     let path = drill(&points, &r.tool, &params).map_err(|e| ctx.bad(c.name, e))?;
+    if r.tool.kind == ToolKind::Chamfer {
+        // Spotting: the cone at each hole is the operation's own (the hole's chamfer).
+        ctx.band.set(Some(params.heights.top - params.heights.bottom));
+    }
     // The tool comes down to R at rapid over every hole: nothing of the part or the fixtures may
     // be above R round one (a hole in a boss drilled with the plate's heights).
     let turned;

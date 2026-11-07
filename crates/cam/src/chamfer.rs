@@ -12,6 +12,11 @@
 //! The toolpath follows the profiles' offsets one pass deep, outside a part or inside an
 //! opening as a contour does, and is checked like every 2D operation before it is returned.
 //!
+//! A chamfer the model does not show (a deburr on a sharp edge, the usual case) is part of
+//! what the operation is told to cut: [`band_gouges`] holds the cone against the part less the
+//! chamfer band, so only a cut beyond it is a gouge. The same check serves a chamfer mill
+//! tracing a line to a depth (V-engraving) and spotting holes, whose band is their depth.
+//!
 //! Here too are the operations a chamfer mill or a face mill is refused for: a chamfer mill's
 //! pointed end leaves ridges between roughing passes a diameter apart, and its tapered side
 //! cannot cut a wall along a ruling; a face mill's inserts do not cut at its centre, so it
@@ -20,8 +25,12 @@
 use serde::{Deserialize, Serialize};
 use solidcore_record::Region2;
 
+use crate::collision::{Hit, gouges};
+use crate::cutter::Cutter;
+use crate::multiaxis::{Pose, Toolpath5};
 use crate::ops::{ContourParams, Cut, Feeds, Heights, Side, contour};
 use crate::path::Toolpath;
+use crate::surface::Surface;
 use crate::tool::{Tool, ToolKind};
 use crate::{Result, invalid};
 
@@ -158,4 +167,35 @@ pub fn chamfer(regions: &[Region2], tool: &Tool, params: &ChamferParams) -> Resu
     };
     let contour_params = ContourParams { side, climb, stock_to_leave: 0.0, tolerance: params.tolerance, ramp_angle: 0.0 };
     contour(regions, &proxy, &contour_params, &cut)
+}
+
+/// The gouges of `tool`, a chamfer mill, along the cutting moves of `path` beyond the band it
+/// is told to cut, `band` mm high along its axis: its cone is held against `surface` less the
+/// band, as if it ran `band` higher (the cone's side then moves `band · sin α` out of the
+/// material, as far as a chamfer `band` high reaches into a sharp edge), so only a cut beyond
+/// the band is a gouge. With `tip_clear` (a chamfer, whose tip runs beside the wall below it)
+/// the tip is also held against `surface` where it really runs. The hits are where the tool
+/// really runs. A band of 0 is the plain check ([`gouges`]).
+pub fn band_gouges(surface: &Surface, tool: &Tool, path: &Toolpath5, band: f64, tip_clear: bool, tol: f64, step: f64) -> Result<Vec<Hit>> {
+    tool.validate()?;
+    if !(band >= 0.0) || !(band <= MAX_SIZE) {
+        return invalid("the chamfer band must be from 0 to 1000 mm");
+    }
+    let cutter = tool.cutter()?;
+    let mut hits: Vec<Hit> = gouges(surface, &cutter, &crate::drill::raised(path, band), tol, step)?
+        .into_iter()
+        .map(|h| Hit { pose: Pose::new(h.pose.up(-band), h.pose.axis), ..h })
+        .collect();
+    let tip = cutter.cone.map_or(0.0, |c| c.tip_radius);
+    if tip_clear && tip > tol {
+        for h in gouges(surface, &Cutter::flat(tip)?, path, tol, step)? {
+            match hits.iter_mut().find(|k| k.index == h.index) {
+                Some(k) if h.distance > k.distance => *k = h,
+                Some(_) => {}
+                None => hits.push(h),
+            }
+        }
+        hits.sort_by_key(|h| h.index);
+    }
+    Ok(hits)
 }

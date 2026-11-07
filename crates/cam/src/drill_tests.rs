@@ -140,7 +140,7 @@ fn to_full_diameter_takes_the_tip_deeper_by_the_point_and_a_flat_end_mill_plunge
     for kind in [ToolKind::BallEndmill, ToolKind::BullNose] {
         let t = Tool { corner_radius: Some(1.0), ..Tool::new(3, kind, 6.0, 20.0) };
         let e = drill(&[v(0.0, 0.0)], &t, &p).unwrap_err();
-        assert!(e.to_string().contains("drill, or a flat end mill"), "{e}");
+        assert!(e.to_string().contains("a drill, a flat end mill to plunge with, or a chamfer mill"), "{e}");
     }
 }
 

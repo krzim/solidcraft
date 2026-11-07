@@ -638,7 +638,7 @@ fn a_drills_point_is_gouge_checked_and_full_diameter_depth_goes_deeper_by_it() {
     assert_clean(&run(&mut drilled_plate(10.0), "cam.job", json!({"job": job, "dry_run": true})));
     job["tools"] = json!([ball(3, 6.0)]);
     let e = drilled_plate(10.0).execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
-    assert!(e.to_string().contains("drill, or a flat end mill"), "{e}");
+    assert!(e.to_string().contains("a drill, a flat end mill to plunge with, or a chamfer mill"), "{e}");
 }
 
 #[test]
@@ -1967,24 +1967,75 @@ fn a_chamfer_mill_cuts_the_modelled_chamfer_as_wide_as_asked() {
     for w in side {
         assert!((w - 1.0).abs() <= 1e-3, "the chamfer is {w} mm wide, not 1");
     }
-    // A chamfer wider than modelled cuts into the part.
-    let r = run(&mut s, "cam.job", json!({"job": chamfer_job(1.2), "dry_run": true}));
-    assert_eq!(r["passed"], false, "{r}");
-    assert!(r["operations"][1]["gouge"].as_f64().is_some_and(|g| g > 0.1), "{r}");
+    // A chamfer wider than modelled is the operation's own band: allowed.
+    assert_clean(&run(&mut s, "cam.job", json!({"job": chamfer_job(1.2), "dry_run": true})));
 }
 
 #[test]
-fn a_chamfer_the_model_does_not_show_is_a_gouge_unless_unchecked() {
+fn a_chamfer_the_model_does_not_show_is_allowed_and_a_cut_past_it_is_not() {
+    // A deburr on a sharp edge: the cone cuts the edge as deep as the chamfer band it is told
+    // to cut, which the gouge and rapid checks allow (its own retract straight up included).
     let mut s = plate(false);
-    let r = run(&mut s, "cam.job", json!({"job": chamfer_job(1.0), "dry_run": true}));
+    let r = run(&mut s, "cam.job", json!({"job": chamfer_job(1.0), "dry_run": true, "simulate": true}));
+    assert_clean(&r);
+    assert_eq!(r["operations"][1]["gouge"].as_f64(), Some(0.0), "{r}");
+    assert_eq!(r["gouge"]["skipped"], json!([]), "the chamfer is checked, not skipped: {r}");
+    // A profile 2 mm inside the edge cuts the top face beyond the band: refused, with a fix
+    // that names the profile and the operation's own keys (not `stock_to_leave`).
+    let mut job = chamfer_job(1.0);
+    job["operations"][1]["polygon"] = json!([[-13, -8], [13, -8], [13, 8], [-13, 8]]);
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
     assert_eq!(r["passed"], false, "{r}");
-    assert!(r["operations"][1]["gouge"].as_f64().is_some_and(|g| g > 0.5), "the cone cuts the sharp edge 1 mm deep: {r}");
-    assert_eq!(r["operations"][0]["gouge"].as_f64(), Some(0.0), "the face mill stays on the top: {r}");
+    assert!(r["operations"][1]["gouge"].as_f64().is_some_and(|g| g > 0.1), "{r}");
+    let dir = Dir::new("chamfer-past");
+    let e = s.execute("cam.job", &json!({"job": job, "output": dir.file("p.tap")})).unwrap_err().to_string();
+    assert!(e.contains("past the chamfer it is told to cut") && e.contains("`side`") && !e.contains("stock_to_leave"), "{e}");
+    // `gouge_check: false` still skips it.
     let mut job = chamfer_job(1.0);
     job["operations"][1]["gouge_check"] = json!(false);
     let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
     assert_clean(&r);
     assert_eq!(r["gouge"]["skipped"], json!(["deburr"]), "{r}");
+}
+
+#[test]
+fn a_chamfer_mill_engraves_a_line_and_spots_holes() {
+    // V-engraving: a contour `side: on` with a chamfer mill traces the line to its depth, the
+    // groove allowed as its own; spot drilling with it cuts the cone a drill starts in.
+    let mut s = plate(false);
+    let mut job = chamfer_job(1.0);
+    job["operations"] = json!([
+        {"name": "engrave", "type": "contour", "tool": 7, "side": "on", "polygon": [[-10, -5], [10, -5], [10, 5], [-10, 5]],
+         "heights": {"clearance": 10, "retract": 2, "top": 0, "bottom": -0.3}},
+        {"name": "spot", "type": "drill", "tool": 7, "points": [[-8, 0], [8, 0]],
+         "heights": {"clearance": 10, "retract": 2, "top": 0, "bottom": -1}}
+    ]);
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true, "simulate": true}));
+    assert_clean(&r);
+    assert_eq!(r["operations"][0]["gouge"].as_f64(), Some(0.0), "{r}");
+    assert_eq!(r["operations"][1]["gouge"].as_f64(), Some(0.0), "{r}");
+    let dir = Dir::new("engrave");
+    let out = dir.file("e.tap");
+    run(&mut s, "cam.job", json!({"job": job, "output": out}));
+    let cuts: Vec<solidcore_record::Vec3> = blocks(&out)
+        .iter()
+        .filter_map(|b| match b {
+            solidcraft_cam::gcode5::JointWords::Feed { linear, .. } => Some(*linear),
+            _ => None,
+        })
+        .collect();
+    assert!(cuts.iter().any(|p| (p.z + 0.3).abs() < 1e-6 && (p.x - 10.0).abs() < 1e-6), "the trace runs on the line at its depth");
+    assert!(cuts.iter().any(|p| (p.z + 1.0).abs() < 1e-6 && (p.x - 8.0).abs() < 1e-6), "the spot goes to its depth");
+    // Deeper than the band it is told to cut, by a trace below the face it names: refused.
+    let mut deep = job.clone();
+    deep["operations"][0]["heights"] = json!({"clearance": 10, "retract": 2, "top": -1, "bottom": -1.3});
+    let r = run(&mut s, "cam.job", json!({"job": deep, "dry_run": true}));
+    assert_eq!(r["passed"], false, "{r}");
+    // Beside the line a chamfer mill is still refused.
+    let mut beside = job.clone();
+    beside["operations"][0]["side"] = json!("outside");
+    let e = s.execute("cam.job", &json!({"job": beside, "dry_run": true})).unwrap_err().to_string();
+    assert!(e.contains("tapered"), "{e}");
 }
 
 #[test]
@@ -3602,6 +3653,51 @@ fn operation_minutes_add_up_with_their_rewinds() {
 }
 
 #[test]
+fn an_unbounded_a_winds_on_and_rewinds_are_timed_with_their_returns_home() {
+    // A machine whose A turns without end (a controller that counts on past ±360°) winds a
+    // helix on with no rewind; one limited to ±360° rewinds, and the machine time counts the
+    // trips of Z to its home that the rewinds make, so its rapids take longer.
+    let mut s = bar();
+    let dir = Dir::new("unbounded-a");
+    let mut post = run(&mut s, "cam.posts", json!({"name": "mach3"}))["post"].clone();
+    post["rewind"] = json!({"distance": 25.0, "retract_feed": 500.0, "plunge_feed": 250.0});
+    post["safe_rotate"] = json!(["G28 G91 Z0.", "G90"]);
+    let post_path = dir.file("rewind.post.json");
+    std::fs::write(&post_path, post.to_string()).unwrap();
+    let rates = json!({"rapid_xyz_mm_min": 8000, "rapid_z_mm_min": 4000, "rapid_a_deg_min": 8000, "home_z_mm": 60});
+    let job = |limits: Value| {
+        let mut j = json!({
+            "machine": "4axis_a", "post_path": post_path, "tools": [ball(3, 2.0)], "machine_rates": rates,
+            "operations": [{"name": "groove", "type": "wrap", "tool": 3, "radius": 10, "points": groove_points(3.0), "gouge_check": false}]
+        });
+        if !limits.is_null() {
+            j["a_limits_deg"] = limits;
+        }
+        j
+    };
+    let limited = run(&mut s, "cam.job", json!({"job": job(json!([-360, 360])), "dry_run": true}));
+    let free = run(&mut s, "cam.job", json!({"job": job(Value::Null), "dry_run": true}));
+    assert_eq!(limited["passed"], true, "{limited}");
+    assert_eq!(free["passed"], true, "{free}");
+    assert_eq!(limited["operations"][0]["rewinds"], 1, "{limited}");
+    assert_eq!(free["operations"][0]["rewinds"], 0, "{free}");
+    let homes = |r: &Value| r["machine_time"]["home_returns"].as_u64().unwrap();
+    assert_eq!(homes(&limited), homes(&free) + 1, "the rewind's return home is timed: {limited}");
+    let rapid = |r: &Value| r["machine_time"]["rapid_minutes"].as_f64().unwrap();
+    assert!(rapid(&limited) > rapid(&free) + 50.0 / 4000.0, "{} against {}", rapid(&limited), rapid(&free));
+    // The A range as written: within ±360° rewound, wound on past it without limits.
+    let range = |s: &mut Session, limits: Value, name: &str| {
+        let out = dir.file(name);
+        run(s, "cam.job", json!({"job": job(limits), "output": out}));
+        let c = run(s, "cam.check", json!({"path": out}));
+        let r = &c["rotary_ranges"][0];
+        r["max_deg"].as_f64().unwrap().max(-r["min_deg"].as_f64().unwrap())
+    };
+    assert!(range(&mut s, json!([-360, 360]), "limited.tap") <= 360.0 + 1e-6);
+    assert!(range(&mut s, Value::Null, "free.tap") > 720.0);
+}
+
+#[test]
 fn an_operation_without_the_gouge_check_is_still_checked_against_the_fixtures() {
     let mut s = bar();
     // A clamp over the top of the bar where an engraving runs along it.
@@ -4465,8 +4561,11 @@ fn a_suggested_job_passes_its_checks_on_a_plate_and_a_bar() {
     assert_eq!(names.first(), Some(&"face top"), "{sug}");
     assert_eq!(names.last(), Some(&"profile profile:0"), "the profile is cut last: {sug}");
     assert!(names.contains(&"rough pocket:0") && names.contains(&"finish pocket:0 walls"), "{sug}");
-    assert_eq!(names.iter().filter(|n| n.starts_with("mill hole:")).count(), 4, "{sug}");
-    assert!(ops.iter().all(|o| o["type"] == "pocket" || o["type"] == "contour"), "{sug}");
+    assert_eq!(names.iter().filter(|n| n.starts_with("mill hole:")).count(), 4, "no drill in the tools: {sug}");
+    let types: Vec<&str> = ops.iter().map(|o| o["type"].as_str().unwrap()).collect();
+    assert_eq!(types.first(), Some(&"face"), "{sug}");
+    assert!(types.iter().all(|t| ["face", "adaptive", "pocket", "contour"].contains(t)), "{sug}");
+    assert_eq!(ops.iter().find(|o| o["name"] == "rough pocket:0").unwrap()["type"], "adaptive", "{sug}");
     // Tools by size: the 6 mm tool fits the 4 mm corners, the holes take 4 and 2 mm tools.
     let tool_of = |name: &str| ops.iter().find(|o| o["name"] == name).unwrap()["tool"].as_u64().unwrap();
     assert_eq!((tool_of("rough pocket:0"), tool_of("finish pocket:0 walls"), tool_of("profile profile:0")), (6, 6, 6), "{sug}");
@@ -4503,6 +4602,58 @@ fn a_suggested_job_passes_its_checks_on_a_plate_and_a_bar() {
     let sug = run(&mut round, "cam.suggest", json!({"tools": feature_tools(), "axis": "a", "check": true}));
     assert_eq!(sug["dry_run"]["passed"], true, "{sug}");
     assert!(sug["operations"].as_array().unwrap().iter().any(|o| o["type"] == "rotary_finish"), "{sug}");
+}
+
+#[test]
+fn a_suggestion_reads_the_jobs_profile_and_picks_carbide_drills_faces_adaptive_and_chamfers() {
+    // The plate, its outer top edges chamfered 1 mm, and a machine profile as cam.job reads it
+    // (default feeds and heights, a tool library beside it): the suggestion names the profile,
+    // faces with the face mill, clears the pocket adaptively with the carbide end mill (not the
+    // HSS one of the same size), drills the 6 mm through holes with the 6 mm drill to its full
+    // diameter, chamfers the outline with the chamfer mill, and passes its own dry run.
+    let mut s = feature_plate();
+    run(&mut s, "solid.chamfer", json!({"edges": [[0, -30, 0], [40, 0, 0], [0, 30, 0], [-40, 0, 0]], "distance": 1, "tangent_chain": false}));
+    let dir = Dir::new("suggest-profile");
+    let mut hss = flat(5, 6.0);
+    hss["description"] = json!("6mm 4F HSS-TiN");
+    let mut carbide = flat(6, 6.0);
+    carbide["description"] = json!("6mm 3F Al carbide");
+    let mut drill = drill_tool(160, 6.0);
+    drill["description"] = json!("6mm cobalt drill");
+    let face = json!({"number": 32, "kind": "face_mill", "diameter": 32, "corner_radius": 0.4, "flute_length": 10, "flutes": 4,
+                      "spindle_rpm": 18000, "feed": 2000, "plunge_feed": 300});
+    let library = json!([face, hss, carbide, flat(4, 4.0), flat(2, 2.0), drill, chamfer_mill(30), ball(12, 4.0)]);
+    std::fs::write(dir.file("lib.json"), library.to_string()).unwrap();
+    let profile = dir.file("mill.profile.json");
+    let file = json!({
+        "name": "a test mill", "machine": "3axis", "post": "mach3_4axis", "tool_library_paths": ["lib.json"], "work_offset": 1,
+        "tolerance": 0.01, "default_heights": {"clearance_above": 10, "retract_above": 2},
+        "default_feeds": {"max_cut": 7998, "max_plunge": 4000, "spindle_rpm_range": [5000, 24000]}
+    });
+    std::fs::write(&profile, file.to_string()).unwrap();
+    let sug = run(&mut s, "cam.suggest", json!({"profile_path": profile, "material": "aluminium", "check": true}));
+    let job = &sug["job"];
+    assert_eq!(job["profile_path"], json!(profile), "the job names the profile: {job}");
+    assert!(job.get("machine").is_none() && job.get("post").is_none(), "the profile gives them: {job}");
+    let ops = job["operations"].as_array().unwrap();
+    let of = |t: &'static str| ops.iter().filter(move |o| o["type"] == t);
+    assert_eq!(ops[0]["type"], "face", "{job}");
+    assert_eq!(ops[0]["tool"], 32, "{job}");
+    let clear = of("adaptive").find(|o| o["feature"] == "pocket:0").unwrap_or_else(|| panic!("{job}"));
+    assert_eq!(clear["tool"], 6, "carbide before HSS: {job}");
+    let drills: Vec<&Value> = of("drill").collect();
+    assert_eq!(drills.len(), 1, "{job}");
+    assert_eq!((drills[0]["tool"].as_u64(), drills[0]["to_full_diameter"].as_bool()), (Some(160), Some(true)), "{job}");
+    assert_eq!(drills[0]["points"].as_array().unwrap().len(), 2, "the two 6 mm through holes: {job}");
+    assert_eq!(ops.iter().filter(|o| o["name"].as_str().unwrap().starts_with("mill hole:")).count(), 2, "the blind 4 mm holes: {job}");
+    let chamfer = of("chamfer").next().unwrap_or_else(|| panic!("{sug}"));
+    assert_eq!((chamfer["tool"].as_u64(), chamfer["side"].as_str()), (Some(30), Some("outside")), "{job}");
+    assert!(chamfer["width"].as_f64().is_some_and(|w| (w - 1.0).abs() < 1e-6), "{job}");
+    assert!(!sug["assumptions"].to_string().contains("no drilling operation"), "{sug}");
+    assert_eq!(sug["dry_run"]["passed"], true, "{sug}");
+    // The owner-style profile with keys only cam.job knows was refused before (`default_feeds`).
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_clean(&r);
 }
 
 #[test]
@@ -4708,9 +4859,15 @@ fn a_hole_left_out_says_what_tool_to_add_not_an_operation_that_is_not_there() {
     let mut s = feature_plate();
     let drill = json!({"number": 60, "kind": "drill", "diameter": 6, "flute_length": 30, "spindle_rpm": 3000, "feed": 300});
     let sug = run(&mut s, "cam.suggest", json!({"tools": [flat(6, 6.0), drill]}));
-    let why = sug["skipped"].as_array().unwrap().iter().filter_map(Value::as_str).find(|x| x.starts_with("hole:0 ")).unwrap_or_default().to_string();
-    assert!(why.contains("(4.8 mm)") && why.contains("\"feature\": \"hole:0\""), "{sug}");
-    assert!(why.contains("no drilling operation") && !why.contains("drill it with"), "{why}");
+    // The 6 mm through holes are drilled with the 6 mm drill, to its full diameter.
+    let ops = sug["job"]["operations"].as_array().unwrap();
+    let drilled = ops.iter().find(|o| o["type"] == "drill").unwrap_or_else(|| panic!("{sug}"));
+    assert_eq!((drilled["tool"].as_u64(), drilled["to_full_diameter"].as_bool()), (Some(60), Some(true)), "{sug}");
+    assert!(drilled["name"].as_str().unwrap().contains("hole:0"), "{sug}");
+    // The blind 4 mm holes match no drill and no end mill fits: skipped, saying what to add.
+    let why = sug["skipped"].as_array().unwrap().iter().filter_map(Value::as_str).find(|x| x.starts_with("hole:2 ")).unwrap_or_default().to_string();
+    assert!(why.contains("(3.2 mm)") && why.contains("\"feature\": \"hole:2\"") && why.contains("no drill of its diameter"), "{sug}");
+    assert!(!why.contains("no drilling operation"), "{why}");
 }
 
 /// Whether two colours are within `within` of each other in every channel.

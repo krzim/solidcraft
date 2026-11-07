@@ -30,8 +30,8 @@ use solidcraft_cam::rotary::{RotaryParams, RotaryPattern, RotaryRoughingParams, 
 use solidcraft_cam::surface_ops::{Boundary, ParallelParams, RoughingParams, WaterlineParams, parallel, roughing, waterline};
 use solidcraft_cam::{
     CamError, Compaction, ContourParams, Cut, DEFAULT_DESCENT_LIMIT, DEFAULT_MAX_ANGLE_STEP, Feeds, Frame, Heights, HolderSection, LineNumbers, Move,
-    Operation5, PocketParams, SafeRetract, Side, Strategy, Surface, Tool, ToolKind, Toolpath, Toolpath5, compact, contour_with, lift_entries,
-    limit_descents, pocket_with,
+    Operation5, PocketParams, SafeRetract, Side, Strategy, Surface, Tool, ToolKind, Toolpath, Toolpath5, band_gouges, compact, contour_with,
+    lift_entries, limit_descents, pocket_with,
 };
 use solidcraft_geom::Mesh;
 use solidcraft_geom::prelude::*;
@@ -67,7 +67,7 @@ pub static COMMANDS: &[CommandSpec] = &[
              rapid may pass through it), tools: [Tool JSON] | tool_library_path | tool_library_paths (+ tool_library to pick one), \
              machine_rates?: {rapid_xyz_mm_min, rapid_z_mm_min?, \
              rapid_a_deg_min?, max_feed_mm_min?, max_feed_z_mm_min?, max_a_deg_min?, spindle_rpm?: [min, max], spindle_start_seconds?, \
-             travel_mm?: [x, y, z]} | machine_rates_path (the machine's top rates: times the program as it runs and warns about blocks \
+             travel_mm?: [x, y, z], home_z_mm?} | machine_rates_path (the machine's top rates: times the program as it runs and warns about blocks \
              the controller slows), operations: [{name, type: contour | pocket | parallel | \
              roughing | waterline | scallop | steep_shallow | pencil | rest_finish | drill | chamfer {heights: {clearance, retract, top}, \
              width, tip_offset?, side?} | indexed {a_deg, operation, name?} | indexed_pattern {a_deg: [..] | count, start_deg?, operation} | \
@@ -85,7 +85,7 @@ pub static COMMANDS: &[CommandSpec] = &[
              operations: [{name, kind, tool, moves, cut_length, cut_minutes (rewinds' feeds included), rewinds, max_tilt_deg, \
              a_deg?, gouge, gouge_at?, holder_collisions, \
              warnings}], program_lines, program_head, readback: {max_tip_deviation, max_axis_deviation_deg, allowed_tip, allowed_axis_deg, \
-             cut_minutes, pass}, cut_minutes, rapid_minutes?, machine_time?: {cut_minutes, written_cut_minutes, rapid_minutes, \
+             cut_minutes, pass}, cut_minutes, rapid_minutes?, machine_time?: {cut_minutes, written_cut_minutes, rapid_minutes, home_returns, \
              spindle_minutes, total_minutes, slowed_blocks, rotary_over, feed_over, peak_rotary_deg_min?, peak_feed_mm_min?, \
              spindle_out_of_range, span_mm, warnings}, gouge: {worst, tolerance, tessellation, allowed, hits, at?: {operation, move_index, line?, \
              xyz}, skipped, pass}, holder_collisions, rapids: \
@@ -759,6 +759,7 @@ impl<'a> Shared<'a> {
     {
         Ctx {
             adaptive: Default::default(),
+            band: Default::default(),
             rest: None,
             cmd: self.cmd,
             s: self.s,
@@ -792,6 +793,9 @@ struct Resolved {
 struct Ctx<'a> {
     /// What an adaptive operation adds to its report, handed from its planning to the report.
     adaptive: std::cell::RefCell<Option<(crate::schema::cam_adaptive::AdaptiveReport, Vec<String>)>>,
+    /// The band a chamfer mill is told to cut into what the model shows (a chamfer, a V-trace,
+    /// a spotted hole), handed from its planning to [`Planned::band`].
+    band: std::cell::Cell<Option<f64>>,
     /// For an operation with `rest_from`: what the earlier operations it names left of the
     /// stock, in work coordinates, and how many they were.
     rest: Option<(std::sync::Arc<solidcraft_cam::adaptive::HeightMap>, usize)>,
@@ -1047,6 +1051,10 @@ fn plan3_raw(ctx: &Ctx<'_>, op: &Op3Spec, frame: &Frame, surface: &Surface) -> R
                 tolerance: tol,
                 ramp_angle: ctx.degrees(c.name, o.ramp_angle_deg.unwrap_or(0.0), "`ramp_angle_deg`")?,
             };
+            if r.tool.kind == ToolKind::Chamfer {
+                // A V-trace: the groove down to its depth is its own.
+                ctx.band.set(Some(h.top - h.bottom));
+            }
             let opts = leads::contour_options(ctx, c.name, o, &r.tool)?;
             let above = leads::clear_above(surface, &r.tool);
             let path = contour_with(&regions, &r.tool, &params, &opts, &cut, &above)
@@ -1256,6 +1264,11 @@ struct Planned {
     tool: Tool,
     feeds: Feeds,
     gouge_check: bool,
+    /// How far up its axis a chamfer mill's cut is its own (mm): the chamfer, the V-trace or the
+    /// spotted hole it is told to cut, which the model need not show. Its gouge check holds the
+    /// cone against the part less that band ([`band_gouges`]), and the rapid check lets it
+    /// retract straight up through it.
+    band: Option<f64>,
     report: OperationReport,
     axes: String,
 }
@@ -1391,7 +1404,9 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             turned = ctx.part.in_frame(&frame).map_err(|e| ctx.bad(c.name, e))?;
             &turned
         };
+        ctx.band.set(None);
         let (path, r, kind) = plan3(ctx, op3, &frame, surface)?;
+        let band = ctx.band.take();
         let stats = path.stats();
         let io = IndexedOperation { name: c.name.into(), tool: r.tool.clone(), spindle_rpm: r.rpm, coolant: c.coolant, rotary, path };
         let (poses, sources) = io.poses_mapped(machine, arc_tol).map_err(|e| ctx.bad(c.name, e))?;
@@ -1415,7 +1430,17 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             Some(a) => format!("3+1 A{}°", num(a)),
             None => "3-axis".into(),
         };
-        Ok(Planned { op: MachineOperation::Indexed(io), poses, sources, feeds: r.feeds, tool: r.tool, gouge_check: c.gouge_check, report, axes })
+        Ok(Planned {
+            op: MachineOperation::Indexed(io),
+            poses,
+            sources,
+            feeds: r.feeds,
+            tool: r.tool,
+            gouge_check: c.gouge_check,
+            band,
+            report,
+            axes,
+        })
     };
     let continuous = |c: Common<'_>, r: Resolved, kind: &str, path: Toolpath5| -> Planned {
         let stats = path.stats();
@@ -1445,12 +1470,16 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             feeds: r.feeds,
             tool: r.tool,
             gouge_check: c.gouge_check,
+            band: None,
             report,
             axes: "4-axis".into(),
         }
     };
     match spec {
-        OperationSpec::Adaptive(o) => indexed(&Op3Spec::Adaptive(o.clone()), vec![0.0; rotaries], None),
+        OperationSpec::Adaptive(o) => match features::op_index(ctx, &o.name, o.feature.as_deref())? {
+            Some((rotary, a)) => indexed(&Op3Spec::Adaptive(o.clone()), rotary, Some(a)),
+            None => indexed(&Op3Spec::Adaptive(o.clone()), vec![0.0; rotaries], None),
+        },
         OperationSpec::AdaptiveRoughing(o) => indexed(&Op3Spec::AdaptiveRoughing(o.clone()), vec![0.0; rotaries], None),
         OperationSpec::Contour(o) => match features::op_index(ctx, &o.name, o.feature.as_deref())? {
             Some((rotary, a)) => indexed(&Op3Spec::Contour(o.clone()), rotary, Some(a)),
@@ -1885,10 +1914,15 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         let op = p.report.name.clone();
         // The moves of the operation's own toolpath hits are along.
         let moves_of = |hits: &[Hit]| hits.iter().filter_map(|h| p.sources.get(h.index)).collect::<BTreeSet<_>>().len();
+        // A drill is checked as its own shape, point and all; a chamfer mill less the band it
+        // is told to cut (its tip, beside the wall, as it runs for a chamfer).
+        let tip_clear = p.report.kind.ends_with("chamfer");
+        let check = |s: &Surface| match p.band {
+            Some(band) => band_gouges(s, &p.tool, &p.poses, band, tip_clear, allowed, step),
+            None => tool_gouges(s, &p.tool, &p.poses, allowed, step),
+        };
         if p.gouge_check {
-            // A drill is checked as its own shape, point and all.
-            let hits = tool_gouges(&surfaces.all, &p.tool, &p.poses, allowed, step)
-                .map_err(|e| cam_err(cmd, &format!("operation `{op}`: gouge check"), e))?;
+            let hits = check(&surfaces.all).map_err(|e| cam_err(cmd, &format!("operation `{op}`: gouge check"), e))?;
             pictures::note_problems(&mut p.report, "gouge", &hits);
             let moves = moves_of(&hits);
             if let Some(worst) = hits.iter().max_by(|a, b| a.distance.total_cmp(&b.distance)) {
@@ -1916,7 +1950,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
                     gouge.at = Some(GougeAt { operation: op.clone(), ..at.clone() });
                 }
                 p.report.gouge_at = Some(at);
-                let on_part = !has_fixtures || !matches!(tool_gouges(&surfaces.part, &p.tool, &p.poses, allowed, step), Ok(h) if h.is_empty());
+                let on_part = !has_fixtures || !matches!(check(&surfaces.part), Ok(h) if h.is_empty());
                 details.push(agent.gouge_refusal(i, p, &hits, on_part, &text, &machine));
             }
             gouge.hits += moves;
@@ -1971,11 +2005,11 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         cam_stock::check_below_stock(&planned, st, agent.geo.fixture_low(), &machine, tol, &mut failures);
     }
     // Every rapid of the program as written, and every position against the machine's travel.
-    let unchecked: Vec<bool> = planned.iter().map(|p| !p.gouge_check).collect();
+    let unchecked: Vec<bool> = planned.iter().map(|p| !p.gouge_check || p.band.is_some()).collect();
     let (rapids, travel) =
         cam_stock::check_motion(cmd, job, &text, &program, &post, &machine, &surfaces, stock.as_ref(), &unchecked, tol, &mut failures)?;
     let simulation = if params.simulate.unwrap_or(false) {
-        let deliberate = planned.iter().any(|p| !p.gouge_check);
+        let deliberate = planned.iter().any(|p| !p.gouge_check || p.band.is_some());
         // A thread mill cuts in the simulation as the core its operation's gouge check took.
         let cores: Vec<Tool> = planned
             .iter()

@@ -53,6 +53,11 @@ pub struct MachineRatesSpec {
     /// How long a tool change (`M6`) takes, seconds: the simulation view's timeline waits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_change_seconds: Option<f64>,
+    /// Where Z's home is, mm in work coordinates: a return home (`G28 … Z`, before a tool change
+    /// or in a rewind of the A axis) is timed up there and back down. Default: the highest Z the
+    /// program reaches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_z_mm: Option<f64>,
 }
 
 /// A spindle speed outside the machine's range.
@@ -71,9 +76,11 @@ pub struct MachineTimeReport {
     pub cut_minutes: f64,
     /// Time at feed as written (the `F` words alone), dwells included, minutes.
     pub written_cut_minutes: f64,
-    /// Time at rapid, each move as long as its slowest axis takes, minutes. Moves to and from
-    /// the machine's home (`G28`) are not timed.
+    /// Time at rapid, each move as long as its slowest axis takes, minutes: the returns of Z to
+    /// its home (`G28`) included, up to `home_z_mm` and back down.
     pub rapid_minutes: f64,
+    /// Returns of Z to its home timed among the rapids (tool changes and rewinds).
+    pub home_returns: usize,
     /// Time waiting for the spindle to start, minutes.
     pub spindle_minutes: f64,
     /// All of it, minutes (acceleration left out).

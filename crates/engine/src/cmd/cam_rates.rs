@@ -40,6 +40,7 @@ pub(super) fn rates_of(cmd: &str, job: &CamJob, base: Option<&Path>) -> Result<O
         accel_z_mm_s2: spec.accel_z_mm_s2,
         accel_a_deg_s2: spec.accel_a_deg_s2,
         tool_change_seconds: spec.tool_change_seconds,
+        home_z_mm: spec.home_z_mm,
     };
     rates.validate().map_err(|e| cam_err(cmd, "`machine_rates`", e))?;
     Ok(Some(rates))
@@ -54,6 +55,7 @@ pub(super) fn time_report(cmd: &str, text: &str, machine: &Machine, post: &Post5
         written_cut_minutes: t.written_cut_minutes,
         rapid_minutes: t.rapid_minutes,
         spindle_minutes: t.spindle_minutes,
+        home_returns: t.home_returns,
         total_minutes: t.total_minutes,
         slowed_blocks: t.slowed_blocks,
         rotary_over: t.rotary_over,
