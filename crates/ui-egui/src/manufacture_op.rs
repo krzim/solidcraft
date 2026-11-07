@@ -486,8 +486,20 @@ fn op_form(app: &mut SolveApp, ui: &mut Ui, i: usize) {
         // With picks, the other ways of giving the geometry are shown only when the job gives them.
         let picked = inner.get("picks").is_some();
         let alternative = |f: &Field| {
-            matches!(f.key, "sketch" | "profiles" | "polygon" | "feature" | "curve" | "points" | "holes" | "centers" | "circles" | "sketch_points")
-                && at(&inner, f.key).is_none()
+            matches!(
+                f.key,
+                "sketch"
+                    | "profiles"
+                    | "polygon"
+                    | "feature"
+                    | "curve"
+                    | "points"
+                    | "holes"
+                    | "centers"
+                    | "circles"
+                    | "sketch_points"
+                    | "diameter_range"
+            ) && at(&inner, f.key).is_none()
         };
         for f in here.iter().filter(|f| !matches!(f.kind, Kind::Picks | Kind::ToolList) && !(picked && alternative(f))) {
             field_row(app, ui, i, f, &inner, defaults.as_ref());
@@ -841,13 +853,13 @@ fn features_params(app: &SolveApp) -> Option<Value> {
 }
 
 /// One row of *Found in the part*: its feature ids, words, and the faces it selects.
-struct FoundRow {
-    id: String,
-    label: String,
-    faces: Vec<(String, u64)>,
+pub(crate) struct FoundRow {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) faces: Vec<(String, u64)>,
 }
 
-fn found_rows_of(r: &Value) -> Vec<(&'static str, Vec<FoundRow>)> {
+pub(crate) fn found_rows_of(r: &Value) -> Vec<(&'static str, Vec<FoundRow>)> {
     let list = |k: &str| r.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
     let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).map_or_else(|| "?".into(), num);
     let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
@@ -867,10 +879,14 @@ fn found_rows_of(r: &Value) -> Vec<(&'static str, Vec<FoundRow>)> {
         .map(|g| {
             let ids: Vec<String> =
                 g.get("ids").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
-            let depth =
-                if g.get("through").and_then(Value::as_bool) == Some(true) { "through".to_string() } else { format!("{} deep", n(g, "depth")) };
+            let (count, diameter) = (n(g, "count"), n(g, "diameter"));
+            let words = if g.get("through").and_then(Value::as_bool) == Some(true) {
+                crate::i18n::format("ui.manufacture.found_hole_through", &[("count", &count), ("diameter", &diameter)])
+            } else {
+                crate::i18n::format("ui.manufacture.found_hole_deep", &[("count", &count), ("diameter", &diameter), ("depth", &n(g, "depth"))])
+            };
             let faces = holes.iter().filter(|h| ids.contains(&s(h, "id"))).flat_map(&faces_of).collect();
-            FoundRow { id: ids.join(","), label: format!("{} \u{d7} {} mm {depth}{}", n(g, "count"), n(g, "diameter"), side(g)), faces }
+            FoundRow { id: ids.join(","), label: format!("{words}{}", side(g)), faces }
         })
         .collect();
     out.push(("holes", groups));
@@ -881,7 +897,8 @@ fn found_rows_of(r: &Value) -> Vec<(&'static str, Vec<FoundRow>)> {
             let w = b[1][0].as_f64().unwrap_or(0.0) - b[0][0].as_f64().unwrap_or(0.0);
             let h = b[1][1].as_f64().unwrap_or(0.0) - b[0][1].as_f64().unwrap_or(0.0);
             let corner = p.get("min_corner_radius").and_then(Value::as_f64).filter(|r| *r > 0.0).map_or(String::new(), |r| format!(", R{}", num(r)));
-            FoundRow { id: s(p, "id"), label: format!("{} \u{d7} {}, {} deep{corner}{}", num(w), num(h), n(p, "depth"), side(p)), faces: faces_of(p) }
+            let words = crate::i18n::format("ui.manufacture.found_pocket_row", &[("width", &num(w)), ("length", &num(h)), ("depth", &n(p, "depth"))]);
+            FoundRow { id: s(p, "id"), label: format!("{words}{corner}{}", side(p)), faces: faces_of(p) }
         })
         .collect();
     out.push(("pockets", pockets));
@@ -918,7 +935,8 @@ fn found_rows_of(r: &Value) -> Vec<(&'static str, Vec<FoundRow>)> {
         .iter()
         .map(|x| FoundRow {
             id: s(x, "id"),
-            label: format!("\u{2300}{} X {} \u{2013} {}", n(x, "diameter"), n(x, "x_min"), n(x, "x_max")),
+            // Ø (U+00D8): the diameter sign U+2300 has no glyph in the interface's faces.
+            label: format!("\u{d8}{} X {} \u{2013} {}", n(x, "diameter"), n(x, "x_min"), n(x, "x_max")),
             faces: faces_of(x),
         })
         .collect();
@@ -1043,7 +1061,10 @@ pub(crate) fn zero_rows(app: &mut SolveApp, ui: &mut Ui) {
     }
     // On the stock: X and Y low, middle or high, Z top, middle or bottom.
     if job.get("stock").is_some() {
-        let grid = job.get("origin_from").and_then(|o| o.get("stock")).cloned().unwrap_or(json!({"x": "low", "y": "low", "z": "top"}));
+        // A bar turns about the A axis through work zero: its place starts on the axis.
+        let bar = job.get("stock").and_then(|s| s.get("cylinder")).is_some();
+        let start = if bar { json!({"x": "low", "y": "middle", "z": "middle"}) } else { json!({"x": "low", "y": "low", "z": "top"}) };
+        let grid = job.get("origin_from").and_then(|o| o.get("stock")).cloned().unwrap_or(start);
         let mut place = [0usize; 3];
         let words: [&[&str]; 3] = [&["low", "middle", "high"], &["low", "middle", "high"], &["top", "middle", "bottom"]];
         for (k, axis) in ["x", "y", "z"].iter().enumerate() {

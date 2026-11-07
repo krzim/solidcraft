@@ -249,10 +249,14 @@ fn defaults(s: &mut Session, p: &Value) -> Result<Value> {
             Ok(())
         };
         if let Err(e) = run() {
-            reply.refused = Some(e.to_string().split("\n").take(4).collect::<Vec<_>>().join(" "));
+            reply.refused = Some(refusal_words(&e));
         }
     }
-    // An operation on a feature: the clearance and retract worked out above it.
+    // The heights the picks give, where the job does not give them.
+    let resolved = resolved_op(cmd, s, &merged, base.as_deref(), &op);
+    let picked = |k: &str| resolved.as_ref().and_then(|r| at(r, &format!("heights.{k}"))).is_some_and(|v| !v.is_null());
+    // An operation on a feature: the clearance and retract worked out above it (unless its picks
+    // give them: those are what it runs with).
     if !planned_values.contains_key("heights.clearance")
         && let (Some(set), Some(id)) = (set, ids.first())
         && let Ok(g) = set.get(id)
@@ -263,12 +267,13 @@ fn defaults(s: &mut Session, p: &Value) -> Result<Value> {
             ("clearance", h.clearance, "10 mm above the material, 5 above the retract height, clear of the fixtures"),
             ("retract", h.retract, "3 mm above the material"),
         ] {
+            if picked(k) {
+                continue;
+            }
             planned_values.insert(format!("heights.{k}"), json!(super::round(v, 1e4)));
             sources.insert(format!("heights.{k}"), json!(["model", why]));
         }
     }
-    // The heights the picks give, where the job does not give them.
-    let resolved = resolved_op(cmd, s, &merged, base.as_deref(), &op);
 
     for (path, description) in paths_of(&ty) {
         let given = at(&inner, &path).cloned();
@@ -301,6 +306,19 @@ fn defaults(s: &mut Session, p: &Value) -> Result<Value> {
         reply.fields.push(field);
     }
     to_value(reply)
+}
+
+/// Why planning refused, in words for the form: each refused operation's error, without the
+/// wrapping an agent reads (the command, the count, the fix for a call, the `refusals` list).
+fn refusal_words(e: &EngineError) -> String {
+    let text = match e {
+        EngineError::BadParams { msg, .. } => msg.clone(),
+        other => other.to_string(),
+    };
+    let tag = crate::schema::cam_agent::REFUSALS_TAG;
+    let listed = text.find(tag).and_then(|at| text.get(at + tag.len()..)).and_then(|t| serde_json::from_str::<Vec<Value>>(t).ok());
+    let errors: Vec<String> = listed.iter().flatten().filter_map(|r| r.get("error").and_then(Value::as_str)).map(str::to_string).collect();
+    if errors.is_empty() { text.lines().take(4).collect::<Vec<_>>().join(" ") } else { errors.join("; ") }
 }
 
 /// The value a rule states outright ("true", "false", a number), when it does.

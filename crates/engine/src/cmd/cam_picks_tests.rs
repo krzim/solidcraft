@@ -415,7 +415,7 @@ fn light_load_clearing_on_an_open_step_says_to_clear_it_as_a_pocket() {
         ff["faces"].as_array().unwrap().iter().find(|f| f["role"] == "step").unwrap_or_else(|| panic!("{ff}"))["id"].as_str().unwrap().to_string();
     run(&mut s, "cam.op.add", json!({"op": {"type": "adaptive", "tool": 4}, "picks": ff["picks"][&step]}));
     let e = s.execute("cam.job", &json!({"dry_run": true})).unwrap_err().to_string();
-    assert!(e.contains("open on some sides") && e.contains("Clear Pocket"), "{e}");
+    assert!(e.contains("open on some sides") && e.contains("Clear Pocket") && e.contains("material along them"), "{e}");
     // Clear Pocket on it plans.
     run(&mut s, "cam.op.remove", json!({"op": 0}));
     run(&mut s, "cam.op.add", json!({"op": {"type": "pocket", "tool": 4}, "picks": ff["picks"][&step]}));
@@ -461,4 +461,129 @@ fn a_radial_hole_opening_on_the_bar_is_drilled_on_its_side() {
     assert!((f(&ext[0][0]) - 12.0).abs() < 1e-6 && (f(&ext[1][0]) - 12.0).abs() < 1e-6, "{ext}");
     // In work coordinates: down its axis to its floor, 8 mm off the bar's axis.
     assert!((f(&ext[0][1]).hypot(f(&ext[0][2])) - 8.0).abs() < 1e-6, "down to its floor 8 mm off the axis: {ext}");
+}
+
+/// The holes of `cam.features` as picks, all of them.
+fn all_hole_picks(s: &mut Session) -> Vec<Value> {
+    let ff = run(s, "cam.features", json!({"picks": true}));
+    let mut picks = Vec::new();
+    for h in ff["holes"].as_array().unwrap() {
+        picks.extend(ff["picks"][h["id"].as_str().unwrap()].as_array().unwrap().iter().cloned());
+    }
+    picks
+}
+
+#[test]
+fn holes_of_different_depths_or_sizes_are_not_drilled_as_one() {
+    // A blind 5 mm hole 6 deep beside the through one: one drilling would take both through.
+    let mut s = block();
+    run(&mut s, "solid.cylinder", json!({"radius": 2.5, "height": 6, "base": [-14, 8, 14], "axis": "Z", "operation": "cut"}));
+    open_job(&mut s);
+    let picks = all_hole_picks(&mut s);
+    assert_eq!(picks.len(), 2);
+    for ty in ["drill", "bore"] {
+        run(&mut s, "cam.op.add", json!({"op": {"type": ty, "tool": if ty == "drill" { 150 } else { 4 }}, "picks": picks}));
+        let e = s.execute("cam.job", &json!({"dry_run": true})).unwrap_err().to_string();
+        assert!(e.contains("different depths") && e.contains("one operation each"), "{ty}: {e}");
+        // The form says why in words, without the agent's wrapping.
+        let d = run(&mut s, "cam.op.defaults", json!({"op": 0}));
+        let why = d["refused"].as_str().unwrap_or_default().to_string();
+        assert!(why.starts_with("the holes go to different depths"), "{why}");
+        assert!(!why.contains("refusals") && !why.contains("invalid parameters") && !why.contains("Nothing was written"), "{why}");
+        run(&mut s, "cam.op.remove", json!({"op": 0}));
+    }
+    // A 6 mm hole through beside the 5 mm one: one drill would leave it 5 mm. Boring takes each
+    // its own size.
+    let mut s = block();
+    run(&mut s, "solid.cylinder", json!({"radius": 3, "height": 20, "base": [-14, 8, 0], "axis": "Z", "operation": "cut"}));
+    open_job(&mut s);
+    let picks = all_hole_picks(&mut s);
+    run(&mut s, "cam.op.add", json!({"op": {"type": "drill", "tool": 150}, "picks": picks}));
+    let e = s.execute("cam.job", &json!({"dry_run": true})).unwrap_err().to_string();
+    assert!(e.contains("different sizes") && e.contains("Mill Round Holes, which takes each hole's own size"), "{e}");
+    run(&mut s, "cam.op.remove", json!({"op": 0}));
+    run(&mut s, "cam.op.add", json!({"op": {"type": "bore", "tool": 4}, "picks": picks}));
+    let r = s.execute("cam.job", &json!({"dry_run": true}));
+    assert!(r.is_ok(), "boring takes each hole's own size: {r:?}");
+}
+
+#[test]
+fn an_operation_turned_off_does_not_need_its_picks() {
+    let mut s = block();
+    open_job(&mut s);
+    let floor = feature_picks(&mut s, "pocket:0");
+    run(&mut s, "cam.op.add", json!({"op": {"type": "pocket", "tool": 4, "name": "gone"}, "picks": floor}));
+    run(&mut s, "cam.op.add", json!({"op": {"type": "face", "tool": 4, "top": 20.5, "bottom": 20, "name": "top"}}));
+    // The hole and the pocket undone: the pocket's floor is lost. Turned off, it stops nothing.
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "cam.op.enable", json!({"op": "gone", "enabled": false}));
+    let g = run(&mut s, "cam.generate", json!({}));
+    assert!(g["findings"].as_array().unwrap().iter().all(|x| x["check"] != "picks"), "{g}");
+    assert_eq!(g["passed"], true, "{g}");
+    // Turned on again, it refuses as before.
+    run(&mut s, "cam.op.enable", json!({"op": "gone", "enabled": true}));
+    let g = run(&mut s, "cam.generate", json!({}));
+    assert!(g["findings"].as_array().unwrap().iter().any(|x| x["check"] == "picks" && x["severity"] == "error"), "{g}");
+}
+
+#[test]
+fn the_form_shows_the_heights_the_picks_give() {
+    let mut s = block();
+    open_job(&mut s);
+    let wall = feature_picks(&mut s, "hole:0");
+    run(&mut s, "cam.op.add", json!({"op": {"type": "drill", "tool": 150}, "picks": wall}));
+    let d = run(&mut s, "cam.op.defaults", json!({"op": 0}));
+    let r = dry(&mut s);
+    let field = |p: &str| d["fields"].as_array().unwrap().iter().find(|x| x["path"] == p).unwrap_or_else(|| panic!("no {p}: {d}")).clone();
+    // The drill's moves: down from its retract height, which the form says.
+    let top = f(&r["operations"][0]["extents"]["all"][1][2]);
+    let (clearance, retract) = (field("heights.clearance"), field("heights.retract"));
+    assert_eq!(clearance["source"], "pick", "{clearance}");
+    assert_eq!(retract["source"], "pick", "{retract}");
+    assert!((f(&clearance["value"]) - top).abs() < 1e-9, "the form's clearance is the one cut with ({top}): {clearance}");
+    assert!((f(&retract["value"]) - 22.0).abs() < 1e-9, "2 above the hole's top: {retract}");
+}
+
+#[test]
+fn a_selection_whose_point_is_off_its_face_is_picked_on_the_face() {
+    let mut s = block();
+    open_job(&mut s);
+    let ff = run(&mut s, "cam.features", json!({}));
+    let floor = ff["pockets"][0]["floor_face"].as_u64().unwrap() as usize;
+    // The point a row of the job tree passes for each of a feature's faces may be on another.
+    s.selection = vec![crate::Sel::Face { body: "Block".into(), index: floor, point: solidcore_record::Vec3::new(14.0, 0.0, 20.0) }];
+    let r = run(&mut s, "cam.picks.resolve", json!({"from_selection": true}));
+    let at = &r["picks"][0]["pick"]["at"];
+    assert!((f(&at[2]) - 15.0).abs() < 1e-6, "on the floor: {r}");
+    assert_eq!(r["picks"][0]["feature"], "pocket:0", "{r}");
+}
+
+#[test]
+fn work_zero_stays_on_a_bar_s_axis() {
+    // A bar turns about the A axis through work zero: work zero on its top would take the bar off
+    // the part, so only X moves.
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 16, "height": 90, "base": [-30, 0, 0], "axis": "X", "body_name": "Bar"}));
+    run(&mut s, "cam.job.new", json!({}));
+    let tools: Value = serde_json::from_str(TOOLS).unwrap();
+    run(
+        &mut s,
+        "cam.job.edit",
+        json!({"set": {"machine": "4axis_a", "tools": tools, "stock": {"cylinder": {"radius": 16, "x_min": -30, "x_max": 60}}}}),
+    );
+    let before = s.cam_job.as_ref().unwrap().value.clone();
+    let e = refused(&mut s, "cam.setup.zero", json!({"stock": {"x": "low", "y": "middle", "z": "top"}}));
+    assert!(e.contains("bar's axis") && e.contains("middle"), "{e}");
+    // A point on its end face off the axis; its round face means its axis, which may.
+    let e = refused(&mut s, "cam.setup.zero", json!({"pick": {"body": "Bar", "at": [-30, 0, 10]}}));
+    assert!(e.contains("bar's axis"), "{e}");
+    assert_eq!(s.cam_job.as_ref().unwrap().value, before, "nothing changed");
+    let r = run(&mut s, "cam.setup.zero", json!({"pick": {"body": "Bar", "at": [0, 0, 16]}}));
+    assert_eq!(r["origin"], json!([0.0, 0.0, 0.0]), "{r}");
+    let r = run(&mut s, "cam.setup.zero", json!({"stock": {"x": "low", "y": "middle", "z": "middle"}}));
+    assert_eq!(r["origin"], json!([-30.0, 0.0, 0.0]), "{r}");
+    // Typed numbers are the person's own: kept, with the note.
+    let r = run(&mut s, "cam.setup.zero", json!({"at": [-30, 0, 16]}));
+    assert!(r["notes"].to_string().contains("bar"), "{r}");
 }

@@ -1105,7 +1105,7 @@ takes it on from there. Nothing of it is saved in the design.
 | `view.manufacture_stage` | `setup`, `operations`, `check` or `program`. |
 | `cam.op.defaults` | `op` (index or name) or `draft: {type, …}`, `plan?` (default true). Every key the operation's type has, with the value it runs with and where that comes from: `given` (in the job), `tool`, `cutting_data`, `profile`, `model`, `stock`, `feature`, `pick` or `rule` (the schema's own "Default:" words); the tool it cuts with and why, the job's tools with why each does not fit, and how its picks were found. Changes nothing. |
 | `cam.op.suggest` | `replace?`, `stock_top?`. The operations `cam.suggest` proposes for the part, with the job's machine and tools, added as one undo step, their geometry as picks. |
-| `cam.picks.resolve` | `picks` or `from_selection`, `for?`. What each pick is (`reads`: "pocket 16 x 10 mm, 5 deep, corners R4"), how it was found, and the operations that suit them, best first, each with the job's tool it would take. |
+| `cam.picks.resolve` | `picks` or `from_selection` (a selected face's or edge's point is kept only when it lies on it; else a point on the face is taken), `for?`. What each pick is (`reads`: "pocket 16 x 10 mm, 5 deep, corners R4"), how it was found, and the operations that suit them, best first, each with the job's tool it would take. |
 | `cam.setup.zero` | One of `at: [x,y,z]`, `pick`, `stock: {x, y, z}`, `axis` + `x_end?`, or `refresh: true`; `keep_ref?` (default true). Sets work zero as one undo step and keeps how it was set in `origin_from`; a box or bar stock (work coordinates) is moved so it stays where it was on the part. |
 
 Every edit is one step of the job's history, and is read with the job's schema before it is
@@ -1145,14 +1145,15 @@ job is planned every pick is found again: by its name, else by the exact face it
 it. The reply's `picks_resolved` says how (`name`, `point` or `lost`) and which `cam.features` id
 it belongs to. A lost pick refuses the operation (a `picks` error finding); one found by its
 position, or by a name worked out from the shape rather than exact history, is a warning to
-check. The job as stored keeps the picks; what the planners read is worked out from them:
+check. An operation turned off (`enabled: false`) is neither planned nor written, so its picks are
+not looked for and a lost one stops nothing. The job as stored keeps the picks; what the planners read is worked out from them:
 
 | Operation | A pick means |
 | --- | --- |
 | `pocket`, `contour` | the feature the face is part of (a pocket's floor or wall, a hole, a face, an outline's top or side): `feature`; in an indexed pattern turned to other angles, its outline in its own frame |
 | `adaptive` | that feature's outline (`polygon`) and its top and bottom; a pocket with islands is refused (use `pocket`) |
 | `chamfer` | the outline of the pocket, hole or outline whose rim it breaks, inside or outside; a chamfer face gives the width |
-| `drill`, `bore`, `thread_mill` | the holes' centres (and diameters), top and bottom |
+| `drill`, `bore`, `thread_mill` | the holes' centres (and diameters), top and bottom; holes of different depths are refused (one cycle takes every hole to one depth), and for `drill` and `thread_mill` holes of different sizes too (one tool; `bore` takes each hole's own) |
 | `face` | `bottom` at the face |
 | the 3D finishes and roughing | `boundary.rect` round the faces' exact extent, grown by the tool's radius; `bottom` at the lowest |
 | `rotary_finish`, `rotary_roughing` | `range` along X of the turned diameters |
@@ -1169,7 +1170,9 @@ planned.
 `origin_from` keeps how work zero was set: `{"pick": <pick>}` (a circular edge's centre, an edge's
 end nearest the pick, the point on a face, a round face's axis), `{"stock": {"x": "low" |
 "middle" | "high", "y": …, "z": "top" | "middle" | "bottom"}}`, or `{"axis": <cylinder face>,
-"x_end": "stock_low" | "stock_high" | <pick>}` (on a 4th axis). `origin` stays the numbers every
+"x_end": "stock_low" | "stock_high" | <pick>}` (on a 4th axis). With a bar (`stock.cylinder`), which
+turns about the A axis through work zero, a place on the stock or a pick that would move work zero
+off the bar's axis (in Y or Z) is refused; `axis` and typed numbers may. `origin` stays the numbers every
 reader uses; when the model or the stock moves what `origin_from` gives by more than the
 tolerance, Generate reports a `work_zero` warning and nothing moves until
 `cam.setup.zero {refresh: true}`.

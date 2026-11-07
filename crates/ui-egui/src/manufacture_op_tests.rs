@@ -205,3 +205,55 @@ fn work_zero_is_set_on_the_stock_and_at_the_selection() {
     h.app.run("cam.setup.zero", json!({"at": [0, 0, 20]})).unwrap();
     assert!(h.app.session.cam_job.as_ref().unwrap().value.get("origin_from").is_none());
 }
+
+#[test]
+fn found_rows_are_in_the_person_s_language() {
+    let r = json!({
+        "hole_groups": [{"ids": ["hole:0"], "count": 2, "diameter": 5, "through": true}, {"ids": ["hole:1"], "count": 1, "diameter": 3, "depth": 6}],
+        "holes": [{"id": "hole:0", "body": "B", "faces": [1]}, {"id": "hole:1", "body": "B", "faces": [2]}],
+        "pockets": [{"id": "pocket:0", "body": "B", "bounds": [[0, 0], [16, 10]], "depth": 5, "floor_face": 3}],
+        "turned": [{"id": "turned:0", "body": "B", "diameter": 32, "x_min": 0, "x_max": 94, "faces": [4]}]
+    });
+    let rows = crate::manufacture_op::found_rows_of(&r);
+    let label = |group: &str, k: usize| rows.iter().find(|(g, _)| *g == group).map(|(_, l)| l[k].label.clone()).unwrap_or_default();
+    let words = |id: &str, args: &[(&str, &str)]| crate::i18n::format(id, args);
+    assert_eq!(label("holes", 0), words("ui.manufacture.found_hole_through", &[("count", "2"), ("diameter", "5")]));
+    assert_eq!(label("holes", 1), words("ui.manufacture.found_hole_deep", &[("count", "1"), ("diameter", "3"), ("depth", "6")]));
+    assert_eq!(label("pockets", 0), words("ui.manufacture.found_pocket_row", &[("width", "16"), ("length", "10"), ("depth", "5")]));
+    // Every character a row shows has a glyph in the built-in faces (no box for a missing one).
+    let fonts = crate::fonts::with_symbol_fallback(crate::fonts::base_font_definitions());
+    let draws = |c: char| {
+        fonts.families[&egui::FontFamily::Proportional]
+            .iter()
+            .filter_map(|name| fonts.font_data.get(name))
+            .any(|data| ttf_parser::Face::parse(data.bytes(), data.index).is_ok_and(|f| f.glyph_index(c).is_some()))
+    };
+    for (_, list) in &rows {
+        for row in list {
+            assert!(row.label.chars().all(draws), "{:?} has a character no face draws", row.label);
+        }
+    }
+    for lang in ["en", "ar", "he", "ja", "vi", "zh", "de", "ko"] {
+        let locale = crate::i18n::Locale::for_language(lang);
+        for id in ["ui.manufacture.found_hole_through", "ui.manufacture.found_hole_deep", "ui.manufacture.found_pocket_row"] {
+            assert_ne!(locale.text(id), id, "{lang} lacks {id}");
+        }
+    }
+}
+
+#[test]
+fn a_drilling_by_picks_shows_no_sketch_only_rows() {
+    let mut h = harness();
+    select_feature(&mut h, "hole:0");
+    h.step(&json!({"key": "M"})).unwrap();
+    h.frames(3);
+    h.step(&json!({"click": {"handle": "manufacture:suit:drill"}})).unwrap();
+    h.frames(4);
+    assert_eq!(ops(&h)[0]["type"], "drill");
+    // Rows are found by their labels (the accessibility tree has the rows scrolled out of view too).
+    let row = |h: &Harness, key: &str| !h.widgets(crate::i18n::tr(&label_id(key))).is_empty();
+    assert!(row(&h, "heights.bottom") && row(&h, "cycle"), "the form is drawn");
+    for key in ["sketch", "circles", "diameter_range", "sketch_points", "points"] {
+        assert!(!row(&h, key), "{key} is for a sketch or numbers, not picks");
+    }
+}

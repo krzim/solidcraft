@@ -74,7 +74,8 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
             "one of at: [x,y,z] | pick: {body, face | edge, at} (a vertex: an edge's end nearest `at`; a circle: its centre; a face: the \
              point) | stock: {x: low|middle|high, y, z: top|middle|bottom} | axis: a cylinder face (4th axis: work zero on its axis) + \
              x_end?: stock_low | stock_high | pick | refresh: true (again from origin_from); keep_ref? (default true: keep origin_from) \
-             → origin, origin_from?, moved, notes, summary. One job undo step; a box or bar stock stays where it was",
+             → origin, origin_from?, moved, notes, summary. One job undo step; a box or bar stock stays where it was; on a bar, \
+             work zero stays on its axis (Y, Z) unless typed or set by `axis`",
         ),
 ];
 
@@ -693,7 +694,8 @@ fn apply(
             let id = one(wanted(ty))?;
             if r.faces.iter().any(|f| f.id == id && matches!(f.role.as_str(), "step" | "plateau")) {
                 return Err(format!(
-                    "{id} is open on some sides: Light-Load Clearing stays inside its outline and would leave a wall of material along                      them; use Clear Pocket, which runs past the open sides"
+                    "{id} is open on some sides: Light-Load Clearing stays inside its outline and would leave a wall of material along \
+                     them; use Clear Pocket, which runs past the open sides"
                 ));
             }
             let (pts, islands) = outline_of(set, id).ok_or_else(|| format!("{id} has no outline"))?;
@@ -746,6 +748,7 @@ fn apply(
             if holes.is_empty() || holes.len() != ids.len() {
                 return Err(format!("the picks are not all holes ({})", ids.join(", ")));
             }
+            one_cycle(ty, &holes.iter().map(|h| (h.diameter, h.bottom_z)).collect::<Vec<_>>(), m.tol)?;
             let top = holes.iter().map(|h| h.top_z).fold(f64::NEG_INFINITY, f64::max);
             let bottom = holes.iter().map(|h| h.bottom_z).fold(f64::INFINITY, f64::min);
             match ty {
@@ -833,6 +836,36 @@ fn apply(
     }
 }
 
+/// Whether holes (diameter, bottom) can be one cycle of type `ty`: one depth for all (each cycle
+/// takes every hole to the operation's one bottom), and for drilling and thread milling one size
+/// (one tool for all; boring takes each hole's own diameter).
+fn one_cycle(ty: &str, holes: &[(f64, f64)], tol: f64) -> std::result::Result<(), String> {
+    let span = |k: usize| {
+        let v = holes.iter().map(|h| if k == 0 { h.0 } else { h.1 });
+        (v.clone().fold(f64::INFINITY, f64::min), v.fold(f64::NEG_INFINITY, f64::max))
+    };
+    let label = super::job_edit::type_label(ty);
+    let (lo, hi) = span(1);
+    if hi - lo > tol.max(1e-6) {
+        return Err(format!(
+            "the holes go to different depths (Z {} to {}): one {label} operation takes them all to one depth; give one operation each",
+            num(lo),
+            num(hi)
+        ));
+    }
+    let (lo, hi) = span(0);
+    if ty != "bore" && hi - lo > tol.max(1e-6) {
+        return Err(format!(
+            "the holes are of different sizes ({} to {} mm): one tool cuts them all; give one operation each, or use {}, which takes each \
+             hole's own size",
+            num(lo),
+            num(hi),
+            super::job_edit::type_label("bore")
+        ));
+    }
+    Ok(())
+}
+
 /// The side a round wall (face `f`, its axis `axis`) opens on: of the setups along its axis, the
 /// one whose top it reaches; and its extent there.
 fn wall_side(m: &Model<'_>, set: &FeatureSet, faces: &BodyFaces, f: usize, axis: Vec3) -> Option<(usize, [[f64; 3]; 2])> {
@@ -882,6 +915,7 @@ fn holes_from_walls(
         holes.push(([super::round(c.x, 1e6), super::round(c.y, 1e6)], radius * 2.0, top, ext[0][2]));
     }
     let su = side.and_then(|k| set.setups.get(k)).ok_or("nothing picked")?;
+    one_cycle(ty, &holes.iter().map(|h| (h.1, h.3)).collect::<Vec<_>>(), m.tol)?;
     match ty {
         "drill" => {
             op.insert("points".into(), json!(holes.iter().map(|h| h.0).collect::<Vec<_>>()));
@@ -1155,6 +1189,16 @@ pub(crate) fn resolve_job(m: &mut Model<'_>, job: &mut Map<String, Value>) -> Re
     let Some(Value::Array(ops)) = job.get_mut("operations") else { return Ok(report) };
     for (i, op) in ops.iter_mut().enumerate() {
         let name = crate::cam_job_state::op_name(op);
+        if !crate::cam_job_state::op_enabled(op) {
+            // Turned off: neither planned nor written, so its picks need not be found (a lost one
+            // must not stop the rest); they only read as the job's schema needs.
+            let at = format!("operations[{i}]");
+            let read = stub(op, &at).and_then(|()| op.get_mut("operation").map_or(Ok(()), |inner| stub(inner, &format!("{at}.operation"))));
+            if let Err(e) = read {
+                refused.push(pick_refusal(i, &name, e));
+            }
+            continue;
+        }
         let Some(outer) = op.as_object_mut() else { continue };
         let outer_ty = outer.get("type").and_then(Value::as_str).unwrap_or_default().to_string();
         let wrapped = matches!(outer_ty.as_str(), "indexed" | "indexed_pattern").then(|| wrapper_angle(outer)).flatten();
@@ -1403,17 +1447,29 @@ fn open_loaded(cmd: &str, s: &Session) -> Result<(Value, Option<std::path::PathB
     Ok((merged, base))
 }
 
+/// The design's selection as picks. A selected face's or edge's point is kept only when it lies on
+/// it (exactly): a point off it (one passed for every face of a feature, say) would find another
+/// face once the name is lost, so a point on the face itself is taken instead.
 fn cam_picks_from_selection(s: &Session) -> Vec<Pick> {
     let Ok(st) = s.world_state() else { return Vec::new() };
+    let on_face = |b: usize, f: usize, p: Vec3| {
+        st.bodies.get(b).is_some_and(|mb| !mb.body.is_mesh() && BodyFaces::new(&mb.name, &mb.body).faces_at(p, point_tol(&st, b, 0.01)).contains(&f))
+    };
+    let on_edge = |b: usize, e: usize, p: Vec3| {
+        st.bodies.get(b).is_some_and(|mb| matches!(mb.body.nearest_edge(p, point_tol(&st, b, 0.01)), Ok(Some((x, _))) if x == e))
+    };
+    let finite = |p: &Vec3| finite3(&[p.x, p.y, p.z]);
     s.selection
         .iter()
         .filter_map(|sel| match sel {
-            crate::Sel::Face { body, index, point } => {
-                st.bodies.iter().position(|b| &b.name == body).and_then(|b| pick_of(&st, b, Some(*index), None, Some(*point)))
-            }
-            crate::Sel::Edge { body, index, point } => {
-                st.bodies.iter().position(|b| &b.name == body).and_then(|b| pick_of(&st, b, None, Some(*index), Some(*point)))
-            }
+            crate::Sel::Face { body, index, point } => st.bodies.iter().position(|b| &b.name == body).and_then(|b| {
+                let at = Some(*point).filter(|p| finite(p) && on_face(b, *index, *p));
+                pick_of(&st, b, Some(*index), None, at)
+            }),
+            crate::Sel::Edge { body, index, point } => st.bodies.iter().position(|b| &b.name == body).and_then(|b| {
+                let at = Some(*point).filter(|p| finite(p) && on_edge(b, *index, *p));
+                pick_of(&st, b, None, Some(*index), at)
+            }),
             _ => None,
         })
         .take(MAX_PICKS)
@@ -1836,6 +1892,20 @@ fn zero_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let new = [super::round(new.x, 1e6), super::round(new.y, 1e6), super::round(new.z, 1e6)];
     let moved = [new[0] - old[0], new[1] - old[1], new[2] - old[2]];
+    // A bar turns about the A axis through work zero: a place on the stock or a pick across it
+    // would take the bar (and the axis) off the part. Its axis (`axis`) and typed numbers may.
+    let bar = stored.get("stock").and_then(|st| st.get("cylinder")).is_some();
+    let across = moved[1].hypot(moved[2]);
+    if bar && across > 1e-6 && from.as_ref().is_some_and(|f| f.get("axis").is_none()) {
+        return Err(bad(
+            cmd,
+            format!(
+                "work zero would move {} mm off the bar's axis, and the bar turns about the A axis through work zero: keep Y and Z on \
+                 it. Set work zero on the axis (`axis`: the bar's round face), or a place on the stock with y and z `middle`",
+                num(across)
+            ),
+        ));
+    }
     let mut next = stored.clone();
     let mut notes = Vec::new();
     if let Value::Object(map) = &mut next {
