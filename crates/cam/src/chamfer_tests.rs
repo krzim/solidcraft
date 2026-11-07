@@ -710,3 +710,40 @@ fn a_chamfer_mill_traces_a_line_to_a_depth_and_spots_holes() {
     assert!(crate::drill::check_drilling_tool(&tool).is_ok());
     assert!(crate::drill::check_drilling_tool(&Tool::new(1, ToolKind::BallEndmill, 6.0, 20.0)).is_err());
 }
+
+#[test]
+fn a_trace_or_a_spot_deeper_than_the_cone_is_refused() {
+    // Below its cone a chamfer mill cuts with its straight side, a slot or a hole as wide as the
+    // tool: not a V-trace or a spot, and deeper than any band check could hold (the band lets
+    // the tool cut everything down to its depth, a wall it breaks into below the face included).
+    use crate::drill::{Cycle, DrillParams, drill};
+    let tool = chamfer_mill(6.0, 0.0, 90.0); // its cone is 3 mm high
+    let region = [rect(-10.0, -5.0, 10.0, 5.0)];
+    let on = ContourParams { side: Side::On, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+    let cut = |top: f64, bottom: f64| Cut {
+        heights: Heights { clearance: 10.0, retract: 2.0, top, bottom },
+        feeds: Feeds { cut: 600.0, plunge: 100.0 },
+        stepdown: 1.0,
+    };
+    assert!(contour(&region, &tool, &on, &cut(0.0, -3.0)).is_ok());
+    let e = contour(&region, &tool, &on, &cut(0.0, -3.5)).unwrap_err().to_string();
+    assert!(e.contains("cone") && e.contains("3 mm"), "{e}");
+    // A top above the face makes the band no deeper than the cone either.
+    assert!(contour(&region, &tool, &on, &cut(2.0, -1.5)).is_err());
+    let spot = |bottom: f64| DrillParams {
+        cycle: Cycle::Simple,
+        heights: Heights { clearance: 10.0, retract: 2.0, top: 0.0, bottom },
+        feed: 100.0,
+        to_full_diameter: false,
+        stay_at_retract: false,
+        part_top: None,
+    };
+    assert!(drill(&[Vec2::new(0.0, 0.0)], &tool, &spot(-3.0)).is_ok());
+    let e = drill(&[Vec2::new(0.0, 0.0)], &tool, &spot(-4.0)).unwrap_err().to_string();
+    assert!(e.contains("cone") && e.contains("3 mm"), "{e}");
+    // A tipped 60° cone: (4 - 0.5) / tan 30° high.
+    let tipped = chamfer_mill(8.0, 1.0, 60.0);
+    let high = 3.5 / 30f64.to_radians().tan();
+    assert!(contour(&region, &tipped, &on, &cut(0.0, -(high - 0.01))).is_ok());
+    assert!(contour(&region, &tipped, &on, &cut(0.0, -(high + 0.01))).is_err());
+}

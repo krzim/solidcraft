@@ -55,7 +55,8 @@ The command never writes a program that fails one of these unless `allow_unsafe`
   found) and the work coordinates of the tool tip there, and says how deep that can be in the
   exact part. A chamfer mill's own band is allowed: the chamfer a `chamfer` operation is told to
   cut, the groove of a V-trace (`contour` `side: on`) and the cone of a spotted hole (`drill`)
-  need not be in the model (see [Chamfers](#chamfers)). Any other operation that cuts what the
+  need not be in the model (see [Chamfers](#chamfers)); the fixtures are held against the
+  whole tool, band and all. Any other operation that cuts what the
   model does not show sets `gouge_check: false`; the reply lists it under `gouge.skipped`, and it
   is still checked against the fixtures. A drill is checked as its own shape, point and all.
 - **Holder.** For tools with holder data (`stickout` above the flutes, `shank_diameter`,
@@ -704,15 +705,21 @@ the chamfer's height (`width / tan(angle_deg / 2)`) higher, where its cone just 
 edge, with its tip also held where it really runs. So a chamfer the model shows passes, and so
 does a deburr of a sharp edge the model does not chamfer; a cut past the band fails, such as a
 profile off the part's edge, a wrong `side`, or a tip that runs into a face below. Its fix names
-the profile, `side`, `width` and `tip_offset`. Its retract straight up through the band passes
-the rapid check, and the simulation warns about its cut below the model rather than failing.
+the profile, `side`, `width` and `tip_offset`. The band is the part's only: a fixture (a vise
+jaw just below the edge) is held against the whole tool. Its retract straight up through the
+band passes the rapid check. The simulation watches every move: it warns about the cuts below
+the model of the operations told to cut a band and fails a cut into the part by any other.
 Inside `indexed` a chamfer runs in the frame the A angle brings under the tool.
 
 A contour `side: on` with a chamfer mill traces the line with the point down to `bottom`: a
 V-engraving as wide at the top as the cone is there (a 60° tool 0.3 mm deep: 0.35 mm). Its groove
-is its band (`top − bottom`), so the model need not show the engraving; a trace whose `top` is not
-the face it engraves cuts past its band and fails. A trace deeper than the flutes is refused. A
-`drill` with a chamfer mill spots holes the same way, its band the spot's depth:
+is its band (`top − bottom`), so the model need not show the engraving; a trace whose `top` is
+below the face it engraves cuts past its band and fails. Give the face as `top`: one above it
+makes the band deeper than the groove, and what stands on the face within it is not held. A
+trace deeper than the cone (from `top` to where the tool is full width, `(diameter −
+tip_diameter) / 2 / tan(angle_deg / 2)`) is refused: below it the tool cuts with its straight
+side. A `drill` with a chamfer mill spots holes the same way, its band the spot's depth, which is
+held to the cone too:
 
 ```json
 {"name": "engrave", "type": "contour", "tool": 30, "side": "on", "sketch": "Text",
@@ -1020,7 +1027,11 @@ keep their depth and feed low on a light machine), `passed` (no gouge and no rap
 follow (on a 4th axis, one that never writes A: no block's position is known) fails rather than
 passing with nothing checked. A failed simulation is reported, never refused;
 inside `cam.job` its failures join the job's. When an operation of the job has `gouge_check:
-false` (an engraving), the simulation's gouges are warned about, not failed.
+false` (an engraving), the simulation's gouges are warned about, not failed. Inside `cam.job`, a
+chamfer, a V-trace or a spot (an operation told to cut a band the model need not show) has the
+simulation watch every move: the cuts of those operations' moves into the part are warned about,
+a cut by any other operation's fails and names it. `cam.simulate` on its own does not know the
+bands: it fails them as gouges unless the job gives the operation `gouge_check: false`.
 
 **The stock.** The simulation starts from the job's `stock` when it can model it on the
 machine: a box on a 3-axis machine, a bar about X on a 4th axis (`stock.derived` is then false,
@@ -1107,7 +1118,8 @@ compact reply.
 | `cam.view.close` | Drops the view. |
 
 **What is found.** `rapid-in-stock` (a rapid cutting more than the tolerance), `gouge` (a cell
-cut below the part, measured again in 3D; a warning for an operation with `gouge_check: false`),
+cut below the part, measured again in 3D; a warning for an operation with `gouge_check: false`
+or one told to cut a band the model need not show: a chamfer, a V-trace, a spot),
 `cut-spindle-off` (cutting after `M5`, once the program has started the spindle), `shank-rubs`
 (material above the flute length where the tool cuts), `shank-hits-stock` and
 `holder-hits-stock` (the shank or a holder section coming down on the stock as it is then),

@@ -8,10 +8,12 @@
 //! starts from one taken from the part: its box on a 3-axis machine, the cylinder about work X
 //! through its farthest point from the axis on a 4th axis.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 use solidcraft_cam::helical::{ISO_EXTERNAL_DEPTH, ISO_INTERNAL_DEPTH, thread_core};
 use solidcraft_cam::kinematics::Machine;
-use solidcraft_cam::sim::{SimParams, SimReport, StockShape, simulate as run_sim, stock_around};
+use solidcraft_cam::sim::{SimParams, SimReport, StockShape, simulate as run_sim, simulate_watched, stock_around};
 use solidcraft_cam::stock::Stock;
 use solidcraft_cam::{Surface, Tool, ToolKind};
 
@@ -114,9 +116,22 @@ pub(super) fn stock_report(stock: &StockShape, derived: bool) -> SimStockReport 
     }
 }
 
-/// Simulates `text` for the job's `machine` and `tools` against `part` at `tol`. With
-/// `deliberate_gouges` (an operation of the job cuts into the part on purpose) gouges are
-/// warned about rather than failed. The reply and the simulation's own report.
+/// Which of a program's cuts into the part are meant, and so warned about rather than failed.
+pub(super) enum Deliberate {
+    /// None: every cut into the part fails.
+    None,
+    /// Every one: an operation of the job has `gouge_check: false`.
+    All,
+    /// The cuts of the operations told to cut a band of their own the model need not show (a
+    /// chamfer, a V-trace, a spot), whose own gouge check holds them to that band: `ops` names
+    /// every operation and says whether it is one, `op_of_line` whose each program line is. A
+    /// cut into the part by any other move fails.
+    Bands { ops: Vec<(String, bool)>, op_of_line: BTreeMap<usize, usize> },
+}
+
+/// Simulates `text` for the job's `machine` and `tools` against `part` at `tol`. Cuts into the
+/// part are failed, or warned about as `deliberate` says. The reply and the simulation's own
+/// report.
 pub(super) fn check_program(
     cmd: &str,
     text: &str,
@@ -126,14 +141,20 @@ pub(super) fn check_program(
     job_stock: Option<&Stock>,
     tol: f64,
     resolution: Option<f64>,
-    deliberate_gouges: bool,
+    deliberate: &Deliberate,
 ) -> Result<(CamSimulateReply, SimReport)> {
     if resolution.is_some_and(|r| !(1e-4..=1e4).contains(&r)) {
         return Err(bad(cmd, "`resolution` must be from 0.0001 to 10000 mm"));
     }
     let mut stock_notes = Vec::new();
     let (stock, derived) = stock_of(cmd, job_stock, part, machine, &mut stock_notes)?;
-    let report = run_sim(text, machine, tools, &stock, part, &SimParams { tolerance: tol, resolution }).map_err(|e| cam_err(cmd, "simulation", e))?;
+    let sim_params = SimParams { tolerance: tol, resolution };
+    let (report, cuts) = match deliberate {
+        // Each move watched, so that a cut of another operation is told from a band's.
+        Deliberate::Bands { .. } => simulate_watched(text, machine, tools, &stock, part, &sim_params),
+        Deliberate::None | Deliberate::All => run_sim(text, machine, tools, &stock, part, &sim_params).map(|r| (r, Vec::new())),
+    }
+    .map_err(|e| cam_err(cmd, "simulation", e))?;
     let mut failures = Vec::new();
     let mut warnings = report.warnings.clone();
     if report.moves == 0 {
@@ -144,13 +165,42 @@ pub(super) fn check_program(
                 .to_string(),
         );
     }
-    if report.gouge_cells > 0 {
-        let what =
-            format!("the program cuts up to {} mm into the part over {} cells of the simulated stock", num(report.gouge_worst), report.gouge_cells);
-        if deliberate_gouges {
-            warnings.push(format!("{what} (an operation has `gouge_check: false`, so this is not failed)"));
-        } else {
-            failures.push(format!("simulation: {what}"));
+    let what =
+        format!("the program cuts up to {} mm into the part over {} cells of the simulated stock", num(report.gouge_worst), report.gouge_cells);
+    match deliberate {
+        _ if report.gouge_cells == 0 && cuts.is_empty() => {}
+        Deliberate::None => failures.push(format!("simulation: {what}")),
+        Deliberate::All => warnings.push(format!("{what} (an operation has `gouge_check: false`, so this is not failed)")),
+        Deliberate::Bands { ops, op_of_line } => {
+            let banded: Vec<String> = ops.iter().filter(|(_, b)| *b).map(|(n, _)| format!("`{n}`")).collect();
+            // The deepest cut, and how many moves cut, of every other operation (or of no known one).
+            let mut others: BTreeMap<Option<usize>, (f64, usize, usize)> = BTreeMap::new();
+            for &(line, depth) in &cuts {
+                let op = op_of_line.get(&line).copied();
+                if op.and_then(|k| ops.get(k)).is_some_and(|(_, b)| *b) {
+                    continue;
+                }
+                let e = others.entry(op).or_insert((0.0, line, 0));
+                e.2 += 1;
+                if depth > e.0 {
+                    (e.0, e.1) = (depth, line);
+                }
+            }
+            for (op, (depth, line, moves)) in &others {
+                let who = match op.and_then(|k| ops.get(k)) {
+                    Some((name, _)) => format!("operation `{name}`"),
+                    None => "a move of no operation".to_string(),
+                };
+                failures
+                    .push(format!("simulation: {who} cuts up to {} mm into the part along {moves} moves, the deepest at line {line}", num(*depth)));
+            }
+            if others.is_empty() {
+                warnings.push(format!(
+                    "{what}: by the moves of {} only, each told to cut a chamfer, a V-trace or a spot the model need not show (its own gouge \
+                     check holds it to that), so this is not failed",
+                    banded.join(", ")
+                ));
+            }
         }
     }
     if let Some(first) = report.rapids_in_material.first() {
@@ -241,7 +291,8 @@ pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let surfaces = surfaces_of(cmd, s, &job, v3(origin), tol)?;
     let mut stock_notes = Vec::new();
     let job_stock = super::cam_stock::stock_of(cmd, s, &job, base.as_deref(), &surfaces, tol, &mut stock_notes)?;
-    let (mut reply, report) = check_program(cmd, &text, &machine, &tools, &surfaces.part, job_stock.as_ref(), tol, params.resolution, deliberate)?;
+    let deliberate = if deliberate { Deliberate::All } else { Deliberate::None };
+    let (mut reply, report) = check_program(cmd, &text, &machine, &tools, &surfaces.part, job_stock.as_ref(), tol, params.resolution, &deliberate)?;
     reply.path = params.path.clone();
     reply.notes.extend(surfaces.notes);
     reply.notes.extend(stock_notes);

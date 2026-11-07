@@ -2039,6 +2039,54 @@ fn a_chamfer_mill_engraves_a_line_and_spots_holes() {
 }
 
 #[test]
+fn a_chamfer_band_is_the_parts_alone_never_a_fixtures() {
+    // A vise jaw along the plate's +X side, its top 0.5 mm below the plate's: the deburr's point
+    // runs 1.2 mm down just outside the edge, into the jaw. The band the chamfer mill is told to
+    // cut is cut into the part, so the jaw is held against the whole tool.
+    let jawed = |top: f64| {
+        let mut s = plate(false);
+        run(
+            &mut s,
+            "solid.box",
+            json!({"length": 10, "width": 30, "height": 20.0 + top, "corner": [15.1, -15, -20], "operation": "new", "body_name": "Jaw"}),
+        );
+        s
+    };
+    let mut s = jawed(-0.5);
+    let mut job = chamfer_job(1.0);
+    job["bodies"] = json!(["Plate"]);
+    job["fixtures"] = json!(["Jaw"]);
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true}));
+    assert_eq!(r["passed"], false, "{r}");
+    assert!(r["operations"][1]["gouge"].as_f64().is_some_and(|g| g > 0.3), "{r}");
+    let dir = Dir::new("chamfer-jaw");
+    let e = s.execute("cam.job", &json!({"job": job, "output": dir.file("p.tap")})).unwrap_err().to_string();
+    assert!(e.contains("fixture"), "{e}");
+    // Clear of the jaw (its top 1.5 mm down), the deburr passes.
+    let mut s = jawed(-1.5);
+    assert_clean(&run(&mut s, "cam.job", json!({"job": job, "dry_run": true})));
+}
+
+#[test]
+fn a_chamfer_in_the_job_leaves_the_simulation_failing_every_other_gouge() {
+    // The face goes 0.5 mm into the plate's top: the simulation fails it, the chamfer (its own
+    // band, which the model does not show) beside it or not.
+    let mut s = plate(false);
+    let mut job = chamfer_job(1.0);
+    job["operations"][0]["heights"]["bottom"] = json!(-0.5);
+    let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true, "simulate": true}));
+    assert_eq!(r["simulation"]["passed"], false, "{r}");
+    let fails = r["simulation"]["failures"].to_string();
+    assert!(fails.contains("face"), "{fails}");
+    // The chamfer alone still passes the simulation, with a warning that names it.
+    let r = run(&mut s, "cam.job", json!({"job": chamfer_job(1.0), "dry_run": true, "simulate": true}));
+    assert_clean(&r);
+    assert_eq!(r["simulation"]["passed"], true, "{r}");
+    let warns = r["simulation"]["warnings"].to_string();
+    assert!(warns.contains("deburr") && !warns.contains("gouge_check: false"), "{warns}");
+}
+
+#[test]
 fn hostile_chamfers_and_chamfer_mills_are_refused() {
     let mut s = plate(true);
     let refused = |s: &mut Session, job: Value, needle: &str| {

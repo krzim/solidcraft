@@ -169,6 +169,35 @@ pub fn chamfer(regions: &[Region2], tool: &Tool, params: &ChamferParams) -> Resu
     contour(regions, &proxy, &contour_params, &cut)
 }
 
+/// How high `tool`'s cone is (mm), from its tip to where it reaches its full diameter: as deep
+/// as it can trace a line or spot a hole. Below that it cuts with its straight side, a slot or a
+/// hole as wide as the tool, which the band check could not hold to anything (it allows the
+/// tool everything down to the band's depth). Refused for a tool without a cone.
+pub(crate) fn cone_height(tool: &Tool) -> Result<f64> {
+    let cutter = tool.cutter()?;
+    let Some(cone) = cutter.cone else { return invalid(format!("tool {} has no cone to trace or spot with", tool.number)) };
+    let tan = cone.half_angle.tan();
+    if !(tan > 0.0) {
+        return invalid(format!("tool {} has no cone to trace or spot with", tool.number));
+    }
+    Ok(((cutter.radius - cone.tip_radius) / tan).min(tool.flute_length))
+}
+
+/// Refuses a V-trace or a spot of `depth` mm (from the face it is told to start at) deeper than
+/// `tool`'s cone ([`cone_height`]); `what` names it.
+pub(crate) fn within_cone(tool: &Tool, depth: f64, what: &str) -> Result<()> {
+    let high = cone_height(tool)?;
+    if !(depth <= high + 1e-9) {
+        return invalid(format!(
+            "the {what} goes {depth:.4} mm down from its top, beyond chamfer mill {}'s cone ({} mm high): below it the tool cuts with its \
+             straight side; give a top at the face and a depth within the cone, or use an end mill or a drill",
+            tool.number,
+            crate::gcode::number(high, 4)
+        ));
+    }
+    Ok(())
+}
+
 /// The gouges of `tool`, a chamfer mill, along the cutting moves of `path` beyond the band it
 /// is told to cut, `band` mm high along its axis: its cone is held against `surface` less the
 /// band, as if it ran `band` higher (the cone's side then moves `band · sin α` out of the

@@ -549,7 +549,14 @@ impl Playback {
         if r.gouge > tol {
             let d = column_depth(&self.part, r.gouge_from, r.gouge_at, r.gouge);
             if d > tol {
-                let (sev, why) = if deliberate { (Severity::Warning, " (its operation has `gouge_check: false`)") } else { (Severity::Error, "") };
+                let (sev, why) = if deliberate {
+                    (
+                        Severity::Warning,
+                        " (its operation cuts what the model need not show: `gouge_check: false`, or a chamfer, V-trace or spot its gouge check holds to its band)",
+                    )
+                } else {
+                    (Severity::Error, "")
+                };
                 ev("gouge", sev, r.gouge_at, d, format!("the tool cuts {} mm into the part{why}", mm(d)));
             }
         }

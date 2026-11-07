@@ -2273,6 +2273,33 @@ fn stock_grid(grid: &Grid, values: Vec<f64>) -> StockGrid {
 /// cell than the simulation allows (a long 4th-axis program) is simulated at a cell coarse
 /// enough to fit, with a warning saying so; the cell used is in the report.
 pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShape, part: &Surface, params: &SimParams) -> Result<SimReport> {
+    simulate_with(text, machine, tools, stock, part, params, false).map(|(r, _)| r)
+}
+
+/// [`simulate`], watching every move as it cuts for a cut into `part`: also the program line
+/// and the depth (measured as the playback measures it) of every move that cuts into the part
+/// deeper than the tolerance, in program order, so that the caller can tell whose cut each is
+/// (an operation told to cut what the model does not show, or another).
+pub fn simulate_watched(
+    text: &str,
+    machine: &Machine,
+    tools: &[Tool],
+    stock: &StockShape,
+    part: &Surface,
+    params: &SimParams,
+) -> Result<(SimReport, Vec<(usize, f64)>)> {
+    simulate_with(text, machine, tools, stock, part, params, true)
+}
+
+fn simulate_with(
+    text: &str,
+    machine: &Machine,
+    tools: &[Tool],
+    stock: &StockShape,
+    part: &Surface,
+    params: &SimParams,
+    watch: bool,
+) -> Result<(SimReport, Vec<(usize, f64)>)> {
     let mut plan = plan_sim(text, machine, tools, stock, params)?;
     let mut coarser = None;
     if params.resolution.is_none() {
@@ -2286,7 +2313,22 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
         }
     }
     let mut state = SimState::new(&plan);
+    let watch = watch && !part.is_empty();
+    if watch {
+        state.set_floor(&Arc::new(plan.part_floor(part)));
+    }
     state.advance(&plan, plan.moves(), 0.0)?;
+    let mut cuts = Vec::new();
+    if watch {
+        for (r, step) in state.removed().iter().zip(&plan.steps) {
+            if r.gouge > plan.tol {
+                let d = column_depth(part, r.gouge_from, r.gouge_at, r.gouge);
+                if d > plan.tol {
+                    cuts.push((step.line, d));
+                }
+            }
+        }
+    }
     let mut report = state.finish(&plan, part);
     if let Some(visits) = coarser {
         report.warnings.push(format!(
@@ -2295,7 +2337,7 @@ pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
             plan.cell()
         ));
     }
-    Ok(report)
+    Ok((report, cuts))
 }
 
 /// Reads `text` (G-code for `machine`, in absolute coordinates) into the steps that cut `stock`

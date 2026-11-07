@@ -17,7 +17,7 @@ fn schemas_and_the_key_check_agree() {
     assert_keys(input_schema_for::<CamFeaturesParams>(), &["axis", "bodies", "origin", "tolerance"]);
     assert_keys(
         input_schema_for::<CamSuggestParams>(),
-        &["axis", "bodies", "check", "origin", "post", "profile_path", "stock_top", "tolerance", "tool_library_path", "tools"],
+        &["axis", "bodies", "check", "material", "origin", "post", "profile_path", "stock_top", "tolerance", "tool_library_path", "tools"],
     );
 }
 

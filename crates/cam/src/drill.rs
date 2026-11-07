@@ -282,6 +282,9 @@ pub fn drill(points: &[Vec2], tool: &Tool, params: &DrillParams) -> Result<Toolp
             tool.flute_length
         ));
     }
+    if tool.kind == ToolKind::Chamfer {
+        crate::chamfer::within_cone(tool, h.top - tip, "spot")?;
+    }
     if params.stay_at_retract && !params.part_top.is_some_and(|t| t.is_finite() && h.retract > t) {
         return invalid(
             "`stay_at_retract` needs the retract (R) height above the top of the part and its fixtures; travel at the clearance height instead",

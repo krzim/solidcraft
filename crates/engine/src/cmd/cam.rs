@@ -1915,14 +1915,30 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         // The moves of the operation's own toolpath hits are along.
         let moves_of = |hits: &[Hit]| hits.iter().filter_map(|h| p.sources.get(h.index)).collect::<BTreeSet<_>>().len();
         // A drill is checked as its own shape, point and all; a chamfer mill less the band it
-        // is told to cut (its tip, beside the wall, as it runs for a chamfer).
+        // is told to cut (its tip, beside the wall, as it runs for a chamfer). The band is cut
+        // into the part only: the fixtures are held against the whole tool.
         let tip_clear = p.report.kind.ends_with("chamfer");
         let check = |s: &Surface| match p.band {
             Some(band) => band_gouges(s, &p.tool, &p.poses, band, tip_clear, allowed, step),
             None => tool_gouges(s, &p.tool, &p.poses, allowed, step),
         };
+        let check_all = || match (p.band, &surfaces.fixtures) {
+            (Some(_), Some(fixtures)) => {
+                let mut hits = check(&surfaces.part)?;
+                for h in tool_gouges(fixtures, &p.tool, &p.poses, allowed, step)? {
+                    match hits.iter_mut().find(|k| k.index == h.index) {
+                        Some(k) if h.distance > k.distance => *k = h,
+                        Some(_) => {}
+                        None => hits.push(h),
+                    }
+                }
+                hits.sort_by_key(|h| h.index);
+                Ok(hits)
+            }
+            _ => check(&surfaces.all),
+        };
         if p.gouge_check {
-            let hits = check(&surfaces.all).map_err(|e| cam_err(cmd, &format!("operation `{op}`: gouge check"), e))?;
+            let hits = check_all().map_err(|e| cam_err(cmd, &format!("operation `{op}`: gouge check"), e))?;
             pictures::note_problems(&mut p.report, "gouge", &hits);
             let moves = moves_of(&hits);
             if let Some(worst) = hits.iter().max_by(|a, b| a.distance.total_cmp(&b.distance)) {
@@ -2009,7 +2025,22 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
     let (rapids, travel) =
         cam_stock::check_motion(cmd, job, &text, &program, &post, &machine, &surfaces, stock.as_ref(), &unchecked, tol, &mut failures)?;
     let simulation = if params.simulate.unwrap_or(false) {
-        let deliberate = planned.iter().any(|p| !p.gouge_check || p.band.is_some());
+        // Every cut into the part is a failure, but those of an operation without a gouge check
+        // and, where the program's blocks can be put under their operations, a band's own.
+        let deliberate = if planned.iter().any(|p| !p.gouge_check) {
+            sim::Deliberate::All
+        } else if planned.iter().any(|p| p.band.is_some()) {
+            let blocks = parse5(&text, &machine.letters()).map_err(|e| cam_err(cmd, "reading the program back", e))?;
+            match solidcraft_cam::rapids::owners(&program, &post, &machine, &blocks) {
+                Some(owner) => sim::Deliberate::Bands {
+                    ops: planned.iter().map(|p| (p.report.name.clone(), p.band.is_some())).collect(),
+                    op_of_line: blocks.iter().zip(owner).map(|(b, k)| (b.line(), k)).collect(),
+                },
+                None => sim::Deliberate::All,
+            }
+        } else {
+            sim::Deliberate::None
+        };
         // A thread mill cuts in the simulation as the core its operation's gouge check took.
         let cores: Vec<Tool> = planned
             .iter()
@@ -2017,7 +2048,7 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
             .filter(|c| c.kind != ToolKind::ThreadMill && tools.iter().any(|t| t.number == c.number && t.kind == ToolKind::ThreadMill))
             .collect();
         let sim_tools = sim::with_thread_cores(&tools, &cores);
-        match sim::check_program(cmd, &text, &machine, &sim_tools, &surfaces.part, stock.as_ref(), tol, params.simulate_resolution, deliberate) {
+        match sim::check_program(cmd, &text, &machine, &sim_tools, &surfaces.part, stock.as_ref(), tol, params.simulate_resolution, &deliberate) {
             Ok((reply, _)) => {
                 failures.extend(reply.failures.iter().cloned());
                 Some(reply)

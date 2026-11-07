@@ -1279,12 +1279,8 @@ pub fn pocket_with(
     b.finish()
 }
 
-/// Refuses a V-trace with `tool`, a chamfer mill, deeper than its flutes: along the line its
+/// Refuses a V-trace with `tool`, a chamfer mill, deeper than its cone: along the line its
 /// point cuts a groove as wide as its cone is at the top.
 fn traces(tool: &Tool, cut: &Cut) -> Result<()> {
-    let depth = cut.heights.top - cut.heights.bottom;
-    if !(depth <= tool.flute_length + 1e-9) {
-        return invalid(format!("the trace goes {depth:.4} mm deep, beyond chamfer mill {}'s {} mm flute length", tool.number, tool.flute_length));
-    }
-    Ok(())
+    crate::chamfer::within_cone(tool, cut.heights.top - cut.heights.bottom, "trace")
 }
