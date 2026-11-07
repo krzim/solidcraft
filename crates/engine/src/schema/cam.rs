@@ -60,6 +60,10 @@ pub struct CamJobParams {
     /// a gouge or a rapid through material fails the job like the other checks. Default: false.
     #[serde(default)]
     pub simulate: Option<bool>,
+    /// With `simulate`: the simulation's cell size, mm (0.0001 to 10000). Default: five times
+    /// the tolerance, coarser where the stock or the program is too large for that.
+    #[serde(default)]
+    pub simulate_resolution: Option<f64>,
     /// Reply with only what an agent needs: passed, the failures with their fixes, one line per
     /// operation, the outputs, the tools and the total minutes. Default: false.
     #[serde(default)]
@@ -597,8 +601,10 @@ operation! {
     RotaryRoughingOp {
         /// Lines along X or one helix.
         pub pattern: PatternSpec,
-        /// The stock's radius, mm.
-        pub stock_radius: f64,
+        /// The stock's radius, mm. Default: the job's `stock` (a cylinder's radius, or how far a
+        /// box's farthest edge is from the A axis).
+        #[serde(default)]
+        pub stock_radius: Option<f64>,
         /// Radius from the rotary axis rapids go round at, mm.
         pub clearance: f64,
         /// Radius the tool feeds in from, mm; at or outside the stock.

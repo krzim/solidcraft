@@ -12,9 +12,10 @@
 //!   bisection on its slope to rounding (bull nose). A level arc is exact too (the nearest
 //!   point of the arc to the cell). An arc that also moves in Z (a helix) is followed as
 //!   chords at most a quarter of the tolerance from it.
-//! - **4th axis** ([`StockShape::Cylinder`], a rotary about work X through work zero): a grid
-//!   over (x, θ) holding the radius the material reaches along the ray from the axis at that x
-//!   and angle. A block that turns the rotary while X moves is a helix in the work frame, so
+//! - **4th axis** ([`StockShape::Cylinder`], or a [`StockShape::Box`] bar the axis runs
+//!   through, on a rotary about work X through work zero): a grid over (x, θ) holding the radius
+//!   the material reaches along the ray from the axis at that x and angle (for a box bar, from
+//!   where the ray leaves its rectangle). A block that turns the rotary while X moves is a helix in the work frame, so
 //!   the tool is placed at points along every block (every axis moving evenly from the block's
 //!   start to its end, as written), each close enough to the last that the cusp the sampling
 //!   leaves is at most half the tolerance: for a tool with a round corner of radius r the
@@ -86,6 +87,8 @@ pub const DEFAULT_CELL_TOLERANCES: f64 = 5.0;
 pub const DRILL_POINT_ANGLE: f64 = 118.0 * PI / 180.0;
 /// Most cell updates one simulation makes: beyond it the simulation is refused.
 const MAX_VISITS: u64 = 4_000_000_000;
+/// The share of [`MAX_VISITS`] a simulation without a resolution is fitted within.
+const FIT_SHARE: f64 = 0.5;
 /// Most tool positions along one block on a 4th axis, and chords of one arc.
 const MAX_BLOCK_POINTS: usize = 1_000_000;
 /// Most cells measured again in 3D for the gouge depth; beyond, the vertical depth is used.
@@ -511,14 +514,26 @@ pub struct Removed {
     pub above: f64,
     pub above_at: Vec3,
     /// The deepest it cut below the part's surface along Z (along the ray) where a part floor
-    /// is given ([`SimState::set_floor`]), and where; a gouge only once measured in 3D.
+    /// is given ([`SimState::set_floor`]), and where; a gouge only once measured in 3D, along
+    /// the column from `gouge_from` (just outside the part's surface) to `gouge_at`
+    /// ([`column_depth`]).
     pub gouge: f64,
     pub gouge_at: Vec3,
+    pub gouge_from: Vec3,
 }
 
 impl Default for Removed {
     fn default() -> Removed {
-        Removed { volume: 0.0, depth: 0.0, at: Vec3::ZERO, above: 0.0, above_at: Vec3::ZERO, gouge: 0.0, gouge_at: Vec3::ZERO }
+        Removed {
+            volume: 0.0,
+            depth: 0.0,
+            at: Vec3::ZERO,
+            above: 0.0,
+            above_at: Vec3::ZERO,
+            gouge: 0.0,
+            gouge_at: Vec3::ZERO,
+            gouge_from: Vec3::ZERO,
+        }
     }
 }
 
@@ -536,6 +551,7 @@ impl Removed {
         if o.gouge > self.gouge {
             self.gouge = o.gouge;
             self.gouge_at = o.gouge_at;
+            self.gouge_from = o.gouge_from;
         }
     }
 }
@@ -615,6 +631,7 @@ fn note_cut(out: &mut Removed, old: f64, new: f64, flute: f64, floor: f64, tol: 
     if below > tol && below > out.gouge {
         out.gouge = below;
         out.gouge_at = point(new);
+        out.gouge_from = point(floor + tol);
     }
 }
 
@@ -916,8 +933,11 @@ struct Radii {
     k0: usize,
     nt: usize,
     nt_all: usize,
+    /// The farthest the stock reaches from the axis.
     radius: f64,
     rho: Vec<f64>,
+    /// How far the stock reaches along each of the band's angles before it is cut.
+    start: Vec<f64>,
     /// sin and cos of the band's angles.
     sin: Vec<f64>,
     cos: Vec<f64>,
@@ -1137,8 +1157,42 @@ fn too_many(n: usize) -> CamError {
 /// (cell `(i, k)` at `x0 + (i + ½)·dx`, `θ = (k + ½)·2π / nt`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Grid {
-    Heights { x0: f64, y0: f64, dx: f64, dy: f64, nx: usize, ny: usize, bottom: f64, top: f64 },
-    Radii { x0: f64, dx: f64, nx: usize, nt: usize, radius: f64 },
+    Heights {
+        x0: f64,
+        y0: f64,
+        dx: f64,
+        dy: f64,
+        nx: usize,
+        ny: usize,
+        bottom: f64,
+        top: f64,
+    },
+    /// `radius` is the farthest the stock reaches from the axis; `section`, a box bar's
+    /// `[y0, y1, z0, z1]` round the axis (each ray starting where it leaves that rectangle).
+    Radii {
+        x0: f64,
+        dx: f64,
+        nx: usize,
+        nt: usize,
+        radius: f64,
+        section: Option<[f64; 4]>,
+    },
+}
+
+/// How far the ray from the axis along `(0, s, c)` reaches inside the rectangle `[y0, y1, z0,
+/// z1]` round the axis.
+fn section_reach(sec: [f64; 4], s: f64, c: f64) -> f64 {
+    let [y0, y1, z0, z1] = sec;
+    let along = |d: f64, lo: f64, hi: f64| {
+        if d > 1e-15 {
+            hi / d
+        } else if d < -1e-15 {
+            lo / d
+        } else {
+            f64::INFINITY
+        }
+    };
+    along(s, y0, y1).min(along(c, z0, z1))
 }
 
 impl Grid {
@@ -1209,9 +1263,12 @@ impl Grid {
                 slot: 0,
                 flute: 0.0,
             }),
-            Grid::Radii { x0, dx, nx, nt, radius } => {
+            Grid::Radii { x0, dx, nx, nt, radius, section } => {
                 let dt = TAU / nt as f64;
                 let (sin, cos): (Vec<f64>, Vec<f64>) = (from..to).map(|k| ((k as f64 + 0.5) * dt).sin_cos()).unzip();
+                let start: Vec<f64> =
+                    sin.iter().zip(&cos).map(|(&s, &c)| section.map_or(radius, |sec| section_reach(sec, s, c).min(radius))).collect();
+                let rho = start.iter().flat_map(|&r| std::iter::repeat_n(r, nx)).collect();
                 Model::Radii(Radii {
                     x0,
                     dx,
@@ -1220,7 +1277,8 @@ impl Grid {
                     nt: n,
                     nt_all: nt,
                     radius,
-                    rho: vec![radius; nx * n],
+                    rho,
+                    start,
                     sin,
                     cos,
                     visits: Arc::clone(visits),
@@ -1237,9 +1295,24 @@ impl Grid {
     }
 }
 
-fn grid_for(stock: &StockShape, params: &SimParams) -> Result<(Grid, f64)> {
+fn grid_for(stock: &StockShape, kind: Kind, params: &SimParams) -> Result<(Grid, f64)> {
     let finite = |v: f64| v.is_finite() && v.abs() <= MAX_COORD;
     match *stock {
+        StockShape::Box { min, max } if kind == Kind::Rotary => {
+            if ![min.x, min.y, min.z, max.x, max.y, max.z].into_iter().all(finite) {
+                return invalid("the stock's box must be finite numbers within 1000 m");
+            }
+            if !(max.x > min.x && min.y < 0.0 && max.y > 0.0 && min.z < 0.0 && max.z > 0.0) {
+                return invalid("a box stock on a 4th axis must have a length and the A axis inside it");
+            }
+            let radius = min.y.abs().max(max.y.abs()).hypot(min.z.abs().max(max.z.abs()));
+            let (x_min, x_max) = (min.x, max.x);
+            let cell = cell_size((x_max - x_min) * TAU * radius, params)?;
+            let (nx, nt) = (cells_for(x_max - x_min, cell)?, cells_for(TAU * radius, cell)?.max(8));
+            nx.checked_mul(nt).filter(|n| *n <= MAX_CELLS).ok_or_else(|| too_many(nx.saturating_mul(nt)))?;
+            let section = Some([min.y, max.y, min.z, max.z]);
+            Ok((Grid::Radii { x0: x_min, dx: (x_max - x_min) / nx as f64, nx, nt, radius, section }, cell))
+        }
         StockShape::Box { min, max } => {
             if ![min.x, min.y, min.z, max.x, max.y, max.z].into_iter().all(finite) {
                 return invalid("the stock's box must be finite numbers within 1000 m");
@@ -1272,7 +1345,7 @@ fn grid_for(stock: &StockShape, params: &SimParams) -> Result<(Grid, f64)> {
             let cell = cell_size((x_max - x_min) * TAU * radius, params)?;
             let (nx, nt) = (cells_for(x_max - x_min, cell)?, cells_for(TAU * radius, cell)?.max(8));
             nx.checked_mul(nt).filter(|n| *n <= MAX_CELLS).ok_or_else(|| too_many(nx.saturating_mul(nt)))?;
-            Ok((Grid::Radii { x0: x_min, dx: (x_max - x_min) / nx as f64, nx, nt, radius }, cell))
+            Ok((Grid::Radii { x0: x_min, dx: (x_max - x_min) / nx as f64, nx, nt, radius, section: None }, cell))
         }
     }
 }
@@ -2208,17 +2281,40 @@ impl SimState {
 fn stock_grid(grid: &Grid, values: Vec<f64>) -> StockGrid {
     match *grid {
         Grid::Heights { x0, y0, dx, dy, nx, ny, bottom, top } => StockGrid::Heights { x0, y0, dx, dy, nx, ny, bottom, top, heights: values },
-        Grid::Radii { x0, dx, nx, nt, radius } => StockGrid::Radii { x0, dx, nx, nt, radius, radii: values },
+        Grid::Radii { x0, dx, nx, nt, radius, .. } => StockGrid::Radii { x0, dx, nx, nt, radius, radii: values },
     }
 }
 
 /// Simulates `text` (G-code for `machine`, in absolute coordinates) cutting `stock` with
 /// `tools` (by number), and compares what is left with `part`. See the module documentation.
+///
+/// Without a resolution in `params`, a program whose cuts would visit more cells at the default
+/// cell than the simulation allows (a long 4th-axis program) is simulated at a cell coarse
+/// enough to fit, with a warning saying so; the cell used is in the report.
 pub fn simulate(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShape, part: &Surface, params: &SimParams) -> Result<SimReport> {
-    let plan = plan_sim(text, machine, tools, stock, params)?;
+    let mut plan = plan_sim(text, machine, tools, stock, params)?;
+    let mut coarser = None;
+    if params.resolution.is_none() {
+        let visits: f64 = (0..plan.moves()).map(|k| plan.step_cost(k)).sum();
+        let budget = FIT_SHARE * MAX_VISITS as f64;
+        if visits > budget {
+            // The cells a tool position visits go as the square of the cell's size.
+            let cell = plan.cell() * (visits / budget).sqrt();
+            plan = plan_sim(text, machine, tools, stock, &SimParams { resolution: Some(cell), ..*params })?;
+            coarser = Some(visits);
+        }
+    }
     let mut state = SimState::new(&plan);
     state.advance(&plan, plan.moves(), 0.0)?;
-    Ok(state.finish(&plan, part))
+    let mut report = state.finish(&plan, part);
+    if let Some(visits) = coarser {
+        report.warnings.push(format!(
+            "the program would visit about {visits:.3e} cells at the default resolution, more than the simulation allows: it was simulated \
+             at a cell of {:.3} mm instead (give `resolution` to choose one)",
+            plan.cell()
+        ));
+    }
+    Ok(report)
 }
 
 /// Reads `text` (G-code for `machine`, in absolute coordinates) into the steps that cut `stock`
@@ -2230,9 +2326,8 @@ pub fn plan_sim(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
     }
     let kind = Kind::of(machine)?;
     match (kind, stock) {
-        (Kind::Three, StockShape::Box { .. }) | (Kind::Rotary, StockShape::Cylinder { .. }) => {}
+        (Kind::Three, StockShape::Box { .. }) | (Kind::Rotary, StockShape::Cylinder { .. } | StockShape::Box { .. }) => {}
         (Kind::Three, _) => return invalid("a 3-axis machine's stock is a box"),
-        (Kind::Rotary, _) => return invalid("a 4th axis's stock is a cylinder about X"),
     }
     if tools.is_empty() {
         return invalid("the simulation needs the program's tools");
@@ -2246,10 +2341,11 @@ pub fn plan_sim(text: &str, machine: &Machine, tools: &[Tool], stock: &StockShap
     }
     let blocks = parse5(text, &machine.letters())?;
     let scan = Scan::of(text)?;
-    let (grid, cell) = grid_for(stock, params)?;
-    let (reach, initial) = match *stock {
-        StockShape::Box { min, max } => ((max - min).len(), max.z),
-        StockShape::Cylinder { x_min, x_max, radius } => ((x_max - x_min).hypot(2.0 * radius), radius),
+    let (grid, cell) = grid_for(stock, kind, params)?;
+    let (reach, initial) = match (*stock, grid) {
+        (StockShape::Box { min, max }, Grid::Radii { radius, .. }) => ((max.x - min.x).hypot(2.0 * radius), radius),
+        (StockShape::Box { min, max }, _) => ((max - min).len(), max.z),
+        (StockShape::Cylinder { x_min, x_max, radius }, _) => ((x_max - x_min).hypot(2.0 * radius), radius),
     };
     let lever_extra = machine.work_origin.len() + machine.rotaries.iter().map(|r| r.center.len()).sum::<f64>();
     let area = match grid {
@@ -2462,23 +2558,91 @@ pub(crate) fn distance_within(surface: &Surface, p: Vec3, cap: f64) -> f64 {
     best.get()
 }
 
+/// Most crossings of the part's surface followed along one column when measuring a gouge.
+const MAX_CROSSINGS: usize = 64;
+
+/// How deep a cut along the straight column from `from` (outside the part) to `to` (where the
+/// cut ends) goes into the part, at most `cap`. The part's material along the column is found
+/// from where it crosses the part's surface: a triangle facing against the column starts
+/// material, one facing along it ends it (a crossing that does neither, as where the column
+/// grazes an edge, is passed over). Each stretch of material the column runs through is
+/// measured from its middle to the part's surface, and the column's end when it is inside the
+/// material. Air between the part's surfaces, as down a hole or a pocket, is no gouge however
+/// far it is from them; a stretch of material, however thin, is as deep as its middle.
+///
+/// Where the crossings do not pair up that way (a part whose triangles face inwards, bodies
+/// that overlap, more crossings than are followed), the
+/// material cannot be told from the air, and the column is measured as if it were all
+/// material: from its end, and from the middle of its stretch past the first crossing, to the
+/// part's surface. That never passes a gouge as air. A column that starts inside the part (the
+/// surface behind its start faces against it) starts in its material.
+pub(crate) fn column_depth(part: &Surface, from: Vec3, to: Vec3, cap: f64) -> f64 {
+    let d = to - from;
+    let len = d.len();
+    if !(len > 1e-12) || !len.is_finite() {
+        return 0.0;
+    }
+    let step = 1e-9 / len;
+    let measure = |a: f64, b: f64| distance_within(part, from + d * (0.5 * (a + b)), cap);
+    let facing = |i: usize| part.triangle(i).map_or(0.0, |tri| (tri[1] - tri[0]).cross(tri[2] - tri[0]).dot(d));
+    let (mut t0, mut inside, mut start, mut worst) = (0.0f64, false, 0.0f64, 0.0f64);
+    let (mut first, mut paired, mut ended) = (None, true, false);
+    // A column that starts inside the part: the surface behind its start faces against it.
+    if let Some((_, i)) = part.raycast(from, -d)
+        && facing(i) < 0.0
+    {
+        (inside, first) = (true, Some(0.0));
+    }
+    for _ in 0..MAX_CROSSINGS {
+        let Some((t, i)) = part.raycast(from + d * t0, d) else {
+            ended = true;
+            break;
+        };
+        let at = t0 + t;
+        if !(at <= 1.0) {
+            ended = true;
+            break;
+        }
+        let facing = facing(i);
+        if facing != 0.0 {
+            first.get_or_insert(at);
+        }
+        if facing < 0.0 && !inside {
+            (inside, start) = (true, at);
+        } else if facing > 0.0 && inside {
+            inside = false;
+            worst = worst.max(measure(start, at));
+        } else if facing != 0.0 {
+            paired = false;
+            break;
+        }
+        t0 = at + step;
+    }
+    if !(paired && ended) {
+        return distance_within(part, to, cap).max(measure(first.unwrap_or(0.0), 1.0)).min(cap);
+    }
+    if inside {
+        worst = worst.max(measure(start, 1.0)).max(distance_within(part, to, cap));
+    }
+    worst.min(cap)
+}
+
 /// The stock left in `model` (a band) against the part; cells the program cut are those below
 /// `initial` (the stock's top or radius). At most `refine` gouged cells are measured in 3D.
 fn compare(model: &Model, part: &Surface, tol: f64, initial: f64, refine: usize) -> Comparison {
     let mut cmp = Comparison::default();
     let (mut refined, mut unrefined) = (0usize, 0usize);
-    // The depth into the part of a column cut from `outer` (the part's surface along the
-    // column) in to `at`, `gap` deep along it: `point(v)` is the column's point at height (or
-    // radius) `v`. Measured from the column's bottom and middle to the part's surface.
+    // The depth into the part of a column cut from outside the part (`point(outer)`) in to
+    // `at`, `gap` deep below the part's surface along it: `point(v)` is the column's point at
+    // height (or radius) `v`. Measured in 3D over the material the column runs through
+    // ([`column_depth`]).
     let mut depth = |gap: f64, at: f64, outer: f64, point: &dyn Fn(f64) -> Vec3| -> f64 {
         if refined >= refine {
             unrefined += 1;
             return gap;
         }
         refined += 1;
-        let bottom = distance_within(part, point(at), gap);
-        let middle = distance_within(part, point(0.5 * (at + outer)), gap * 0.5);
-        bottom.max(middle)
+        column_depth(part, point(outer), point(at), gap)
     };
     match model {
         Model::Heights(h) => {
@@ -2492,7 +2656,7 @@ fn compare(model: &Model, part: &Surface, tol: f64, initial: f64, refine: usize)
                     let surface = h.top + 1.0 - t * span;
                     let gap = z - surface;
                     if gap < -tol {
-                        let d = depth(-gap, z, surface, &|v| Vec3::new(x, y, v));
+                        let d = depth(-gap, z, h.top + 1.0, &|v| Vec3::new(x, y, v));
                         if d > tol {
                             cmp.gouged += 1;
                             cmp.worst = cmp.worst.max(d);
@@ -2521,13 +2685,13 @@ fn compare(model: &Model, part: &Surface, tol: f64, initial: f64, refine: usize)
                     let surface = out * (1.0 - t);
                     let gap = rho - surface;
                     if gap < -tol {
-                        let d = depth(-gap, rho, surface, &|v| Vec3::new(x, 0.0, 0.0) + dir * v);
+                        let d = depth(-gap, rho, out, &|v| Vec3::new(x, 0.0, 0.0) + dir * v);
                         if d > tol {
                             cmp.gouged += 1;
                             cmp.worst = cmp.worst.max(d);
                         }
                     }
-                    if rho < initial - 1e-9 {
+                    if rho < r.start.get(k).copied().unwrap_or(initial) - 1e-9 {
                         cmp.machined += 1;
                         let left = gap.max(0.0);
                         cmp.leftover_sum += left;

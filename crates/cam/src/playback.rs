@@ -30,7 +30,7 @@ use crate::kinematics::{bed_point, head_frame};
 use crate::machine_model::{MachineModel, ZoneOf, clearance, zones};
 use crate::machine_time::{DwellUnit, MachineRates, block_times};
 use crate::multiaxis::Pose;
-use crate::sim::{Footprint, Grid, SimPlan, SimState, distance_within};
+use crate::sim::{Footprint, Grid, SimPlan, SimState, column_depth};
 use crate::surface::Surface;
 use crate::tool::Tool;
 use crate::workholding::HoldScene;
@@ -547,7 +547,7 @@ impl Playback {
             ev("rapid-in-stock", Severity::Error, r.at, r.depth, format!("a rapid cuts {} mm into the stock (a crash on the machine)", mm(r.depth)));
         }
         if r.gouge > tol {
-            let d = distance_within(&self.part, r.gouge_at, r.gouge);
+            let d = column_depth(&self.part, r.gouge_from, r.gouge_at, r.gouge);
             if d > tol {
                 let (sev, why) = if deliberate { (Severity::Warning, " (its operation has `gouge_check: false`)") } else { (Severity::Error, "") };
                 ev("gouge", sev, r.gouge_at, d, format!("the tool cuts {} mm into the part{why}", mm(d)));

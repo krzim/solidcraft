@@ -101,19 +101,83 @@ fn the_table_itself_and_a_rotary_unit() {
     let hold = Workholding::from_json(
         r#"{"format": "solidcraft.workholding", "version": 1, "holding": "rotary",
             "rotary": {"axis": [60, 70], "headstock": {"min": [10, 20, 0], "max": [80, 100, 110]},
-                       "chuck": {"diameter": 80, "length": 40, "face_x": 120},
+                       "chuck": {"diameter": 80, "length": 40, "face_x": 120, "side": "minus_x"},
                        "tailstock": {"min": [250, 40, 0], "max": [290, 80, 90]}}}"#,
     )
     .unwrap();
     let bar = StockShape::Cylinder { x_min: 0.0, x_max: 100.0, radius: 15.0 };
     let s = build(&table(), &hold, &bar).unwrap();
-    // Work zero on the A axis at the chuck's face (the bar's low end there).
+    // A chuck on the -X side: work zero on the A axis at the chuck's face (the bar's low end
+    // there), the chuck reaching back from it towards -X.
     close3(s.work_zero_table, Vec3::new(120.0, 60.0, 70.0), 1e-12);
     let chuck = s.obstacles.iter().find(|o| o.name == "the rotary unit's chuck").unwrap();
     close3(chuck.max, Vec3::new(0.0, 40.0, 40.0), 1e-12);
     assert_eq!(s.obstacles.iter().filter(|o| o.kind == ObstacleKind::Rotary).count(), 3);
-    // A rotary unit holds a bar, not a box.
+    // A rotary unit holds a bar the A axis runs through (a square one too), not a plate below
+    // the axis.
     assert!(build(&table(), &hold, &coupon()).is_err());
+    let square = StockShape::Box { min: Vec3::new(0.0, -15.0, -15.0), max: Vec3::new(100.0, 15.0, 15.0) };
+    close3(build(&table(), &hold, &square).unwrap().work_zero_table, Vec3::new(120.0, 60.0, 70.0), 1e-12);
+}
+
+/// The usual layout: the unit and its chuck at the table's +X end, the bar standing out towards
+/// -X with its +X end in the jaws; work zero on the A axis.
+#[test]
+fn a_rotary_unit_holds_the_bar_from_the_plus_x_side_by_default() {
+    let hold = Workholding::from_json(
+        r#"{"format": "solidcraft.workholding", "version": 1, "holding": "rotary",
+            "rotary": {"axis": [57, 65], "headstock": {"min": [222, 12, 0], "max": [300, 102, 160]},
+                       "chuck": {"diameter": 80, "length": 45, "face_x": 180,
+                                 "jaws": {"radial": 12, "axial": 15}}}}"#,
+    )
+    .unwrap();
+    // The bar: 30 mm across, its free end at X -50, 20 mm of it in the jaws (to X 20).
+    let bar = StockShape::Cylinder { x_min: -50.0, x_max: 20.0, radius: 15.0 };
+    let s = build(&table(), &hold, &bar).unwrap();
+    // The bar's +X end at the chuck's face: work zero 20 mm towards -X from it.
+    close3(s.work_zero_table, Vec3::new(160.0, 57.0, 65.0), 1e-12);
+    // The chuck's body reaches from its face towards +X, into the unit.
+    let chuck = s.obstacles.iter().find(|o| o.name == "the rotary unit's chuck").unwrap();
+    close3(chuck.min, Vec3::new(20.0, -40.0, -40.0), 1e-12);
+    close3(chuck.max, Vec3::new(65.0, 40.0, 40.0), 1e-12);
+    // The jaws stand 15 mm out of the face towards the work, 12 mm beyond the bar, never inside it.
+    let jaws: Vec<_> = s.obstacles.iter().filter(|o| o.name == "the rotary unit's jaws").collect();
+    assert!(!jaws.is_empty());
+    for j in &jaws {
+        assert!(j.min.x >= 5.0 - 1e-9 && j.max.x <= 20.0 + 1e-9, "{j:?}");
+        assert!(j.min.y >= -27.0 - 1e-9 && j.max.y <= 27.0 + 1e-9 && j.min.z >= -27.0 - 1e-9 && j.max.z <= 27.0 + 1e-9, "{j:?}");
+        let inside_bar = j.min.y < 15.0 && j.max.y > -15.0 && j.min.z < 15.0 && j.max.z > -15.0;
+        assert!(!inside_bar, "{j:?}");
+    }
+    // Above the bar in the jaws: a tool coming down there meets a jaw.
+    let top = Vec3::new(12.0, 0.0, 20.0);
+    let holds = |j: &&crate::machine_model::Obstacle| {
+        j.min.x <= top.x && top.x <= j.max.x && j.min.y <= top.y && top.y <= j.max.y && j.min.z <= top.z && top.z <= j.max.z
+    };
+    assert!(jaws.iter().any(holds));
+    assert!(s.findings.is_empty(), "{:?}", s.findings);
+    // Work zero given: a bar that does not reach the jaws is not held.
+    let mut short = hold.clone();
+    if let Some(r) = short.rotary.as_mut() {
+        r.zero_x = Some(100.0);
+    }
+    let s = build(&table(), &short, &bar).unwrap();
+    assert_eq!(s.findings.iter().map(|f| f.code.as_str()).collect::<Vec<_>>(), ["stock-not-gripped"]);
+    // ... and one with 2 mm in the jaws is held only just.
+    if let Some(r) = short.rotary.as_mut() {
+        r.zero_x = Some(147.0);
+    }
+    let s = build(&table(), &short, &bar).unwrap();
+    assert_eq!(s.findings.iter().map(|f| f.code.as_str()).collect::<Vec<_>>(), ["shallow-grip"]);
+    // Jaws of no size are refused, and so is a side that is not a side.
+    for bad in [r#""jaws": {"radial": 0, "axial": 15}"#, r#""side": "up""#] {
+        let text = format!(
+            r#"{{"format": "solidcraft.workholding", "version": 1, "holding": "rotary",
+                "rotary": {{"axis": [57, 65], "headstock": {{"min": [222, 12, 0], "max": [300, 102, 160]}},
+                           "chuck": {{"diameter": 80, "length": 45, "face_x": 180, {bad}}}}}}}"#
+        );
+        assert!(Workholding::from_json(&text).is_err(), "{bad}");
+    }
 }
 
 #[test]

@@ -273,7 +273,7 @@ fn turning_radius(ctx: &Ctx<'_>, spec: &OperationSpec, post: &Post5, own_top: f6
     };
     match spec {
         OperationSpec::RotaryFinish(o) => Some((o.clearance, f64::NEG_INFINITY)),
-        OperationSpec::RotaryRoughing(o) => Some((o.clearance, o.stock_radius)),
+        OperationSpec::RotaryRoughing(o) => Some((o.clearance, roughing_stock_radius(ctx, o).unwrap_or(f64::NEG_INFINITY))),
         OperationSpec::Wrap(o) => Some((o.radius + o.clearance.unwrap_or(WRAP_CLEARANCE), f64::NEG_INFINITY)),
         OperationSpec::WrapPocket(o) => Some((o.radius + o.clearance.unwrap_or(WRAP_CLEARANCE), f64::NEG_INFINITY)),
         OperationSpec::WrapContour(o) => Some((o.radius + o.clearance.unwrap_or(WRAP_CLEARANCE), f64::NEG_INFINITY)),

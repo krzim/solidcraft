@@ -605,3 +605,65 @@ fn rotary_rings_step_over_exactly_along_x() {
     let json = serde_json::to_string(&RotaryPattern::Rings { stepover: 2.0, zigzag: false }).unwrap();
     assert_eq!(json, r#"{"type":"rings","stepover":2.0,"zigzag":false}"#);
 }
+
+/// The profile `(x, r)` turned about the X axis in `n` steps.
+fn turned_x(profile: &[(f64, f64)], n: usize) -> Surface {
+    let at = |x: f64, r: f64, k: usize| Vec3::new(x, 0.0, 0.0) + radial(TAU * k as f64 / n as f64) * r;
+    let mut tris = Vec::new();
+    for w in profile.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        for k in 0..n {
+            tris.push([at(a.0, a.1, k), at(b.0, b.1, k), at(b.0, b.1, k + 1)]);
+            tris.push([at(a.0, a.1, k), at(b.0, b.1, k + 1), at(a.0, a.1, k + 1)]);
+        }
+    }
+    Surface::new(tris).unwrap()
+}
+
+/// A spindle: r 14 to a shoulder at X -8, down its face to an R3 fillet into r 10. A ⌀4 ball
+/// on the ring at X -6 just reaches the shoulder's face with its side: it rests in the fillet
+/// (radius 11), and the mesh's facets, each within its tessellation error of the true surface,
+/// must not hold it up by up to a millimetre at some angles and not at others (a ring that
+/// dips in and out thousands of times). It runs round at one radius, its ball never more than
+/// that error into the mesh.
+#[test]
+fn a_ring_beside_a_shoulder_runs_round_at_one_radius() {
+    let tol = 0.01;
+    let chord = 0.25 * tol;
+    // The fillet in steps whose chords are within the tessellation error of the arc.
+    let steps = (FRAC_PI_2 / (2.0 * (1.0f64 - chord / 3.0).acos())).ceil() as usize;
+    let mut profile = vec![(-30.0, 0.0), (-30.0, 14.0), (-8.0, 14.0), (-8.0, 13.0)];
+    profile.extend((1..steps).map(|k| {
+        let a = PI + FRAC_PI_2 * k as f64 / steps as f64;
+        (-5.0 + 3.0 * a.cos(), 13.0 + 3.0 * a.sin())
+    }));
+    profile.extend([(-5.0, 10.0), (10.0, 10.0), (10.0, 0.0)]);
+    let n = (PI / (1.0f64 - chord / 14.0).acos()).ceil() as usize;
+    let s = turned_x(&profile, n);
+    let tool = ball(4.0);
+    let mut p = finish(RotaryPattern::Rings { stepover: 1.0, zigzag: false });
+    p.range = Some([-7.0, -5.0]);
+    p.tolerance = tol;
+    let path = rotary_finish(&s, &tool, &p).unwrap();
+    let ring: Vec<Pose> = path
+        .moves
+        .iter()
+        .filter_map(|m| match *m {
+            Move5::Feed { to, .. } if (to.tip.x + 6.0).abs() < 1e-9 && radius(to.tip) < 12.5 => Some(to),
+            _ => None,
+        })
+        .collect();
+    assert!(ring.len() >= 150, "{}", ring.len());
+    let radii: Vec<f64> = ring.iter().map(|q| radius(q.tip)).collect();
+    let (lo, hi) = radii.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), r| (a.min(*r), b.max(*r)));
+    assert!(hi - lo <= tol, "the ring's radius runs from {lo} to {hi}");
+    assert!((lo - 11.0).abs() <= 0.1, "{lo}");
+    // A whole turn in no more moves than the angle step asks for.
+    assert!(ring.len() <= 200, "{} moves on the ring", ring.len());
+    // Never more than the tessellation error into the mesh, measured from the ball's centre.
+    for q in path.poses() {
+        let centre = q.tip + q.axis * 2.0;
+        let d = crate::sim::distance_within(&s, centre, 2.0);
+        assert!(d >= 2.0 - chord - 1e-6, "{q:?}: the ball is {} mm into the part", 2.0 - d);
+    }
+}

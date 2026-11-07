@@ -207,6 +207,17 @@ impl Stock {
         }
     }
 
+    /// Whether every point of `part` lies inside the stock, within `tol`: a bar is held against
+    /// how far the part's points reach from its axis, not its box's corners.
+    pub fn holds_surface(&self, part: &crate::Surface, tol: f64) -> bool {
+        match *self {
+            Stock::Box { .. } => self.holds(&part.bounds(), tol),
+            Stock::Cylinder { radius, x_min, x_max } => {
+                part.triangles().iter().flatten().all(|p| p.x >= x_min - tol && p.x <= x_max + tol && p.y.hypot(p.z) <= radius + tol)
+            }
+        }
+    }
+
     /// How deep the cutter at `pose` (a cylinder of `radius` from the tip along its axis
     /// without end) is in the stock, where it is deeper than `tol`: the least it would have to
     /// move to clear it, along its axis or sideways. `None` when it is clear.

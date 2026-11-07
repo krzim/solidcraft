@@ -81,7 +81,8 @@ pub static COMMANDS: &[CommandSpec] = &[
              tools with Z min, operations, checks, warnings); dry_run?: plan and check, write nothing; allow_unsafe?: write even when a \
              check fails; compact?: a short reply (passed, failures with fixes, one line per operation, outputs, tools, total_minutes); \
              simulate?: also run the written program through cam.simulate's stock model (a gouge or a rapid in material \
-             fails) → operations: [{name, kind, tool, moves, cut_length, cut_minutes (rewinds' feeds included), rewinds, max_tilt_deg, \
+             fails); simulate_resolution?: its cell mm (default 5 × tolerance, coarser to fit a large stock or a long program) → \
+             operations: [{name, kind, tool, moves, cut_length, cut_minutes (rewinds' feeds included), rewinds, max_tilt_deg, \
              a_deg?, gouge, gouge_at?, holder_collisions, \
              warnings}], program_lines, program_head, readback: {max_tip_deviation, max_axis_deviation_deg, allowed_tip, allowed_axis_deg, \
              cut_minutes, pass}, cut_minutes, rapid_minutes?, machine_time?: {cut_minutes, written_cut_minutes, rapid_minutes, \
@@ -122,7 +123,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .output(output_schema_for::<crate::schema::cam_sim::CamSimulateReply>)
         .params(
             "path: G-code file; job: {…} | job_path: .json (the job it was written for: machine, tools, bodies, origin, tolerance); \
-             resolution?: cell mm (default 5 × tolerance, at most 20 M cells); stock_stl?: STL path for the stock left → stock: {kind: \
+             resolution?: cell mm (default 5 × tolerance, coarser to fit a large stock or a long program); stock_stl?: STL path for the stock left → stock: {kind: \
              box | cylinder, min?, max?, x_range?, radius?, derived}, resolution, cells, gouge: {worst, cells}, rapids_in_material: \
              [{line, volume, depth}], leftover: {max, mean, cells}, removed_volume, minutes, slot_moves, passed, failures, warnings, \
              notes, stock_stl?. The stock is swept by every block (3-axis: a heightfield; 4th axis: radii over x and A) and compared \
@@ -790,6 +791,16 @@ fn material_top(ctx: &Ctx<'_>, frame: &Frame) -> Option<f64> {
     top.is_finite().then_some(top)
 }
 
+/// The radius a `rotary_roughing` starts from: its own `stock_radius`, else the job's stock's
+/// (a cylinder's radius, or how far a box's farthest edge is from the A axis).
+fn roughing_stock_radius(ctx: &Ctx<'_>, o: &crate::schema::cam::RotaryRoughingOp) -> Option<f64> {
+    use solidcraft_cam::stock::Stock;
+    o.stock_radius.or_else(|| match ctx.stock? {
+        Stock::Cylinder { radius, .. } => Some(*radius),
+        Stock::Box { min, max } => Some(min.y.abs().max(max.y.abs()).hypot(min.z.abs().max(max.z.abs()))),
+    })
+}
+
 /// The share of a 3D operation's budget it plans within, and the share its moves may then move
 /// by when merged (with the share it plans within again).
 fn split_budget(budget: f64) -> (f64, Option<(f64, f64)>) {
@@ -1260,7 +1271,8 @@ fn plan(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Planned> {
             let r = ctx.resolve(&c)?;
             let params = RotaryRoughingParams {
                 pattern: pattern(ctx, c.name, o.pattern)?,
-                stock_radius: o.stock_radius,
+                stock_radius: roughing_stock_radius(ctx, o)
+                    .ok_or_else(|| ctx.bad(c.name, "give `stock_radius`, or the job a `stock` (a `cylinder` about X or a `box`) to take it from"))?,
                 clearance: o.clearance,
                 retract: o.retract,
                 floor: o.floor.unwrap_or(0.0),
@@ -1615,7 +1627,14 @@ fn run_job(s: &mut Session, cmd: &str, raw: &Value, params: CamJobParams, only: 
         cam_stock::check_motion(cmd, job, &text, &program, &post, &machine, &surfaces, stock.as_ref(), &unchecked, tol, &mut failures)?;
     let simulation = if params.simulate.unwrap_or(false) {
         let deliberate = planned.iter().any(|p| !p.gouge_check);
-        match sim::check_program(cmd, &text, &machine, &tools, &surfaces.part, stock.as_ref(), tol, None, deliberate) {
+        // A thread mill cuts in the simulation as the core its operation's gouge check took.
+        let cores: Vec<Tool> = planned
+            .iter()
+            .map(|p| p.tool.clone())
+            .filter(|c| c.kind != ToolKind::ThreadMill && tools.iter().any(|t| t.number == c.number && t.kind == ToolKind::ThreadMill))
+            .collect();
+        let sim_tools = sim::with_thread_cores(&tools, &cores);
+        match sim::check_program(cmd, &text, &machine, &sim_tools, &surfaces.part, stock.as_ref(), tol, params.simulate_resolution, deliberate) {
             Ok((reply, _)) => {
                 failures.extend(reply.failures.iter().cloned());
                 Some(reply)

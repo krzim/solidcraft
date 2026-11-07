@@ -406,7 +406,11 @@ pub fn bore(holes: &[Hole], tool: &Tool, p: &BoreParams) -> Result<HelicalPath> 
 /// thread mill's own shank and holder. Only thread milling checks with it: anywhere else a
 /// thread mill is checked whole ([`Tool::cutter`]), its teeth and all.
 pub fn thread_check_tool(tool: &Tool, p: &ThreadParams) -> Result<Tool> {
-    let depth = p.thread_depth();
+    thread_core(tool, p.thread_depth())
+}
+
+/// [`thread_check_tool`] for a thread `depth` deep (radially, mm).
+pub fn thread_core(tool: &Tool, depth: f64) -> Result<Tool> {
     if !(depth > 0.0) || !(depth < tool.radius()) {
         return invalid("the thread must be less deep than the thread mill's radius");
     }

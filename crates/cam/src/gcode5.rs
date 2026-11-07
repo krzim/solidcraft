@@ -689,13 +689,12 @@ impl Writer5<'_> {
             self.pos = self.pos.map(|_| at);
             self.height = Height::At(h);
         }
-        // The turn states its motion code, alone on its block as it is, and so does the move
-        // after it.
+        // The turn states its motion code, alone on its block as it is; the move after it is
+        // still a rapid and does not repeat it.
         self.mode = None;
         let mut block = vec![self.motion(0)];
         block.extend(self.rotary_words(rot));
         self.block(&join(&block));
-        self.mode = None;
         self.release();
         Ok(())
     }
@@ -1088,6 +1087,23 @@ fn first_turn(motion: &Motion) -> Option<&[f64]> {
 
 /// Slack (radians) of an angle against a limit.
 const LIMIT_SLACK: f64 = 1e-9;
+/// How far past a limit (radians, 0.0006°) a cut's angle is taken back to the limit rather than
+/// rewound: a path drawn a hair longer than a whole turn (to rounding, below what the angle is
+/// written to) ends at the limit, rather than turning A back two turns to cut the hair.
+const LIMIT_SNAP: f64 = 1e-5;
+
+/// `j`'s rotaries no more than [`LIMIT_SNAP`] past `machine`'s limits brought back to them.
+fn snap_to_limits(machine: &Machine, j: &mut Joints) {
+    for (r, a) in machine.rotaries.iter().zip(j.rotary.iter_mut()) {
+        if let Some((lo, hi)) = r.limits {
+            if *a > hi && *a <= hi + LIMIT_SNAP {
+                *a = hi;
+            } else if *a < lo && *a >= lo - LIMIT_SNAP {
+                *a = lo;
+            }
+        }
+    }
+}
 /// Most rewinds within one machine move.
 const MAX_REWINDS_PER_MOVE: usize = 64;
 
@@ -1216,6 +1232,7 @@ fn unwind_from(machine: &Machine, moves: &[JointMove], previous: Option<&Joints>
                 for (a, s) in to.rotary.iter_mut().zip(&shift) {
                     *a += s;
                 }
+                snap_to_limits(machine, &mut to);
                 for (i, lo, hi) in beyond(machine, &to) {
                     let reference = last.as_ref().and_then(|l| l.rotary.get(i).copied()).unwrap_or(0.0);
                     if let (Some(a), Some(s)) = (to.rotary.get_mut(i), shift.get_mut(i))
@@ -1233,6 +1250,7 @@ fn unwind_from(machine: &Machine, moves: &[JointMove], previous: Option<&Joints>
                 for (a, s) in to.rotary.iter_mut().zip(&shift) {
                     *a += s;
                 }
+                snap_to_limits(machine, &mut to);
                 let Some(mut from) = last.clone() else { return Err(at(CamError::Unsafe("a cut before the first positioning move".into()))) };
                 for _ in 0..MAX_REWINDS_PER_MOVE {
                     let over = beyond(machine, &to);

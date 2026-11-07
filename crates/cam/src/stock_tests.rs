@@ -5,7 +5,7 @@ use solidcore_record::{Vec2, Vec3};
 use solidcraft_geom::Aabb3;
 use solidcraft_geom::prelude::*;
 
-use crate::foundation_tests::close;
+use crate::foundation_tests::{close, cylinder_x};
 use crate::stock::{FACE_LEAD, FaceParams, Stock, default_face_overhang, default_face_stepover, face, flat_diameter};
 use crate::*;
 
@@ -169,6 +169,13 @@ fn stock_intrusion_closed_forms() {
     assert_eq!(s, Stock::Box { min: Vec3::new(-11.0, -7.0, -8.5), max: Vec3::new(11.0, 7.0, 0.5) });
     assert!(s.holds(&part, 0.0));
     assert!(!bar.holds(&[Vec3::new(-10.0, -10.0, -10.0), Vec3::new(10.0, 10.0, 10.0)].into_iter().collect(), 0.01));
+    // A round part in a bar of its own radius: its box's corners stand outside the bar, the
+    // part itself does not.
+    let round = cylinder_x(12.0, -30.0, 30.0, 48);
+    assert!(bar.holds_surface(&round, 0.01));
+    assert!(!bar.holds_surface(&cylinder_x(12.5, -30.0, 30.0, 48), 0.01));
+    assert!(!bar.holds_surface(&cylinder_x(12.0, -30.0, 31.0, 48), 0.01));
+    assert!(s.holds_surface(&crate::foundation_tests::block(Vec3::new(-10.0, -5.0, -8.0), Vec3::new(10.0, 5.0, 0.0)), 0.0));
 }
 
 #[test]
