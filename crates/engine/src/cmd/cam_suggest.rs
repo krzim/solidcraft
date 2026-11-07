@@ -725,12 +725,16 @@ fn operations(
         // The finishing contour round its walls, added after the holes.
         let corner = pk.min_corner_radius;
         let takes = |t: &Pick| contour_takes(&t.tool, &regions, Side::Inside, g.top, g.bottom, tol);
-        let finish = flats
-            .iter()
-            .copied()
-            .filter(|t| t.tool.radius() <= corner + 1e-9)
-            .find(|t| takes(t))
-            .or_else(|| smallest(flats.iter().copied().filter(|t| takes(t)), material));
+        let finish = flats.iter().copied().filter(|t| t.tool.radius() <= corner + 1e-9).find(|t| takes(t)).or_else(|| {
+            // Sharp corners: the smallest that fits and reaches the floor out of its holder.
+            // (a shank wider than the flutes must stay above the floor too)
+            let reaches = |t: &&Pick| {
+                let shank_clear = t.tool.shank_diameter.is_none_or(|d| d <= t.tool.diameter + 1e-9) || t.tool.flute_length >= pk.depth;
+                shank_clear && t.tool.stickout.unwrap_or(t.tool.flute_length) >= pk.depth + 1.0
+            };
+            smallest(flats.iter().copied().filter(|t| takes(t) && reaches(t)), material)
+                .or_else(|| smallest(flats.iter().copied().filter(|t| takes(t)), material))
+        });
         let Some(finish) = finish else {
             plan.skipped.push(format!("{}: no flat end mill fits round its walls for a finishing pass", pk.id));
             continue;
