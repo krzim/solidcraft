@@ -136,6 +136,9 @@ const MAX_JSON_BYTES: usize = 16 << 20;
 const MAX_GCODE_BYTES: usize = 256 << 20;
 /// Most operations in a job.
 const MAX_OPERATIONS: usize = 200;
+/// Most operations of a job planned side by side: each may hold a lot of memory while it is
+/// planned.
+const PLAN_THREADS: usize = 8;
 /// Most tools in a job.
 const MAX_TOOLS: usize = 1000;
 /// Most bodies named in a job.
@@ -618,41 +621,6 @@ fn sketch_regions(cmd: &str, s: &Session, key: &str, profiles: Option<&[usize]>,
     };
     let lp = |l: &Loop2| Loop2 { segs: l.segs.iter().map(seg).collect() };
     Ok(regions.iter().map(|r| Region2 { outer: lp(&r.outer), holes: r.holes.iter().map(lp).collect() }).collect())
-}
-
-/// `f` for every item, each on a thread of its own (with the kernel's stack, and the caller's
-/// file scope) natively; one after the other in the browser, for a single item, or where a
-/// thread cannot be had. The results in order; `None` for an item whose thread stopped.
-fn plan_each<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<Option<R>> {
-    if items.len() <= 1 || cfg!(target_arch = "wasm32") {
-        return items.into_iter().map(|t| Some(f(t))).collect();
-    }
-    let scope = solidcraft_io::vfs::current_scope();
-    let (f, scope) = (&f, &scope);
-    std::thread::scope(|threads| {
-        let mut pending = Vec::with_capacity(items.len());
-        for item in items {
-            // The item goes through a slot the thread takes it from, so that it is still here
-            // when no thread can be had.
-            let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(item)));
-            let mine = std::sync::Arc::clone(&slot);
-            let job = move || {
-                let item = mine.lock().ok().and_then(|mut s| s.take());
-                item.map(|t| solidcraft_io::vfs::scoped(scope.clone(), || f(t)))
-            };
-            match solidcraft_kernel::kernel_thread("solidcraft-cam-plan").spawn_scoped(threads, job) {
-                Ok(h) => pending.push(Err(h)),
-                Err(_) => pending.push(Ok(slot.lock().ok().and_then(|mut s| s.take()).map(f))),
-            }
-        }
-        pending
-            .into_iter()
-            .map(|p| match p {
-                Ok(done) => done,
-                Err(h) => h.join().ok().flatten(),
-            })
-            .collect()
-    })
 }
 
 /// What the operations of a job share while they are planned, side by side or not: a
@@ -1523,14 +1491,31 @@ fn plan_job(cmd: &str, s: &Session, loaded: &agent::Loaded) -> Result<PlannedJob
     let mut refused = Vec::new();
     // Every operation planned on its own with a fork of the agent, side by side natively; then,
     // in order, what each recorded taken back and its set-up checked against the one before:
-    // the same plan, notes and refusals as one after the other.
-    let work: Vec<(usize, &OperationSpec, agent::Agent)> = job.operations.iter().enumerate().map(|(i, spec)| (i, spec, agent.fork())).collect();
-    let results = plan_each(work, |(i, spec, fork)| {
-        fork.start(i);
-        let r = xrotary::plan_op(&shared.ctx(&fork), spec, pose_tol);
-        (fork, r)
+    // the same plan, notes and refusals as one after the other. Only the operations that fit
+    // in the job whatever those before them plan are planned side by side; the rest one after
+    // the other, each refused before it is planned when the job has no room for it.
+    let side_by_side = xrotary::fitting(&job.operations);
+    let work: Vec<(usize, &OperationSpec, std::sync::Mutex<Option<agent::Agent>>)> =
+        job.operations.iter().take(side_by_side).enumerate().map(|(i, spec)| (i, spec, std::sync::Mutex::new(Some(agent.fork())))).collect();
+    let scope = solidcraft_io::vfs::current_scope();
+    let results = solidcraft_kernel::map_on_threads(&work, PLAN_THREADS, |(i, spec, slot)| {
+        let fork = slot.lock().ok().and_then(|mut f| f.take())?;
+        solidcraft_io::vfs::scoped(scope.clone(), || {
+            fork.start(*i);
+            let r = xrotary::plan_op(&shared.ctx(&fork), spec, pose_tol, 0);
+            Some((fork, r))
+        })
     });
-    for (i, (spec, result)) in job.operations.iter().zip(results).enumerate() {
+    let mut results = results.into_iter().map(Option::flatten);
+    for (i, spec) in job.operations.iter().enumerate() {
+        let result = if i < side_by_side {
+            results.next().flatten()
+        } else {
+            let fork = agent.fork();
+            fork.start(i);
+            let r = xrotary::plan_op(&shared.ctx(&fork), spec, pose_tol, planned.len());
+            Some((fork, r))
+        };
         let r = match result {
             Some((fork, r)) => {
                 agent.absorb(fork);

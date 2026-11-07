@@ -2539,6 +2539,13 @@ fn hostile_rotary_operations_are_refused_without_panics() {
             Ok(v) => panic!("{p}: accepted: {v}"),
         }
     }
+    // Operations past 200 in all are refused before they are planned: the pattern's own error
+    // never shows, as it never runs.
+    let mut bad = face_op("face", 40.0);
+    bad["stepover"] = json!(-1);
+    let over = json!([face_op("plain", 40.0), {"type": "indexed_pattern", "count": 200, "operation": bad}]);
+    let e = s.execute("cam.job", &json!({"job": faces_job(over), "dry_run": true})).unwrap_err().to_string();
+    assert!(e.contains("at most 200 operations") && !e.contains("stepover"), "{e}");
     // The new operations need a 4th axis; rings need a stepover.
     let mut on3 = slot_job("wrap_pocket");
     on3["machine"] = json!("3axis");
@@ -5103,4 +5110,17 @@ fn speeds_from_cutting_data_are_held_to_the_machine_and_stated_first_on_the_shee
     let mut bad = job.clone();
     bad["tools"][0]["surface_speed"] = json!(-1);
     assert!(s.execute("cam.job", &json!({"job": bad, "dry_run": true})).is_err());
+    // A feed from the chip load past the machine's top feed (10000 × 3 × 0.4 = 12000) is held
+    // to it, and so is the plunge that follows it without a `plunge_feed` of its own: never
+    // faster than the cut, and down no faster than Z's top feed.
+    let mut fast = job.clone();
+    fast["tools"][0]["chip_load"] = json!(0.4);
+    fast["tools"][0].as_object_mut().unwrap().remove("plunge_feed");
+    let out = dir.file("fast.tap");
+    run(&mut s, "cam.job", json!({"job": fast, "output": out}));
+    let text = std::fs::read_to_string(&out).unwrap();
+    let feeds: Vec<f64> =
+        text.lines().flat_map(|l| l.split_whitespace()).filter_map(|w| w.strip_prefix('F')).filter_map(|f| f.parse().ok()).collect();
+    assert!(feeds.contains(&8000.0) && feeds.iter().all(|f| *f <= 8000.0), "{feeds:?}");
+    assert!(feeds.contains(&4000.0), "the plunge is held to Z's top feed: {feeds:?}");
 }

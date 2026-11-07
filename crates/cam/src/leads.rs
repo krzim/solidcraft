@@ -226,6 +226,8 @@ fn xy(p: solidcore_record::Vec3) -> Vec2 {
 /// down many times faster than that (a 30° ramp at 2880 mm/min goes down at 1440 mm/min, where
 /// a small tool may be rated for 100).
 fn limit_descent(moves: &mut [Move], plunge: f64) {
+    /// Points a vertical arc's slope is taken at, its ends included.
+    const STEEPEST_SAMPLES: usize = 64;
     let cap = |feed: &mut f64, len: f64, dz: f64| {
         let most = plunge * (len / dz).max(1.0);
         if *feed > most {
@@ -243,9 +245,18 @@ fn limit_descent(moves: &mut [Move], plunge: f64) {
                 let run = xy(p).dist(*center) * arc_sweep(p, *to, *center, *ccw);
                 cap(feed, run.hypot(p.z - to.z), p.z - to.z);
             }
-            Move::PlaneArc { to, center, plane, ccw, feed } if p.z - to.z > 1e-9 => {
-                let len = crate::path::PlaneArc { from: p, to: *to, center: *center, plane: *plane, ccw: *ccw }.length();
-                cap(feed, len, p.z - to.z);
+            // A vertical arc goes down fastest where it is steepest (a quarter arc into a cut
+            // starts straight down), not at its average.
+            Move::PlaneArc { to, center, plane, ccw, feed } => {
+                let arc = crate::path::PlaneArc { from: p, to: *to, center: *center, plane: *plane, ccw: *ccw };
+                let sampled =
+                    (0..=STEEPEST_SAMPLES).filter_map(|k| arc.tangent(k as f64 / STEEPEST_SAMPLES as f64)).map(|t| -t.z).fold(0.0f64, f64::max);
+                // Between two samples the slope is at most this much steeper.
+                let between = 1.0 - (arc.sweep().abs() / (2 * STEEPEST_SAMPLES) as f64).cos();
+                let steepest = (sampled + between).min(1.0);
+                if sampled > 1e-9 {
+                    cap(feed, 1.0, steepest);
+                }
             }
             _ => {}
         }
@@ -1013,8 +1024,12 @@ pub fn contour_with(
                         // Down where the depth passes cut, or into the material by the entry.
                         if cut_so_far.iter().any(|piece| piece.dist(to) <= 0.9 * r) {
                             b.descend_to(z, top)?;
-                        } else if entry == Entry::Plunge && pass.vertical.is_none() {
-                            return invalid("a finishing pass would plunge where the depth passes did not cut: give it a smaller lead, or an entry");
+                        } else if entry == Entry::Plunge && pass.vertical.is_none_or(|v| z + v < top - 1e-9) {
+                            // A vertical lead whose arc starts below the top plunges down to it.
+                            return invalid(
+                                "a finishing pass would plunge where the depth passes did not cut: give it a smaller lead, a vertical lead \
+                                 that starts above the top, or an entry",
+                            );
                         } else {
                             b.descend_to(top, top)?;
                             down.enter(b, &pass, z)?;

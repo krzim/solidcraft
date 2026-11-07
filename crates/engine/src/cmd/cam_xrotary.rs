@@ -33,16 +33,38 @@ fn room(ctx: &Ctx<'_>, have: usize, more: usize) -> Result<()> {
     }
 }
 
+/// How many of `specs`, from the first, fit in a job whatever those before them plan: each
+/// counted as the most operations it can plan (an indexed pattern one per angle).
+pub(super) fn fitting(specs: &[OperationSpec]) -> usize {
+    let most = |spec: &OperationSpec| match spec {
+        OperationSpec::IndexedPattern(o) => match (&o.a_deg, o.count) {
+            (Some(a), _) => a.len(),
+            (None, Some(n)) => usize::try_from(n).unwrap_or(usize::MAX),
+            (None, None) => 1,
+        },
+        _ => 1,
+    };
+    let mut total = 0usize;
+    specs
+        .iter()
+        .take_while(|spec| {
+            total = total.saturating_add(most(spec));
+            total <= MAX_OPERATIONS
+        })
+        .count()
+}
+
 /// The operations `spec` plans: itself, or an indexed pattern's at each of its angles, its arcs
-/// followed within `arc_tol` into the poses the checks run along. Each operation is planned on
-/// its own, so operations may be planned side by side; the checks that
+/// followed within `arc_tol` into the poses the checks run along; refused before anything is
+/// planned when the job, with `have` operations before it, has no room for them. Each
+/// operation is planned on its own, so operations may be planned side by side; the checks that
 /// need the operation before ([`add_checked`]) come after.
-pub(super) fn plan_op(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Result<Vec<Planned>> {
+pub(super) fn plan_op(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64, have: usize) -> Result<Vec<Planned>> {
     match spec {
         OperationSpec::IndexedPattern(o) => {
             let name = common3(&o.operation).name;
             let angles = pattern_angles(ctx, name, o)?;
-            room(ctx, 0, angles.len())?;
+            room(ctx, have, angles.len())?;
             let mut out = Vec::with_capacity(angles.len());
             for a in angles {
                 let mut op = (*o.operation).clone();
@@ -51,7 +73,10 @@ pub(super) fn plan_op(ctx: &Ctx<'_>, spec: &OperationSpec, arc_tol: f64) -> Resu
             }
             Ok(out)
         }
-        _ => Ok(vec![plan(ctx, spec, arc_tol)?]),
+        _ => {
+            room(ctx, have, 1)?;
+            Ok(vec![plan(ctx, spec, arc_tol)?])
+        }
     }
 }
 

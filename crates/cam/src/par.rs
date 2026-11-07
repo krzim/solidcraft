@@ -6,11 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::{CamError, Result};
 
-/// Most threads one call uses.
-const MAX_THREADS: usize = 16;
-
 /// How many threads to split `work` items over (each worth at least `least` of them): one per
-/// core up to [`MAX_THREADS`]; one in the browser.
+/// core up to 16; one in the browser.
 pub(crate) fn threads_for(work: usize, least: usize) -> usize {
     #[cfg(target_arch = "wasm32")]
     {
@@ -19,6 +16,8 @@ pub(crate) fn threads_for(work: usize, least: usize) -> usize {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        /// Most threads one call uses.
+        const MAX_THREADS: usize = 16;
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         cores.min(MAX_THREADS).min(work / least.max(1)).max(1)
     }

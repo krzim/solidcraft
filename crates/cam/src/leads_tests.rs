@@ -523,6 +523,15 @@ fn fastest_descent(path: &Toolpath) -> f64 {
                     let run = v(p.x, p.y).dist(center) * arc_sweep(p, to, center, ccw);
                     fastest = fastest.max(feed * (p.z - to.z) / run.hypot(p.z - to.z));
                 }
+                // A vertical arc goes down fastest where it is steepest: straight down at the
+                // start of a quarter arc into a cut.
+                Move::PlaneArc { to, center, plane, ccw, feed } => {
+                    let arc = crate::path::PlaneArc { from: p, to, center, plane, ccw };
+                    for k in 0..=64 {
+                        let down = arc.tangent(f64::from(k) / 64.0).map_or(0.0, |t| -t.z);
+                        fastest = fastest.max(feed * down);
+                    }
+                }
                 _ => {}
             }
         }
@@ -555,6 +564,14 @@ fn no_cut_goes_down_faster_than_the_plunge_feed() {
             assert!(fastest <= feeds.plunge * (1.0 + 1e-9), "{entry:?} {lead:?} {tabs:?}: down at {fastest} mm/min");
             // Only the descents are slowed: the passes themselves go at the cutting feed.
             assert!(path.moves.iter().any(|m| matches!(m, Move::Feed { feed, .. } if *feed == feeds.cut)));
+        }
+        // A vertical lead's quarter arc starts straight down.
+        for vertical in [1.0, 2.5] {
+            let opts = ContourOptions { vertical_lead: Some(vertical), finish_passes: 1, finish_stepover: 0.2, ..ContourOptions::default() };
+            let path = contour_with(&regions, &tool(3.0), &outside(climb), &opts, &c, &never).unwrap();
+            assert!(path.moves.iter().any(|m| matches!(m, Move::PlaneArc { .. })));
+            let fastest = fastest_descent(&path);
+            assert!(fastest <= feeds.plunge * (1.0 + 1e-6), "vertical lead {vertical}: down at {fastest} mm/min");
         }
         let params = PocketParams { climb, ..lanes(1.2) };
         for entry in [Entry::Helix { radius: 1.4, angle }, Entry::Ramp { angle }] {
@@ -756,4 +773,15 @@ fn a_vertical_lead_arcs_down_into_the_pass_and_up_out_of_it() {
     let inside = ContourParams { side: Side::Inside, ..outside(true) };
     let big = ContourOptions { vertical_lead: Some(30.0), ..ContourOptions::default() };
     assert!(contour_with(&square, &tool(6.0), &inside, &big, &c, &never).is_err());
+    // A finishing pass whose vertical lead starts where the depth passes did not cut would
+    // plunge into the material down to the arc's start, as a plain plunge would: refused,
+    // unless the arc starts above the top.
+    // Round a circle the lead's start, along the tangent, is well away from the depth passes.
+    let deep = cut(0.0, -20.0, 10.0);
+    let finish =
+        |vertical: f64| ContourOptions { vertical_lead: Some(vertical), finish_passes: 1, finish_stepover: 0.25, ..ContourOptions::default() };
+    let e = contour_with(&circle, &tool(6.0), &outside(true), &finish(12.0), &deep, &never).unwrap_err();
+    assert!(e.to_string().contains("did not cut"), "{e}");
+    let path = contour_with(&circle, &tool(6.0), &outside(true), &finish(20.0), &deep, &never).unwrap();
+    assert!(verify(&path, &deep.heights).is_ok());
 }

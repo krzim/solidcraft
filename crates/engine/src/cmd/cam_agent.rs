@@ -1503,6 +1503,10 @@ pub(super) fn resolve_for(ctx: &Ctx<'_>, c: &Common<'_>, fit: Option<&dyn Fn(&To
                 ag.limit(format!("{prefix}: the cutting feed {} is held to the machine's {}", num(f.cut), num(m)));
                 f.cut = m;
             }
+            // A plunge that follows a feed from the chip load (the tool gives no `plunge_feed`)
+            // goes down no faster than the machine's Z.
+            let max_plunge = max_plunge
+                .or_else(|| rates.and_then(|r| r.max_feed_z_mm_min.or(r.max_feed_mm_min)).filter(|_| fed.feed_derived && tool.plunge_feed.is_none()));
             if let Some(m) = max_plunge
                 && f.plunge > m
             {

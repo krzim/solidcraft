@@ -498,6 +498,9 @@ fn face_with_leads(path: &mut Path, entries: &mut Vec<(Vec3, Vec3)>, ps: &Passes
                         entries.push((q, a));
                         if q.z > start.z + 1e-9 {
                             path.push(Move::Feed { to: start, feed: p.feeds.plunge })?;
+                        } else if q.z < start.z - 1e-9 {
+                            // A lead taller than the clearance: up to where its arc starts.
+                            path.push(Move::Rapid { to: start })?;
                         }
                     }
                     push_all(path, vertical_quarter(start, a, world(ua, v, z + lead), along, p.feeds.cut))?;

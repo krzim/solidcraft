@@ -204,8 +204,9 @@ An adaptive clearing's deep, thin cut and a slot's shallow, full-width one want 
 numbers: a tool library keeps the general values on the tool and the adaptive ones in its
 `adaptive` entry. The spindle speed is held to the machine's range and the feeds to its top
 feeds, with a note: the profile's `default_feeds` limits, and for a speed or feed worked out
-from `surface_speed` or `chip_load`, the job's `machine_rates` where the profile gives none.
-The setup sheet states every such hold first.
+from `surface_speed` or `chip_load`, the job's `machine_rates` where the profile gives none
+(a plunge that follows such a feed, the tool giving no `plunge_feed`, is held to the machine's
+top Z feed). The setup sheet states every such hold first.
 
 ### Which tool for which operation
 
@@ -668,7 +669,9 @@ direction runs along neither axis the arc goes out as lines within 0.001 mm of i
 contour a vertical lead comes down into the start of its `lead` (or the pass) and takes the
 place of the entry (no ramp or helix with it); it is refused where the ground behind the start
 or beyond the end is the part. Like every way down, the arc into the cut is slowed so it goes
-down no faster than the plunge feed on average.
+down no faster than the plunge feed where it is steepest (a quarter arc into a cut starts
+straight down). A finishing pass whose vertical lead would start where the depth passes did not
+cut is refused, as a plunge there is, unless the arc starts above `top`.
 
 ## 3D finishing strategies
 

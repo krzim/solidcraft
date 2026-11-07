@@ -378,4 +378,18 @@ fn facing_with_vertical_leads_arcs_down_into_and_up_out_of_the_passes() {
     for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e9] {
         assert!(face(&tool, &FaceParams { lead_radius: Some(bad), ..params(&tool, 0.0, true) }).is_err(), "{bad}");
     }
+    // A lead that starts above the clearance height: the tool goes up to its start, and every
+    // arc starts where the tool is, its radius from its centre.
+    for zigzag in [true, false] {
+        let p = FaceParams { lead_radius: Some(20.0), ..params(&tool, 0.0, zigzag) };
+        let path = face(&tool, &p).unwrap();
+        assert!(crate::check::verify(&path, &p.heights).is_ok());
+        let mut pos: Option<Vec3> = None;
+        for m in &path.moves {
+            if let (Some(from), Move::PlaneArc { to, center, plane, ccw, .. }) = (pos, *m) {
+                close(crate::path::PlaneArc { from, to, center, plane, ccw }.radius(), 20.0, 1e-9);
+            }
+            pos = m.target().or(pos);
+        }
+    }
 }
