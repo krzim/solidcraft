@@ -29,6 +29,7 @@ Units are millimetres and mm/min. Angles in a job are degrees (`a_deg`, `angle_d
 | `dry_run` | Plan and check, write nothing; the reply says whether the checks pass instead of refusing. |
 | `allow_unsafe` | Write the program even when a check fails. |
 | `simulate` | Also run the program as written through the stock-removal simulation (below): a gouge or a rapid through material fails the job like the other checks, and the reply carries `simulation`. |
+| `simulate_resolution` | With `simulate`: the simulation's cell size in mm, as `cam.simulate`'s `resolution`. Default: five times the tolerance, coarser where the stock or the program is too large for that. |
 
 Every file is read and written through the session's file access, so an MCP server's
 `--allow-path` folders apply; every path is checked before anything is computed or written.
@@ -138,6 +139,7 @@ silently left at its default. That holds for the tools, the machine and the post
 | --- | --- |
 | `name` | The program's name, in its header. Default: the design's name. |
 | `machine` | `"3axis"`, `"4axis_a"` (a rotary table about +X, the A axis, through work zero), or a whole machine as the CAM crate's `Machine` JSON (`name`, `rotaries: [{letter, direction, center, carrier, limits?, reversed?}]`, `linear_limits?`, `work_origin?`; radians). |
+| `machine_path` | The machine as a `Machine` JSON file instead of `machine`, read from the job file's folder when relative (through the session's file access). `cam.job`, `cam.simulate` and `cam.view.load` read it alike. |
 | `a_reversed` | With `4axis_a`: the controller's positive A turns the table the other way. |
 | `a_limits_deg` | With `4axis_a`: `[lowest, highest]` A in degrees. Default: it turns without end. |
 | `post` | A built-in post (`cam.posts` lists them): `mach3_4axis`, `linuxcnc_4axis`, `grblhal_4axis`, `rs274_5axis`, `rs274_tcp`. |
@@ -230,7 +232,7 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `chamfer` | `sketch` + `profiles?` or `polygon`; `heights: {clearance, retract, top}` (no `bottom`: the depth follows from the width); `width` (across the top); `tip_offset` (0.2); `side`: `outside` \| `inside` (outside); `climb` (true); `tolerance`. A chamfer mill only; see [Chamfers](#chamfers) |
 | `indexed` | `a_deg` and `operation`: any of the 3-axis operations above, run with A held at `a_deg` (3+1); optionally `name`, used when the inner operation has none. The inner operation carries the tool and feeds. |
 | `rotary_finish` | `pattern`: `{type: "lines", angle_step_deg, zigzag?}`, `{type: "helix", pitch}` or `{type: "rings", stepover, zigzag?}` (below); `clearance` and `retract` (radii from the A axis); `floor` (0); `range: [min x, max x]` (the part's extent); `step`; `tolerance`; `stock_to_leave` (0); `max_angle_step_deg` (2) |
-| `rotary_roughing` | As `rotary_finish`, with `stock_radius`, `stepdown` (in radius) and `stock_to_leave` (0.25) |
+| `rotary_roughing` | As `rotary_finish`, with `stock_radius` (default: the job's `stock`, a cylinder's radius or a box's farthest edge from the axis), `stepdown` (in radius) and `stock_to_leave` (0.25) |
 | `bore` | `sketch` (its circles) + `diameter_range?: [min, max]` or `holes: [{center: [x, y], diameter}]`; `heights` (`top` the hole's top, `bottom` its floor); `pitch` or `ramp_angle_deg` (2, the pitch at most `stepdown`: the tool's, else 10% of its diameter); `stepover` (between rings; the tool's, else 40% of its diameter); `climb` (true); `finish_passes` (0); `stock_to_leave` (0.1 with finishing passes, else 0) |
 | `thread_mill` | `sketch` (its circles' centres) + `diameter_range?` or `centers: [[x, y], …]`; `heights` (the thread from `top` down to `bottom`); `pitch`; `thread_diameter` (the major, nominal diameter); `internal` (true); `right_hand` (true); `climb` (true); `thread_depth` (ISO metric: 0.5413 × pitch inside, 0.6134 × pitch outside); `radial_passes` (1); `spring_pass` (false) |
 | `face` | `bottom`; `top` (the stock's top; required without a stock); `retract` (2 above the top, or the stock's top if higher); `clearance` (10 above the retract); `stepdown` (tool's, else 1); `stepover` (tool's, else 70% of the flat of its end); `angle_deg` (0); `zigzag` (true); `overhang` (half the tool's diameter and 0.5); `rect: [[x, y], [x, y]]` (the stock seen from above, else the part's extent). A face mill, a flat end mill or a bull nose. |
@@ -305,7 +307,10 @@ naming the operation and the Z it needs), takes the
 `safe_rotate` lines, turns A back by whole turns, comes back at rapid to 1 mm above the cut and
 feeds the rest of the way in at the operation's plunge feed (`plunge_feed` when it has none),
 then goes on. Each operation starts at the whole turn that needs the fewest rewinds, so one that
-begins where the last ended at a limit does not rewind right after its first plunge.
+begins where the last ended at a limit does not rewind right after its first plunge. A cut that
+ends past a limit by less than 0.0006° (a groove drawn a hair longer than a whole turn, to
+rounding below what the angle is written to) ends at the limit, with no rewind and no turn
+before it.
 
 With `safe_rotate` or `clearance_retract`, a run of rapids that each turn A (a rotary toolpath's
 link at clearance) is written as one retract and one turn of A, not a retract for every step.
@@ -739,6 +744,14 @@ throughout, and A winds on a turn per ring (the post's `rewind`, or a table that
 end). Rings are linked by feeding across X when that is short and clear. For roughing, rings
 farther apart than the tool is wide are refused.
 
+A ring holds X for a whole turn, so a ring where the tool meets the part only at a steep
+tangency (a ball whose side just reaches a shoulder's face at the ring's X) would be held up by
+the part's facets, each within its tessellation error of the true surface, at some angles and
+not at others: a ring dipping in and out thousands of times. A ring's tool rests where the tool
+shrunk by that error (a quarter of the tolerance) does, wherever that is more than the tolerance
+lower: it runs round at one radius, into the facets by at most that error, as the gouge check
+allows for the tessellation.
+
 ### Indexed patterns
 
 ```json
@@ -828,6 +841,9 @@ Moves to and from the machine's home (`G28`) are in machine coordinates and are 
   lines, before its first turn of A. A post with `"coolant_after_turn": true` switches it on
   right after that turn (`G0 A90.` then `M8`). Coolant that goes off, and an operation that
   turns nothing at its start, are written the same either way.
+- **The move after a turn.** A turn of A is a block of its own, `G0 A…`, after the post's safe
+  lines; the rapid after it leaves out the `G0` it is still in (`G0 A90.` then `X0. Y-3.`),
+  unless a line the post writes comes between them (the coolant, with `coolant_after_turn`).
 
 ## Stock-removal simulation
 
@@ -844,7 +860,7 @@ on the program it has just written when given `simulate: true`.
 | --- | --- |
 | `path` | The G-code file, in the job's work coordinates. |
 | `job` / `job_path` | The job the program was written for: its machine, tools (by `T` number; `T… M6` loads one), part bodies, `origin` and `tolerance`. |
-| `resolution` | The cell size in mm. Default: five times the tolerance, coarser when that would be more than 4 million cells. More than 20 million cells is refused. |
+| `resolution` | The cell size in mm. Default: five times the tolerance, coarser when that would be more than 4 million cells, or when the program's cuts would visit more cells than the simulation allows (a long 4th-axis program: a warning gives the cell used). More than 20 million cells is refused. |
 | `stock_stl` | Write the stock the program leaves as a binary STL file (its top surface, or its round surface on a 4th axis), for a preview. |
 
 The reply: `stock` (`kind`: `box` or `cylinder`, its size, and `derived`), `resolution`,
@@ -895,8 +911,15 @@ a warning; `cam.job`'s own gouge check, against the exact cutter, still covers t
 
 **Against the part.** Each cell's part height (or radius) is where a ray from above (from
 outside) first meets the part's facets. A cell cut below the part by more than the tolerance is
-measured again in 3D, as the distance from the bottom and the middle of the cut column to the
-part's surface, so a cut beside a steep wall within the tolerance of the wall is not a gouge.
+measured again in 3D over the part's material along its column: where the column crosses the
+part's surface it goes into material (a facet facing against it) or out of it (one facing along
+it), and each stretch of material the cut went through counts as deep as its middle is from the
+part's surface, the cut's end too when it is inside the part. A cut beside a steep wall within
+the tolerance of the wall is not a gouge, and neither is a column down the air of a hole or a
+pocket, however far its middle is from their walls (such columns slant into a radial hole or an
+indexed pocket's edge on a 4th axis, and whether a cell's column does depends on the cell's size).
+A thread mill cuts as the core inside its teeth, as deep as its `thread_mill` operation's thread
+(as the gouge check takes it), since the thread is not in the model.
 Leftover is measured along Z (along the ray), so material beside a steep wall counts its full
 height. The position is lost at a return home or a move in machine coordinates (`G28`, `G30`,
 `G53`); the next block is taken as coming straight down the tool axis from above the stock,
@@ -1002,7 +1025,7 @@ held; the job's stock is placed in it, and work zero follows.
 | `vise` | `vise: {model: {length, width, height, floor, fixed_jaw, moving_jaw, max_opening}, center, quarter_turns?, offset?, grip?}` | The stock against the fixed jaw, on the parallels (or the floor), centred along the jaws at `offset`. `quarter_turns` counter-clockwise from the jaws along X with the fixed jaw at the back. `grip` is a box (work coordinates) the jaws close on instead of the stock. |
 | `clamps` | `stock_at: [x, y]` (its front-left corner on the table), `clamps: [{center, size, height}]` | On the parallels or the table; each clamp a box on the stock's top. |
 | `table` | `table_zero: [x, y, z]` | The program machines the table itself. |
-| `rotary` | `rotary: {axis: [y, z], headstock: {min, max}, chuck: {diameter, length, face_x}, tailstock?, plate?, zero_x?}` | A bar on the A axis; work zero on the axis at `zero_x` (default: the bar's low end at the chuck's face). |
+| `rotary` | `rotary: {axis: [y, z], headstock: {min, max}, chuck: {diameter, length, face_x, side?, jaws?: {radial, axial, count?}}, tailstock?, plate?, zero_x?}` | A bar on the A axis; work zero on the axis at `zero_x`. `side` is the end of the bar the chuck holds: `plus_x` (the default: the unit at the table's +X end, +X pointing into the axis, the bar standing out towards -X, its +X end at the chuck's face unless `zero_x` is given) or `minus_x` (the mirror image: the bar's -X end at the face). The chuck reaches back from its face away from the bar; the jaws stand `axial` out of the face towards the bar and `radial` beyond its surface, and are checked as the ring they sweep as A turns. A bar that does not reach into the jaws is `stock-not-gripped`, one held by less than 3 mm `shallow-grip`. |
 
 `parallels: {height, thickness, length, inset?, offset?}` go under the stock (along the jaws in a
 vise, under the long edges with clamps).

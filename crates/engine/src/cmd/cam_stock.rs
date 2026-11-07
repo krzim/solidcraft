@@ -39,7 +39,7 @@ pub(super) fn stock_of(cmd: &str, job: &CamJob, surfaces: &Surfaces, tol: f64, n
         StockSpec::AroundPart(a) => Stock::around(&surfaces.part.bounds(), v3(a.margin)).map_err(|e| cam_err(cmd, "`stock.around_part`", e))?,
     };
     stock.validate().map_err(|e| cam_err(cmd, "`stock`", e))?;
-    if !stock.holds(&surfaces.part.bounds(), tol) {
+    if !stock.holds_surface(&surfaces.part, tol) {
         notes.push("the part reaches outside the stock: check the stock against the part's position in work coordinates".into());
     }
     Ok(Some(stock))

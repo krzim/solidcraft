@@ -8,18 +8,18 @@
 //! starts from one taken from the part: its box on a 3-axis machine, the cylinder about work X
 //! through its farthest point from the axis on a 4th axis.
 
-use std::path::{Path, PathBuf};
-
 use serde_json::Value;
+use solidcraft_cam::helical::{ISO_EXTERNAL_DEPTH, ISO_INTERNAL_DEPTH, thread_core};
 use solidcraft_cam::kinematics::Machine;
 use solidcraft_cam::sim::{SimParams, SimReport, StockShape, simulate as run_sim, stock_around};
 use solidcraft_cam::stock::Stock;
-use solidcraft_cam::{Surface, Tool};
+use solidcraft_cam::{Surface, Tool, ToolKind};
 
-use super::{MAX_GCODE_BYTES, TOLERANCE_RANGE, cam_err, finite_point, machine_of, num, parse, read_json, surfaces_of, tools_of, v3};
+use super::{MAX_GCODE_BYTES, TOLERANCE_RANGE, cam_err, finite_point, machine_of, num, parse, surfaces_of, tools_of, v3};
 use crate::params::bad;
 use crate::schema::TypedContract;
-use crate::schema::cam::CamJob;
+use crate::schema::cam::{CamJob, OperationSpec};
+use crate::schema::cam_agent::ToolRef;
 use crate::schema::cam_sim::{CamSimulateParams, CamSimulateReply, LeftoverReport, RapidInMaterial, SimGougeReport, SimStockReport};
 use crate::{EngineError, Result, Session};
 
@@ -30,19 +30,35 @@ const STL_SIDE: usize = 1024;
 /// Rapids in material listed in a reply.
 const LISTED: usize = 100;
 
-/// The job of `job` (`raw` as given) or `job_path`, the folder a job file is in, and whether an
-/// operation of it has `gouge_check: false`.
-pub(super) fn load_job(cmd: &str, job: Option<CamJob>, raw: Option<&Value>, job_path: Option<&String>) -> Result<(CamJob, Option<PathBuf>, bool)> {
-    match (job, job_path) {
-        (Some(_), Some(_)) => Err(bad(cmd, "give `job` or `job_path`, not both")),
-        (None, None) => Err(bad(cmd, "give the `job` (an object) or a `job_path` (a .json file)")),
-        (Some(j), None) => Ok((j, None, raw.and_then(|v| v.get("operations")).is_some_and(unchecked))),
-        (None, Some(path)) => {
-            let v = read_json(cmd, path, "job_path")?;
-            let deliberate = v.get("operations").is_some_and(unchecked);
-            Ok((parse(cmd, &v, &format!("job_path {path}"))?, Path::new(path).parent().map(Path::to_path_buf), deliberate))
-        }
-    }
+/// `tools` as the simulation cuts with them: a thread mill that a thread milling operation uses
+/// is taken as the core inside its teeth (`cores`, by tool number; the smallest of a number's),
+/// as the gouge check takes it, since the thread it cuts is not in the model.
+pub(super) fn with_thread_cores(tools: &[Tool], cores: &[Tool]) -> Vec<Tool> {
+    tools
+        .iter()
+        .map(|t| {
+            let core = cores.iter().filter(|c| c.number == t.number).min_by(|a, b| a.diameter.total_cmp(&b.diameter));
+            match core {
+                Some(c) if t.kind == ToolKind::ThreadMill => c.clone(),
+                _ => t.clone(),
+            }
+        })
+        .collect()
+}
+
+/// The cores of the thread mills the job's `thread_mill` operations name by number, each as
+/// deep as its operation's thread.
+pub(super) fn job_thread_cores(job: &CamJob, tools: &[Tool]) -> Vec<Tool> {
+    job.operations
+        .iter()
+        .filter_map(|op| {
+            let OperationSpec::ThreadMill(o) = op else { return None };
+            let ToolRef::Number(n) = o.tool else { return None };
+            let tool = tools.iter().find(|t| t.number == n && t.kind == ToolKind::ThreadMill)?;
+            let iso = if o.internal.unwrap_or(true) { ISO_INTERNAL_DEPTH } else { ISO_EXTERNAL_DEPTH };
+            thread_core(tool, o.thread_depth.unwrap_or(o.pitch * iso)).ok()
+        })
+        .collect()
 }
 
 /// Whether `v` (a job's operations as JSON, an indexed one's inner operation included) has
@@ -68,8 +84,14 @@ pub(super) fn stock_of(
     let rotary = !machine.rotaries.is_empty();
     match job_stock {
         Some(&Stock::Box { min, max }) if !rotary => return Ok((StockShape::Box { min, max }, false)),
+        // A square or rectangular bar with the A axis through it.
+        Some(&Stock::Box { min, max }) if min.y < 0.0 && max.y > 0.0 && min.z < 0.0 && max.z > 0.0 => {
+            return Ok((StockShape::Box { min, max }, false));
+        }
         Some(&Stock::Cylinder { radius, x_min, x_max }) if rotary => return Ok((StockShape::Cylinder { x_min, x_max, radius }, false)),
-        Some(Stock::Box { .. }) => notes.push("the simulation models a bar about X on a 4th axis, not the job's box stock".into()),
+        Some(Stock::Box { .. }) => {
+            notes.push("the simulation models a bar the A axis runs through on a 4th axis, not the job's box stock off the axis".into())
+        }
         Some(Stock::Cylinder { .. }) => notes.push("the simulation models a box on a 3-axis machine, not the job's bar stock".into()),
         None => {}
     }
@@ -196,7 +218,9 @@ pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         }
         solidcraft_io::vfs::check(out).map_err(|e| EngineError::Other(e.to_string()))?;
     }
-    let (job, base, deliberate) = load_job(cmd, params.job, p.get("job"), params.job_path.as_ref())?;
+    // Read as `cam.job` reads it: its profile merged in, its machine file and tool libraries read.
+    let loaded = super::agent::load_job_of(cmd, p, params.job.is_some(), params.job_path.as_ref())?;
+    let (job, base, deliberate) = (loaded.job, loaded.base, loaded.unchecked);
     let tol = job.tolerance.unwrap_or(0.01);
     if !(tol.is_finite() && (TOLERANCE_RANGE.0..=TOLERANCE_RANGE.1).contains(&tol)) {
         return Err(bad(cmd, "the job's `tolerance` must be from 0.0001 to 1 mm"));
@@ -205,6 +229,7 @@ pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     finite_point(&origin, "`origin`").map_err(|e| bad(cmd, e))?;
     let machine = machine_of(cmd, &job)?;
     let tools = tools_of(cmd, &job, base.as_deref())?;
+    let tools = with_thread_cores(&tools, &job_thread_cores(&job, &tools));
     let bytes = solidcraft_io::vfs::read(&params.path, MAX_GCODE_BYTES).map_err(|e| EngineError::Other(format!("{}: {e}", params.path)))?;
     let text = String::from_utf8_lossy(&bytes);
     let surfaces = surfaces_of(cmd, s, &job, v3(origin), tol)?;
@@ -214,10 +239,16 @@ pub(super) fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     reply.path = params.path.clone();
     reply.notes.extend(surfaces.notes);
     reply.notes.extend(stock_notes);
+    reply.notes.extend(loaded.notes);
     if let Some(out) = &params.stock_stl {
-        let mesh = report.stock.mesh(STL_SIDE);
-        solidcraft_io::vfs::write(out, &solidcraft_io::stl_binary(&[mesh], "stock")).map_err(|e| EngineError::Other(format!("{out}: {e}")))?;
+        export_stock(out, &report)?;
         reply.stock_stl = Some(out.clone());
     }
     serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+/// The stock the simulation left, written to `out` as a binary STL file.
+fn export_stock(out: &str, report: &SimReport) -> Result<()> {
+    let mesh = report.stock.mesh(STL_SIDE);
+    solidcraft_io::vfs::write(out, &solidcraft_io::stl_binary(&[mesh], "stock")).map_err(|e| EngineError::Other(format!("{out}: {e}")))
 }

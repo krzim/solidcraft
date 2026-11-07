@@ -19,6 +19,7 @@ use solidcraft_cam::rapids::owners;
 use solidcraft_cam::sim::{SimParams, plan_sim};
 use solidcraft_cam::tool_mesh::tool_meshes;
 use solidcraft_cam::workholding::{Holding, Workholding, build};
+use solidcraft_cam::{Tool, ToolKind};
 use solidcraft_geom::Mesh;
 
 use super::{
@@ -226,7 +227,15 @@ fn load(s: &mut Session, p: &Value) -> Result<Value> {
             if ops.is_none() {
                 notes.push("the program's blocks could not be put under their operations: one operation per tool change is shown".into());
             }
-            (pj.text, pj.machine, pj.tools, pj.surfaces.part, pj.stock, pj.tol, ops)
+            // A thread mill cuts as the core its operation's gouge check took.
+            let cores: Vec<Tool> = pj
+                .planned
+                .iter()
+                .map(|q| q.tool.clone())
+                .filter(|c| c.kind != ToolKind::ThreadMill && pj.tools.iter().any(|t| t.number == c.number && t.kind == ToolKind::ThreadMill))
+                .collect();
+            let tools = sim::with_thread_cores(&pj.tools, &cores);
+            (pj.text, pj.machine, tools, pj.surfaces.part, pj.stock, pj.tol, ops)
         }
         Some(path) => {
             if path.trim().is_empty() {
@@ -241,6 +250,7 @@ fn load(s: &mut Session, p: &Value) -> Result<Value> {
             finite_point(&origin, "`origin`").map_err(|e| bad(cmd, e))?;
             let machine = machine_of(cmd, job)?;
             let tools = tools_of(cmd, job, base)?;
+            let tools = sim::with_thread_cores(&tools, &sim::job_thread_cores(job, &tools));
             let surfaces = surfaces_of(cmd, s, job, v3(origin), tol)?;
             let job_stock = cam_stock::stock_of(cmd, job, &surfaces, tol, &mut notes)?;
             notes.extend(surfaces.notes.iter().cloned());

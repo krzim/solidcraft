@@ -277,15 +277,35 @@ struct Drum<'a> {
     cutter: Cutter,
     leave: f64,
     budget: Budget,
+    /// With rings: the cutter shrunk by the part's tessellation error (a quarter of the
+    /// tolerance) and how far its tip is up its axis from the cutter's: see [`Drum::at`].
+    steady: Option<(Cutter, f64)>,
+    tol: f64,
 }
 
 impl Drum<'_> {
+    /// Where the tool's tip rests coming in radially at `x` and `theta`.
+    ///
+    /// Rings hold X for a whole turn, so a ring where the cutter meets the part only at a steep
+    /// tangency (a ball whose side just reaches a wall it runs beside, as a ring beside a
+    /// shoulder at the ball's radius from it) would be held up by the facets of the part's
+    /// mesh, each within its tessellation error of the true surface, a millimetre or more
+    /// higher at one angle than the next, and dip in and out all the way round. With rings the
+    /// tip rests where the cutter shrunk by that error does, when that is more than the
+    /// tolerance lower: into the mesh by at most that error, the depth the gouge check allows
+    /// for the tessellation. Elsewhere the two differ by about that error, and the cutter's own
+    /// rest is kept.
     fn at(&self, x: f64, theta: f64) -> Result<Tip> {
         self.budget.spend()?;
-        Ok(match drop_along(self.surface, &self.cutter, Vec3::new(x, 0.0, 0.0), radial(theta))? {
-            Some(d) => Tip::At(d + self.leave),
-            None => Tip::Clear,
-        })
+        let (o, dir) = (Vec3::new(x, 0.0, 0.0), radial(theta));
+        let Some(d) = drop_along(self.surface, &self.cutter, o, dir)? else { return Ok(Tip::Clear) };
+        if let Some((shrunk, raise)) = &self.steady
+            && let Some(s) = drop_along(self.surface, shrunk, o, dir)?
+            && d - (s - raise) > self.tol
+        {
+            return Ok(Tip::At(s - raise + self.leave));
+        }
+        Ok(Tip::At(d + self.leave))
     }
 
     /// The farthest the part reaches from the axis within reach of `lo..=hi` along it, the
@@ -436,8 +456,12 @@ fn check_rough_stepover(pattern: RotaryPattern, stock_radius: f64, tool: &Tool) 
 
 impl Setup {
     fn drum<'a>(&self, surface: &'a Surface, tool: &Tool, leave: f64) -> Result<Drum<'a>> {
-        let cutter = tool_cutter(tool)?;
-        let drum = Drum { surface, cutter: cutter.grown(leave)?, leave, budget: Budget::new() };
+        let cutter = tool_cutter(tool)?.grown(leave)?;
+        let steady = match self.pattern {
+            RotaryPattern::Rings { .. } => Some(cutter.shrunk(0.25 * self.tol)?),
+            RotaryPattern::Lines { .. } | RotaryPattern::Helix { .. } => None,
+        };
+        let drum = Drum { surface, cutter, leave, budget: Budget::new(), steady, tol: self.tol };
         if let Some(top) = drum.top(self.lo, self.hi)
             && self.retract < top - 1e-9
         {

@@ -833,8 +833,9 @@ fn limited_a() -> Machine {
     Machine::four_axis_a_with(Vec3::ZERO, false, Some((-TAU, TAU)))
 }
 
-/// Checks that a motion code is written only when the mode changes (a template line, a turn
-/// of A or a tool length offset line sets no mode the next block may leave out), that every
+/// Checks that a motion code is written only when the mode changes (a template line or a tool
+/// length offset line sets no mode the next block may leave out; a turn of A states its G0 and
+/// the move after it may leave that out), that every
 /// number of a motion word has a decimal point, and that every arc states both I and J.
 fn assert_modal_with_points(text: &str) {
     let mut mode: Option<&str> = None;
@@ -860,9 +861,6 @@ fn assert_modal_with_points(text: &str) {
         }
         if matches!(mode, Some("G2" | "G3")) && code.is_some() {
             assert!(line.contains(" I") && line.contains(" J"), "an arc without both I and J: `{line}`");
-        }
-        if line.starts_with("G0 A") {
-            mode = None;
         }
     }
 }
@@ -998,9 +996,18 @@ fn a_dialect_post_retracts_before_every_turn_of_a() {
     // No lowest Z where A turns.
     assert!(text.starts_with("(WRAP)\n(T3 D=6. CR=0. - FLAT END MILL)\n"), "{text}");
     // The first index turns A after the start's retract; the next one retracts before its
-    // comment, then A turns alone and the tool comes back across and down with its offset.
-    assert!(text.contains("\n(SIDE 0)\nT3 M6\nS9000 M3\nG17 G90 G94\nG54\nG0 A0.\nG0 X0. Y-3.\nG43 Z10. H3\nZ1.\n"), "{text}");
-    assert!(text.contains("\nG0 Z10.\nG28 G91 Z0.\nG90\n\n(SIDE 90)\nG17 G90 G94\nG54\nG0 A90.\nG0 X0. Y-3.\nG43 Z10. H3\nZ1.\n"), "{text}");
+    // comment, then A turns alone and the tool comes back across (still G0, not written
+    // again) and down with its offset.
+    assert!(text.contains("\n(SIDE 0)\nT3 M6\nS9000 M3\nG17 G90 G94\nG54\nG0 A0.\nX0. Y-3.\nG43 Z10. H3\nZ1.\n"), "{text}");
+    assert!(text.contains("\nG0 Z10.\nG28 G91 Z0.\nG90\n\n(SIDE 90)\nG17 G90 G94\nG54\nG0 A90.\nX0. Y-3.\nG43 Z10. H3\nZ1.\n"), "{text}");
+    // The move after a turn of A does not repeat its G0.
+    let mut last: Option<&str> = None;
+    for line in text.lines() {
+        if line.starts_with("G0 ") && last.is_some_and(|l| l.starts_with("G0 A")) {
+            panic!("a repeated G0 after {last:?}: {line}\n{text}");
+        }
+        last = Some(line);
+    }
     assert_modal_with_points(&text);
     // Inverse time: F with at most four decimals on every block that turns A, G94 before the
     // next cut that does not.
@@ -1046,6 +1053,35 @@ fn rewinds_in(text: &str) -> Vec<Vec<&str>> {
         .collect()
 }
 
+/// A groove once round a bar of radius 16 drawn 100.531 mm long, a hair more than a whole
+/// turn (by 2·10⁻⁶ rad, less than the angle written can show): it starts at A0 and ends at
+/// A360 within the limits, with no rewind and no turn before it.
+#[test]
+fn a_wrap_that_ends_at_a_whole_turn_needs_no_rewind() {
+    let turn = 100.531 / 16.0;
+    assert!(turn > TAU);
+    let n = 180;
+    let pose = |k: usize| {
+        let th = turn * k as f64 / n as f64;
+        Pose::new(Vec3::new(20.0, 0.0, 0.0) + radial(th) * 15.5, radial(th))
+    };
+    let mut moves = vec![Move5::Rapid { to: Pose::new(pose(0).up(5.0), radial(0.0)) }, Move5::Feed { to: pose(0), feed: 100.0 }];
+    moves.extend((1..=n).map(|k| Move5::Feed { to: pose(k), feed: 300.0 }));
+    // Out of the groove at rapid, still at its last angle.
+    moves.push(Move5::Rapid { to: Pose::new(pose(n).up(5.0), pose(n).axis) });
+    let program = program5(Toolpath5 { moves });
+    let post = dialect();
+    let text = emit5(&program, &post, &limited_a()).unwrap();
+    assert!(rewinds_in(&text).is_empty(), "{text}");
+    let angles: Vec<f64> = text.lines().filter_map(|l| l.split(' ').find_map(|w| w.strip_prefix('A'))).map(|a| a.parse().unwrap()).collect();
+    assert_eq!(angles.first(), Some(&0.0), "{text}");
+    assert_eq!(angles.iter().filter(|a| **a == 0.0).count(), 1, "A turns back to 0: {text}");
+    assert_eq!(angles.last(), Some(&360.0), "{text}");
+    assert!(angles.windows(2).all(|w| w[1] >= w[0]), "A only goes on round: {text}");
+    let rb = readback5(&text, &program, &post, &limited_a()).unwrap();
+    assert!(rb.within(), "{rb:?}");
+}
+
 #[test]
 fn a_long_helix_rewinds_within_the_limits_of_a() {
     let post = dialect();
@@ -1075,13 +1111,13 @@ fn a_long_helix_rewinds_within_the_limits_of_a() {
             "G28 G91 Z0.",
             "G90",
             "G0 A-360.",
-            "G0 X10. Y0.",
+            "X10. Y0.",
             "G43 Z21. H3",
             "G1 Z20. F250.",
             "G93 X10.042 Z19.993 A-358.5 F571.2171"
         ]
     );
-    assert!(rewinds[1].join("\n").starts_with("G94 Z21. F500.\nG0 Z45.\nG28 G91 Z0.\nG90\nG0 A-360.\nG0 X30. Y0.\nG43 Z21. H3\nG1 Z20. F250."));
+    assert!(rewinds[1].join("\n").starts_with("G94 Z21. F500.\nG0 Z45.\nG28 G91 Z0.\nG90\nG0 A-360.\nX30. Y0.\nG43 Z21. H3\nG1 Z20. F250."));
     let rb = readback5(&text, &program, &post, &limited_a()).unwrap();
     assert!(rb.within(), "{rb:?}");
     // Each rewind feeds 1 mm out and 1 mm back in.
@@ -1187,17 +1223,18 @@ fn coolant_can_come_on_after_the_first_turn_of_a() {
     let program = MachineProgram { name: "sides".into(), operations: vec![side("side 0", 0.0), side("side 90", 90.0)], work_offset: None };
     // By default the coolant comes on before the index, as it always has.
     let before = emit_program(&program, &dialect(), &machine).unwrap();
-    assert!(before.contains("\nG54\nM8\nG0 A0.\nG0 X0. Y-3.\n"), "{before}");
+    assert!(before.contains("\nG54\nM8\nG0 A0.\nX0. Y-3.\n"), "{before}");
     // With the switch, right after it; the second side keeps the coolant on through its turn.
     let post = Post5 { coolant_after_turn: true, ..dialect() };
     post.validate().unwrap();
     let after = emit_program(&program, &post, &machine).unwrap();
     assert!(after.contains("\nG54\nG0 A0.\nM8\nG0 X0. Y-3.\nG43 Z10. H3\n"), "{after}");
-    assert!(after.contains("\n(SIDE 90)\nG17 G90 G94\nG54\nG0 A90.\nG0 X0. Y-3.\n"), "{after}");
+    assert!(after.contains("\n(SIDE 90)\nG17 G90 G94\nG54\nG0 A90.\nX0. Y-3.\n"), "{after}");
     assert_eq!(after.matches("M8").count(), 1, "{after}");
     assert!(after.ends_with("G0 Z10.\n\nM9\nM5\nG28 G91 Z0.\nG90\nG28 G91 X0. Y0.\nG90\nM30\n"), "{after}");
-    // Only the coolant line moves.
-    assert_eq!(before.replace("M8\n", ""), after.replace("M8\n", ""));
+    // Only the coolant line moves (the move after it states its G0 again, as after any line the
+    // post writes).
+    assert_eq!(before.replace("M8\n", ""), after.replace("M8\nG0 ", "").replace("M8\n", ""));
     assert_modal_with_points(&after);
     assert!(readback_program(&after, &program, &post, &machine).unwrap().within());
 
@@ -1374,7 +1411,7 @@ fn a_rewind_turns_a_no_lower_than_the_operations_clearance() {
     }
     assert!(turns >= 2, "{text}");
     // It comes back at rapid to 1 mm above the cut and feeds the rest of the way in.
-    assert!(rewinds_in(&text).iter().all(|r| r.contains(&"G0 Z21.") && r.contains(&"G1 Z20. F250.")), "{text}");
+    assert!(rewinds_in(&text).iter().all(|r| r.contains(&"Z21.") && r.contains(&"G1 Z20. F250.")), "{text}");
     assert!(readback5(&text, &program, &post, &limited_a()).unwrap().within());
 }
 

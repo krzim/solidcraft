@@ -29,6 +29,7 @@ fn schemas_and_the_key_check_agree() {
             "preview",
             "setup_sheet",
             "simulate",
+            "simulate_resolution",
             "view",
             "width",
         ],

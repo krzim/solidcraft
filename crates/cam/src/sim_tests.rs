@@ -336,6 +336,30 @@ fn a_rapid_into_round_stock_is_caught() {
     close(r.gouge_worst, 0.5, 0.02);
 }
 
+/// A square bar on a 4th axis is modelled as the square it is: a rapid across just above a
+/// flat side (inside the circle through its corners) cuts nothing, one into it or one turning
+/// a corner up into the tool does.
+#[test]
+fn a_square_bar_on_a_fourth_axis_is_square() {
+    let part = block(Vec3::new(-10.0, -10.0, -10.0), Vec3::new(10.0, 10.0, 10.0));
+    let machine = Machine::four_axis_a();
+    let stock = StockShape::Box { min: Vec3::new(-20.0, -15.0, -15.0), max: Vec3::new(20.0, 15.0, 15.0) };
+    let text = "G21\nT1 M6\nG0 X-15. Y0. Z30. A0.\nG0 Z18.\nG0 X15.\nG0 Z30.\n";
+    let r = simulate(text, &machine, &[flat(6.0)], &stock, &part, &params(0.01, 0.2)).unwrap();
+    assert!(r.rapids_in_material.is_empty(), "{:?}", r.rapids_in_material);
+    assert_eq!(r.removed_volume, 0.0);
+    // Down into the side, or a corner (21.2 mm out) turned up into the tool at Z 18.
+    let text = "G21\nT1 M6\nG0 X-5. Y0. Z30. A0.\nG0 Z14.\nG0 Z18.\nG0 A45.\nG0 Z30.\n";
+    let r = simulate(text, &machine, &[flat(6.0)], &stock, &part, &params(0.01, 0.2)).unwrap();
+    let lines: Vec<usize> = r.rapids_in_material.iter().map(|m| m.line).collect();
+    assert_eq!(lines, vec![4, 6], "{:?}", r.rapids_in_material);
+    // The cells it did not cut (over the part) are not counted as machined.
+    assert!(r.machined_cells > 0 && r.machined_cells < r.cells / 4, "{} of {}", r.machined_cells, r.cells);
+    // A box the axis does not run through is refused.
+    let off = StockShape::Box { min: Vec3::new(-20.0, -15.0, 1.0), max: Vec3::new(20.0, 15.0, 15.0) };
+    assert!(simulate(text, &machine, &[flat(6.0)], &off, &part, &params(0.01, 0.2)).is_err());
+}
+
 #[test]
 fn derived_stock_and_hostile_input() {
     let part = block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(40.0, 40.0, -5.0));
@@ -748,4 +772,25 @@ G1 Z-1 F100
     )
     .unwrap();
     assert_eq!(silent.step(1).unwrap().rpm, None);
+}
+
+/// A gouge is measured over the material a cut column runs through: a column down the air of
+/// a slot between two blocks is no gouge however far its middle is from their walls, and a
+/// column through the side of a block grazing it, or into it, is as deep as it goes in.
+#[test]
+fn a_gouge_is_measured_over_the_material_a_column_cuts() {
+    let left = block(Vec3::new(-10.0, -10.0, -10.0), Vec3::new(-2.0, 10.0, 0.0));
+    let right = block(Vec3::new(2.0, -10.0, -10.0), Vec3::new(10.0, 10.0, 0.0));
+    let floor = block(Vec3::new(-10.0, -10.0, -12.0), Vec3::new(10.0, 10.0, -10.0));
+    let part = Surface::new(left.triangles().iter().chain(right.triangles()).chain(floor.triangles()).copied().collect()).unwrap();
+    // Down the slot to its floor: air all the way, 2 mm from the walls at its middle.
+    close(crate::sim::column_depth(&part, Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -10.0), 20.0), 0.0, 1e-9);
+    // Into the floor by half a millimetre.
+    close(crate::sim::column_depth(&part, Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -10.5), 20.0), 0.5, 1e-9);
+    // Slanting in through the top of a block and out of its side into the slot: as deep as the
+    // middle of the stretch inside it.
+    let d = crate::sim::column_depth(&part, Vec3::new(-3.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -5.0), 20.0);
+    assert!(d > 0.1 && d < 0.5, "{d}");
+    // Ending inside a block: as deep as its end.
+    close(crate::sim::column_depth(&part, Vec3::new(-6.0, 0.0, 5.0), Vec3::new(-6.0, 0.0, -3.0), 20.0), 3.0, 1e-9);
 }

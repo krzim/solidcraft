@@ -936,6 +936,17 @@ fn an_m6x1_internal_thread_is_written_one_pitch_a_turn_and_passes_the_checks() {
     let mut pocket = m6_job();
     pocket["operations"][0] = json!({"name": "p", "type": "pocket", "tool": 2, "polygon": [[0, -5], [5, -5], [5, 5], [0, 5]], "heights": {"clearance": 20, "retract": 5, "top": 0, "bottom": -1}});
     assert!(s.execute("cam.job", &json!({"job": pocket, "dry_run": true})).unwrap_err().to_string().contains("thread mill"));
+    // The model shows the tap drill's hole, not the thread: the simulation cuts with the thread
+    // mill's core, as the gouge check does, so the thread is no gouge there either.
+    let mut flat_job = m6_job();
+    flat_job["machine"] = json!("3axis");
+    flat_job["stock"] = json!({"box": {"min": [-20, -15, -10], "max": [20, 15, 0]}});
+    let out = dir.file("m6-sim.tap");
+    let r = run(&mut s, "cam.job", json!({"job": flat_job, "output": out, "simulate": true}));
+    assert_eq!(r["simulation"]["gouge"]["cells"], 0, "{r}");
+    assert_clean(&r);
+    let c = run(&mut s, "cam.simulate", json!({"path": out, "job": flat_job}));
+    assert_eq!(c["gouge"]["cells"], 0, "{c}");
 }
 
 #[test]
@@ -2396,6 +2407,24 @@ fn a_clearance_inside_the_part_is_refused() {
     });
     let e = bar().execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
     assert!(e.to_string().contains("not outside the stock"), "{e}");
+    // Without `stock_radius` the job's round stock gives it: refused the same way ...
+    let mut job = barrel_job();
+    job["stock"] = json!({"cylinder": {"radius": 14, "x_min": -20, "x_max": 20}});
+    job["operations"][0] = json!({
+        "name": "rough", "type": "rotary_roughing", "tool": 3, "pattern": {"type": "rings", "stepover": 3},
+        "clearance": 14, "retract": 14, "range": [-15, 15]
+    });
+    let e = bar().execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("not outside the stock"), "{e}");
+    // ... and planned from it when the clearance is outside it.
+    job["operations"][0]["clearance"] = json!(17);
+    job["operations"][0]["retract"] = json!(15);
+    let r = run(&mut bar(), "cam.job", json!({"job": job, "dry_run": true}));
+    assert_eq!(r["operations"].as_array().map(Vec::len), Some(1), "{r}");
+    // Neither the radius nor a stock: refused, saying what to give.
+    job.as_object_mut().unwrap().remove("stock");
+    let e = bar().execute("cam.job", &json!({"job": job, "dry_run": true})).unwrap_err();
+    assert!(e.to_string().contains("stock_radius"), "{e}");
 }
 
 #[test]
@@ -2803,6 +2832,50 @@ fn a_simulation_that_follows_no_move_does_not_pass() {
     assert_eq!(r["passed"], false, "{r}");
     assert!(r["rapids_in_material"].as_array().is_some_and(|m| !m.is_empty()), "{r}");
     assert!(r["gouge"]["worst"].as_f64().is_some_and(|w| w > 4.0), "{r}");
+}
+
+/// A radial hole drilled into a bar on a 4th axis is no gouge in the simulation at any cell
+/// size: the cells whose rays slant down the hole's air are not measured as cut into the part.
+#[test]
+fn a_radial_hole_is_no_gouge_in_the_simulation_at_any_cell_size() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 16, "height": 60, "base": [-30, 0, 0], "axis": "X", "body_name": "Bar"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 2.5, "height": 10, "base": [0, 0, 8], "axis": "Z", "operation": "cut"}));
+    let job = json!({
+        "machine": "4axis_a", "post": "mach3_4axis", "tools": [drill_tool(4, 5.0)],
+        "stock": {"cylinder": {"radius": 16, "x_min": -30, "x_max": 30}},
+        "operations": [{"name": "hole", "type": "drill", "tool": 4, "points": [[0, 0]],
+            "heights": {"clearance": 30, "retract": 18, "top": 16, "bottom": 8}}]
+    });
+    for resolution in [0.1, 0.07, 0.05] {
+        let r = run(&mut s, "cam.job", json!({"job": job, "dry_run": true, "simulate": true, "simulate_resolution": resolution}));
+        assert_eq!(r["simulation"]["gouge"]["cells"], 0, "at {resolution} mm: {}", r["simulation"]);
+        assert_eq!(r["simulation"]["resolution"], resolution, "{}", r["simulation"]);
+        assert_clean(&r);
+    }
+}
+
+/// A job file that names its machine file by a path beside it is read the same by `cam.job`
+/// and `cam.simulate`.
+#[test]
+fn a_machine_file_beside_the_job_is_read_by_the_job_and_the_simulation() {
+    let mut s = bar();
+    let dir = Dir::new("machine-path");
+    let turn = std::f64::consts::TAU;
+    let machine = json!({"name": "A about X", "rotaries": [{"letter": "A", "direction": [1, 0, 0], "center": [0, 0, 0], "carrier": "table",
+        "limits": [-turn, turn]}]});
+    std::fs::write(dir.file("mill.machine.json"), machine.to_string()).unwrap();
+    let mut job = barrel_job();
+    job.as_object_mut().unwrap().remove("machine");
+    job["machine_path"] = json!("mill.machine.json");
+    let job_path = dir.file("barrel.cam.json");
+    std::fs::write(&job_path, job.to_string()).unwrap();
+    let gcode = dir.file("barrel.tap");
+    let r = run(&mut s, "cam.job", json!({"job_path": job_path, "output": gcode}));
+    assert_eq!(r["passed"], true, "{r}");
+    let r = run(&mut s, "cam.simulate", json!({"path": gcode, "job_path": job_path, "resolution": 0.2}));
+    assert_eq!(r["gouge"]["cells"], 0, "{r}");
+    assert!(r["rapids_in_material"].as_array().is_some_and(Vec::is_empty), "{r}");
 }
 
 /// The dome finished with two ball end mills, the second with holder data; a third tool in the

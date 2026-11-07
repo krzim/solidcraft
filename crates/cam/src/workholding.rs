@@ -108,14 +108,57 @@ pub struct Clamp {
     pub height: f64,
 }
 
+/// Which end of the bar the chuck holds, and so which way the chuck's body reaches from its
+/// face along X.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChuckSide {
+    /// The unit at the table's +X end: the chuck holds the bar's +X end and reaches back from its
+    /// face towards +X; the bar stands out towards -X (+X points into the axis).
+    #[default]
+    PlusX,
+    /// The unit at the table's -X end: the chuck holds the bar's -X end and reaches back towards -X.
+    MinusX,
+}
+
+impl ChuckSide {
+    /// +1 when the chuck's body is on the +X side of its face, -1 on the -X side.
+    pub fn sign(self) -> f64 {
+        match self {
+            ChuckSide::PlusX => 1.0,
+            ChuckSide::MinusX => -1.0,
+        }
+    }
+}
+
+/// A chuck's jaws, as the ring they sweep as A turns: from the bar's surface out by `radial`,
+/// standing `axial` out of the chuck's face towards the work.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Jaws {
+    /// How many (drawn only); default 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    /// From the bar's surface to the jaws' outside.
+    pub radial: f64,
+    /// How far they stand out of the chuck's face: the length of bar they grip.
+    pub axial: f64,
+}
+
 /// A rotary unit's chuck: a cylinder about the A axis ending at its face.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Chuck {
     pub diameter: f64,
     pub length: f64,
-    /// Where its face is along X, table frame; the chuck reaches back from it (towards -X).
+    /// Where its face is along X, table frame; the chuck reaches back from it, away from the work
+    /// (towards `side`).
     pub face_x: f64,
+    /// Which end of the bar it holds. Default: `plus_x`.
+    #[serde(default)]
+    pub side: ChuckSide,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jaws: Option<Jaws>,
 }
 
 /// A rotary unit (4th axis about X).
@@ -130,7 +173,8 @@ pub struct RotaryUnit {
     pub tailstock: Option<Box3>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plate: Option<Box3>,
-    /// Work zero along X, table frame; left out, the stock's low end sits at the chuck's face.
+    /// Work zero along X, table frame; left out, the bar's held end (its +X end with the chuck on
+    /// the +X side) sits at the chuck's face.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zero_x: Option<f64>,
 }
@@ -228,6 +272,12 @@ impl Workholding {
                 || r.zero_x.is_some_and(|x| !finite(&[x]))
             {
                 return invalid("the rotary unit's boxes must have min below max, its chuck a diameter and a length above 0, all finite");
+            }
+            if c.jaws
+                .as_ref()
+                .is_some_and(|j| !(finite(&[j.radial, j.axial]) && j.radial > 0.0 && j.axial > 0.0 && j.count.is_none_or(|n| (1..=12).contains(&n))))
+            {
+                return invalid("the chuck's jaws need a `radial` and an `axial` size above 0, and 1 to 12 of them");
             }
         }
         match self.holding {
@@ -427,29 +477,44 @@ pub fn build(table: &Table, hold: &Workholding, stock: &StockShape) -> Result<Ho
         }
         Holding::Rotary => {
             let Some(r) = &hold.rotary else { return invalid("`holding: rotary` needs the `rotary` unit") };
-            if !matches!(stock, StockShape::Cylinder { .. }) {
-                return invalid("a rotary unit holds a bar (a cylinder about X)");
+            if !(smin.y < 0.0 && smax.y > 0.0 && smin.z < 0.0 && smax.z > 0.0) {
+                return invalid("a rotary unit holds a bar the A axis runs through (a cylinder about X, or a box round it)");
             }
             let to = |b: &Box3| (Vec3::new(b.min[0], b.min[1], b.min[2]), Vec3::new(b.max[0], b.max[1], b.max[2]));
             push("the table", ObstacleKind::Table, table_box);
             push("the rotary unit's headstock", ObstacleKind::Rotary, to(&r.headstock));
-            let cr = r.chuck.diameter * 0.5;
-            push(
-                "the rotary unit's chuck",
-                ObstacleKind::Rotary,
-                (
-                    Vec3::new(r.chuck.face_x - r.chuck.length, r.axis[0] - cr, r.axis[1] - cr),
-                    Vec3::new(r.chuck.face_x, r.axis[0] + cr, r.axis[1] + cr),
-                ),
-            );
+            let c = &r.chuck;
+            let sign = c.side.sign();
+            let span = |a: f64, b: f64| (a.min(b), a.max(b));
+            let ring =
+                |(x0, x1): (f64, f64), rad: f64| (Vec3::new(x0, r.axis[0] - rad, r.axis[1] - rad), Vec3::new(x1, r.axis[0] + rad, r.axis[1] + rad));
+            push("the rotary unit's chuck", ObstacleKind::Rotary, ring(span(c.face_x, c.face_x + sign * c.length), c.diameter * 0.5));
             if let Some(t) = &r.tailstock {
                 push("the rotary unit's tailstock", ObstacleKind::Rotary, to(t));
             }
             if let Some(p) = &r.plate {
                 push("the rotary unit's plate", ObstacleKind::Rotary, to(p));
             }
-            let zero_x = r.zero_x.unwrap_or(r.chuck.face_x - smin.x);
-            Vec3::new(zero_x, r.axis[0], r.axis[1])
+            // The bar's held end at the chuck's face unless work zero is given.
+            let held_end = if c.side == ChuckSide::PlusX { smax.x } else { smin.x };
+            let zero_x = r.zero_x.unwrap_or(c.face_x - held_end);
+            let zero = Vec3::new(zero_x, r.axis[0], r.axis[1]);
+            if let Some(j) = &c.jaws {
+                // The ring the jaws sweep, less the bar: where a tool must not go.
+                let zone = span(c.face_x, c.face_x - sign * j.axial);
+                let rad = smin.y.abs().max(smax.y).hypot(smin.z.abs().max(smax.z));
+                let rad = if matches!(stock, StockShape::Cylinder { .. }) { smax.y } else { rad };
+                for b in box_minus(ring(zone, rad + j.radial), (smin + zero, smax + zero)) {
+                    push("the rotary unit's jaws", ObstacleKind::Rotary, b);
+                }
+                let grip = (smax.x + zero_x).min(zone.1) - (smin.x + zero_x).max(zone.0);
+                if grip <= 1e-9 {
+                    f.push(setup("stock-not-gripped", Severity::Error, "the bar does not reach the chuck's jaws: nothing holds it".into()));
+                } else if grip < 3.0 {
+                    f.push(setup("shallow-grip", Severity::Warning, format!("the jaws grip only {} mm of the bar: aim for 3 mm or more", num(grip))));
+                }
+            }
+            zero
         }
     };
     // The grip box is an obstacle where the stock is not.
