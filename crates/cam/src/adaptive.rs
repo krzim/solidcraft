@@ -32,10 +32,11 @@ use solidcraft_geom::prelude::*;
 use crate::check::verify;
 use crate::cutter::Cutter;
 use crate::dropcutter::drop_z;
-use crate::engagement::{Index, SKIN};
+use crate::engagement::SKIN;
 use crate::offset::Shape;
 use crate::ops::{Cut, Feeds, Heights};
 use crate::path::{MAX_MOVES, Move, Toolpath, arc_sweep};
+use crate::piece::Piece;
 use crate::surface::Surface;
 use crate::surface_ops::{Boundary, Budget, check_leave, check_stepdown, check_tolerance, descent_feed, levels, tool_cutter};
 use crate::tool::Tool;
@@ -54,11 +55,19 @@ const MAX_WORK: f64 = 6.0e9;
 /// walks' searches and refreshes. A level's work does not depend on how many levels there
 /// are, so a larger stepdown (fewer levels) is never refused where a smaller one is planned.
 pub(crate) const LEVEL_WORK_PER_CELL: f64 = 8000.0;
+/// Cell visits a step of a walk takes, about, per cell of the raster its sweep looks at (the
+/// sweep itself, the engagement round the fan of headings, the exact distances near the cut).
+const STEP_WORK_PER_SWEEP_CELL: f64 = 3.0;
+/// How many times the steps a level is expected to take its budget allows.
+const STEP_SLACK: f64 = 3.0;
 /// Fewest cell visits a level of an adaptive roughing is allowed (a small raster).
 const MIN_LEVEL_WORK: f64 = 2.0e8;
 /// About how many cell visits a level of an adaptive roughing takes per cell of its raster (a
 /// plate round a boss: some 3000).
 pub(crate) const TYPICAL_LEVEL_WORK_PER_CELL: f64 = 3000.0;
+/// Material at most this thick (mm) left above a level by earlier cuts is not chased by rest
+/// machining (the operation's tolerance when that is larger).
+pub const REST_TOLERANCE: f64 = 0.02;
 /// Most cell visits an adaptive roughing is expected to take, all its levels together (a few
 /// minutes of planning); a job expected to take more is refused before any is done.
 pub(crate) const MAX_ROUGHING_WORK: f64 = 3.0e10;
@@ -132,6 +141,10 @@ pub struct AdaptiveRoughingParams {
     #[serde(default)]
     pub flats: bool,
     pub adaptive: AdaptiveParams,
+    /// What earlier cuts left of the stock (rest machining): the levels clear only what is
+    /// still above them there. Left out, the stock box is whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest: Option<HeightMap>,
 }
 
 /// An adaptive toolpath and what each of its moves is for.
@@ -200,8 +213,8 @@ fn check_flutes(tool: &Tool, top: f64, zs: &[f64]) -> Result<()> {
     Ok(())
 }
 
-/// Counts cell visits: those of the level being planned against its own limit, and all of
-/// them against the operation's.
+/// Counts cell visits: those of the level being planned against its own budget, and all of
+/// them against the sum of the budgets so far.
 struct Work {
     total: std::cell::Cell<f64>,
     level: std::cell::Cell<f64>,
@@ -210,21 +223,16 @@ struct Work {
 }
 
 impl Work {
-    /// The 2D adaptive clearing's: [`MAX_WORK`] for its one planned level.
-    fn new() -> Work {
-        Work { total: std::cell::Cell::new(0.0), level: std::cell::Cell::new(0.0), limit: MAX_WORK, level_limit: MAX_WORK }
+    /// Before any level: `setup` visits for rasterising the region.
+    fn new(setup: f64) -> Work {
+        Work { total: std::cell::Cell::new(0.0), level: std::cell::Cell::new(0.0), limit: setup, level_limit: setup }
     }
 
-    /// An adaptive roughing's: each level's limit scaled to its raster of `cells`, the whole
-    /// operation's that times its `levels`.
-    fn for_levels(levels: usize, cells: usize) -> Work {
-        let level_limit = level_work_limit(cells);
-        Work { total: std::cell::Cell::new(0.0), level: std::cell::Cell::new(0.0), limit: level_limit * levels.max(1) as f64, level_limit }
-    }
-
-    /// A new level starts.
-    fn start_level(&self) {
+    /// A new level starts, allowed `budget` visits of its own.
+    fn start_level(&mut self, budget: f64) {
         self.level.set(0.0);
+        self.level_limit = budget;
+        self.limit += budget;
     }
 
     fn add(&mut self, n: f64) -> Result<()> {
@@ -236,7 +244,7 @@ impl Work {
         self.level.set(self.level.get() + n);
         if self.level.get() > self.level_limit || self.total.get() > self.limit {
             return Err(CamError::TooLarge(
-                "the adaptive clearing needs too much work at one level; use a larger tool, optimal load or engagement limit, or a smaller region"
+                "the adaptive clearing needs far more work at one level than its area and load call for (the walks keep missing the material); use a larger optimal load or engagement limit, or split the region"
                     .into(),
             ));
         }
@@ -244,24 +252,79 @@ impl Work {
     }
 }
 
-/// The most cell visits one level of an adaptive roughing over a raster of `cells` may take.
-pub(crate) fn level_work_limit(cells: usize) -> f64 {
-    (cells as f64 * LEVEL_WORK_PER_CELL).max(MIN_LEVEL_WORK)
+/// The most cell visits one level over a raster of `cells` may take when its walks are expected
+/// to take `steps` steps of `step_work` visits each: the searches between the walks (scaled to
+/// the raster) and the walks themselves (scaled to the area and the load), each with room to
+/// spare.
+pub(crate) fn level_work_limit(cells: usize, steps: f64, step_work: f64) -> f64 {
+    (cells as f64 * LEVEL_WORK_PER_CELL).max(MIN_LEVEL_WORK) + STEP_SLACK * steps * step_work
+}
+
+/// What an adaptive clearing at `knobs` is expected to take: steps per level over `area` mm².
+fn expected_steps(knobs: &Knobs, area: f64) -> f64 {
+    area / (knobs.w * knobs.step)
+}
+
+/// The smallest optimal load (mm) at which `fits` holds for the knobs it gives, the rest of
+/// `params` kept but for the largest engagement, raised with the load as a job raises it by
+/// default (one and a half times the load's, and at least 15° more): `None` when not even the
+/// tool's diameter does.
+fn smallest_load(tool: &Tool, params: &AdaptiveParams, fits: &dyn Fn(&Knobs) -> bool) -> Option<f64> {
+    let r = tool.radius();
+    let knobs = |w: f64| {
+        let opt = (1.0 - w / r).clamp(-1.0, 1.0).acos();
+        let most = params.max_engagement.max((opt * 1.5).max(opt + 15.0 * PI / 180.0).min(PI));
+        Knobs::new(tool, &AdaptiveParams { optimal_load: w, max_engagement: most, ..*params })
+    };
+    let (mut lo, mut hi) = (params.optimal_load, tool.diameter);
+    if !fits(&knobs(hi)) {
+        return None;
+    }
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if fits(&knobs(mid)) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(hi)
+}
+
+/// What to say when a clearing at `params` would take too many steps: the smallest load that
+/// would plan, or that none does.
+fn load_hint(tool: &Tool, params: &AdaptiveParams, fits: &dyn Fn(&Knobs) -> bool) -> String {
+    match smallest_load(tool, params, fits) {
+        // Rounded up to the next 0.01 mm, so the load named does plan.
+        Some(w) => {
+            format!("use an optimal load of at least {:.2} mm ({:.1}% of the tool's diameter)", (w * 100.0).ceil() / 100.0, w / tool.diameter * 100.0)
+        }
+        None => "no optimal load up to the tool's diameter plans it: use a larger tool, or split the region".into(),
+    }
 }
 
 /// Refuses, before any is done, an adaptive roughing of `levels` levels over a raster of
-/// `cells` that would take minutes of planning ([`MAX_ROUGHING_WORK`] as it typically goes) or
-/// more drop-cutter samples than an operation may take: with the numbers and what to change.
-pub(crate) fn check_roughing_work(levels: usize, cells: usize) -> Result<()> {
-    let expected = levels as f64 * cells as f64 * TYPICAL_LEVEL_WORK_PER_CELL;
+/// `cells` whose walks are expected to take `steps` steps of `step_work` visits a level, when
+/// that would take minutes of planning ([`MAX_ROUGHING_WORK`] as it typically goes), more steps
+/// a level than a walk may take, or more drop-cutter samples than an operation may take: with
+/// the numbers and `hint`, what to change.
+pub(crate) fn check_roughing_work(levels: usize, cells: usize, steps: f64, step_work: f64, hint: &dyn Fn() -> String) -> Result<()> {
+    let expected = levels as f64 * (cells as f64 * TYPICAL_LEVEL_WORK_PER_CELL + steps * step_work);
     if !(expected <= MAX_ROUGHING_WORK) {
         return Err(CamError::TooLarge(format!(
-            "the adaptive roughing has {levels} levels over a raster of {cells} cells: some {expected:.1e} cell visits, minutes of planning (at most {MAX_ROUGHING_WORK:.0e}); use a larger stepdown (fewer levels), a larger tool or optimal load (a coarser raster), or a smaller boundary"
+            "the adaptive roughing has {levels} levels over a raster of {cells} cells, some {steps:.2e} steps a level: some {expected:.1e} cell visits, minutes of planning (at most {MAX_ROUGHING_WORK:.0e}); use a larger stepdown (fewer levels) or a smaller boundary, or {}",
+            hint()
+        )));
+    }
+    if !(steps <= MAX_STEPS as f64) {
+        return Err(CamError::TooLarge(format!(
+            "the adaptive roughing needs some {steps:.2e} steps a level, more than {MAX_STEPS}; {}, or use a smaller boundary",
+            hint()
         )));
     }
     if !(levels as f64 * cells as f64 <= crate::surface_ops::MAX_DROPS as f64) {
         return Err(CamError::TooLarge(format!(
-            "the adaptive roughing has {levels} levels over a raster of {cells} cells, more drop-cutter samples than {}; use a larger stepdown (fewer levels), a larger tool or optimal load (a coarser raster), or a smaller boundary",
+            "the adaptive roughing has {levels} levels over a raster of {cells} cells, more drop-cutter samples than {}; use a larger stepdown (fewer levels), a larger tool (a coarser raster), or a smaller boundary",
             crate::surface_ops::MAX_DROPS
         )));
     }
@@ -386,14 +449,44 @@ fn envelope(f: &[f64], d: &mut [f64], v: &mut Vec<usize>, z: &mut Vec<f64>) {
 /// Distance (mm) from each cell's centre to the nearest cell's centre where `site` holds;
 /// infinite where there is none.
 fn distance_field(g: &Grid, site: &dyn Fn(usize) -> bool, work: &mut Work) -> Result<Vec<f64>> {
-    work.add(3.0 * g.len() as f64)?;
-    let (nx, ny) = (g.nx, g.ny);
-    let mut out = vec![FAR; g.len()];
+    distance_window(g, site, Window { i0: 0, i1: g.nx, j0: 0, j1: g.ny }, work)
+}
+
+/// A rectangle of a raster's cells: columns `i0..i1`, rows `j0..j1`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Window {
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+}
+
+impl Window {
+    /// Grown by `m` cells on every side, within the raster.
+    fn grown(&self, m: usize, g: &Grid) -> Window {
+        Window { i0: self.i0.saturating_sub(m), i1: (self.i1 + m).min(g.nx), j0: self.j0.saturating_sub(m), j1: (self.j1 + m).min(g.ny) }
+    }
+
+    /// Also covering cell `(i, j)`.
+    fn with(w: Option<Window>, i: usize, j: usize) -> Window {
+        match w {
+            None => Window { i0: i, i1: i + 1, j0: j, j1: j + 1 },
+            Some(w) => Window { i0: w.i0.min(i), i1: w.i1.max(i + 1), j0: w.j0.min(j), j1: w.j1.max(j + 1) },
+        }
+    }
+}
+
+/// [`distance_field`] over the cells of `win` only, from the sites inside it, indexed from its
+/// corner row by row.
+fn distance_window(g: &Grid, site: &dyn Fn(usize) -> bool, win: Window, work: &mut Work) -> Result<Vec<f64>> {
+    let (nx, ny) = (win.i1.saturating_sub(win.i0), win.j1.saturating_sub(win.j0));
+    work.add(3.0 * (nx * ny) as f64)?;
+    let mut out = vec![FAR; nx * ny];
     let n = nx.max(ny);
     let (mut f, mut d, mut v, mut z) = (vec![FAR; n], vec![FAR; n], Vec::with_capacity(n), Vec::with_capacity(n + 1));
     for j in 0..ny {
         for (i, fi) in f.iter_mut().enumerate().take(nx) {
-            *fi = if site(j * nx + i) { 0.0 } else { FAR };
+            *fi = if site((win.j0 + j) * g.nx + win.i0 + i) { 0.0 } else { FAR };
         }
         if let (Some(fr), Some(dr)) = (f.get(..nx), d.get_mut(..nx)) {
             envelope(fr, dr, &mut v, &mut z);
@@ -462,6 +555,221 @@ impl Domain for Clear<'_> {
     }
 }
 
+/// A heightfield of what earlier cuts left: cell `(i, j)` is the column over the square of
+/// side `dx` by `dy` about `(x0 + (i + ½)·dx, y0 + (j + ½)·dy)`, its top at `heights[j·nx + i]`
+/// (the simulation's [`crate::sim::StockGrid::Heights`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HeightMap {
+    pub x0: f64,
+    pub y0: f64,
+    pub dx: f64,
+    pub dy: f64,
+    pub nx: usize,
+    pub ny: usize,
+    pub heights: Vec<f64>,
+}
+
+/// Most cells of a height map.
+pub const MAX_MAP_CELLS: usize = 64_000_000;
+
+impl HeightMap {
+    pub fn validate(&self) -> Result<()> {
+        if ![self.x0, self.y0, self.dx, self.dy].iter().all(|v| v.is_finite() && v.abs() <= MAX_COORD) || !(self.dx > 0.0) || !(self.dy > 0.0) {
+            return invalid("the stock's height map needs finite corners and cells above 0 mm");
+        }
+        if self.nx == 0 || self.ny == 0 || self.nx.checked_mul(self.ny).is_none_or(|n| n > MAX_MAP_CELLS || n != self.heights.len()) {
+            return invalid(format!("the stock's height map needs nx × ny heights, at most {MAX_MAP_CELLS}"));
+        }
+        if !self.heights.iter().all(|z| z.is_finite() && z.abs() <= MAX_COORD) {
+            return invalid("the stock's heights must be finite numbers within 1000 m");
+        }
+        Ok(())
+    }
+
+    /// The highest top of the cell `q` is in and the cells next to it (the material could be
+    /// anywhere in a cell); `None` off the map.
+    pub fn top_near(&self, q: Vec2) -> Option<f64> {
+        let fi = (q.x - self.x0) / self.dx;
+        let fj = (q.y - self.y0) / self.dy;
+        if !(fi >= 0.0 && fj >= 0.0 && fi < self.nx as f64 && fj < self.ny as f64) {
+            return None;
+        }
+        let (i, j) = (fi as usize, fj as usize);
+        let mut most = f64::NEG_INFINITY;
+        for jj in j.saturating_sub(1)..=(j + 1).min(self.ny - 1) {
+            for ii in i.saturating_sub(1)..=(i + 1).min(self.nx - 1) {
+                if let Some(z) = self.heights.get(jj * self.nx + ii) {
+                    most = most.max(*z);
+                }
+            }
+        }
+        most.is_finite().then_some(most)
+    }
+
+    /// The highest top over the disc of radius `rad` about `c` (and a cell round it); `None`
+    /// where the disc is off the map.
+    fn top_over(&self, c: Vec2, rad: f64) -> Option<f64> {
+        let i0 = ((c.x - rad - self.x0) / self.dx - 1.0).floor().max(0.0);
+        let i1 = ((c.x + rad - self.x0) / self.dx + 1.0).ceil().min(self.nx as f64 - 1.0);
+        let j0 = ((c.y - rad - self.y0) / self.dy - 1.0).floor().max(0.0);
+        let j1 = ((c.y + rad - self.y0) / self.dy + 1.0).ceil().min(self.ny as f64 - 1.0);
+        if !(i0 <= i1 && j0 <= j1) {
+            return None;
+        }
+        let mut most = f64::NEG_INFINITY;
+        let reach = rad + self.dx.hypot(self.dy);
+        for j in j0 as usize..=j1 as usize {
+            for i in i0 as usize..=i1 as usize {
+                let p = Vec2::new(self.x0 + (i as f64 + 0.5) * self.dx, self.y0 + (j as f64 + 0.5) * self.dy);
+                if p.dist(c) <= reach
+                    && let Some(z) = self.heights.get(j * self.nx + i)
+                {
+                    most = most.max(*z);
+                }
+            }
+        }
+        most.is_finite().then_some(most)
+    }
+}
+
+/// What an adaptive clearing knows of the stock beyond its own region (2D) or boundary (3D):
+/// where the stock is seen from above, how high it reaches, and what earlier cuts left of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StockModel {
+    /// The stock's low and high corners seen from above; `None`: it reaches past the region
+    /// everywhere (a 2D clearing then enters with a helix).
+    #[serde(default)]
+    pub rect: Option<[Vec2; 2]>,
+    /// The stock's top; `None`: the operation's top.
+    #[serde(default)]
+    pub top: Option<f64>,
+    /// What earlier operations (or setups) left: where the map has a cell, the material ends at
+    /// its top. Rest machining plans on it.
+    #[serde(default)]
+    pub heights: Option<HeightMap>,
+    /// Material left above a level no thicker than this is taken as cut (mm): the cusps and
+    /// the cells of the map are not chased.
+    #[serde(default)]
+    pub rest_tolerance: f64,
+}
+
+impl StockModel {
+    fn validate(&self) -> Result<()> {
+        if let Some([lo, hi]) = self.rect
+            && (![lo.x, lo.y, hi.x, hi.y].iter().all(|v| v.is_finite() && v.abs() <= MAX_COORD) || !(lo.x < hi.x) || !(lo.y < hi.y))
+        {
+            return invalid("the stock's corners must be finite, the low one below and left of the high one");
+        }
+        if self.top.is_some_and(|t| !(t.is_finite() && t.abs() <= MAX_COORD)) {
+            return invalid("the stock's top must be a finite height");
+        }
+        if !(self.rest_tolerance >= 0.0 && self.rest_tolerance <= 100.0) {
+            return invalid("the rest tolerance must be from 0 to 100 mm");
+        }
+        if let Some(m) = &self.heights {
+            m.validate()?;
+        }
+        Ok(())
+    }
+
+    fn in_rect(&self, q: Vec2) -> bool {
+        self.rect.is_none_or(|[lo, hi]| q.x >= lo.x && q.x <= hi.x && q.y >= lo.y && q.y <= hi.y)
+    }
+
+    /// Whether there is stock at `q` at the level `z`.
+    fn material_at(&self, q: Vec2, z: f64) -> bool {
+        self.in_rect(q)
+            && self.top.is_none_or(|t| t > z + self.rest_tolerance)
+            && self.heights.as_ref().and_then(|m| m.top_near(q)).is_none_or(|t| t > z + self.rest_tolerance)
+    }
+
+    /// The highest the stock reaches over the disc of radius `rad` about `c`, at most `cap`.
+    fn top_over(&self, c: Vec2, rad: f64, cap: f64) -> f64 {
+        let t = self.top.map_or(cap, |t| t.min(cap));
+        match self.heights.as_ref().and_then(|m| m.top_over(c, rad)) {
+            Some(h) => h.min(t),
+            None => t,
+        }
+    }
+}
+
+/// Where the cutter's centre may stand in a 2D clearing when the stock's extent is known: inside
+/// the regions clear of their walls as [`Walls`] has it, and also past a region's boundary where
+/// the tool meets no stock outside the regions (open air beyond the stock's edge, or a region
+/// drawn round the stock).
+struct Fence {
+    shape: Shape,
+    lo: Vec2,
+    hi: Vec2,
+    /// The boundary of the stock outside the regions: the regions' boundary inside the stock and
+    /// the stock's edges outside the regions.
+    walls: Vec<Piece>,
+    wall: f64,
+}
+
+impl Fence {
+    fn new(shape: Shape, lo: Vec2, hi: Vec2, wall: f64) -> Fence {
+        let corners = [lo, Vec2::new(hi.x, lo.y), hi, Vec2::new(lo.x, hi.y)];
+        let edges: Vec<Piece> = (0..4).filter_map(|i| Some(Piece::Line { a: *corners.get(i)?, b: *corners.get((i + 1) % 4)? })).collect();
+        let size = (hi - lo).len().max(1.0);
+        let eps = 1e-9 * size;
+        let nudge = 1e-6 * size;
+        let strictly_in = |q: Vec2| q.x > lo.x + eps && q.x < hi.x - eps && q.y > lo.y + eps && q.y < hi.y - eps;
+        // The stretches of `piece` between where it crosses `others`.
+        let split = |piece: &Piece, others: &mut dyn Iterator<Item = &Piece>| -> Vec<(f64, f64)> {
+            let mut ts = vec![0.0, 1.0];
+            let mut hits = Vec::new();
+            for o in others {
+                hits.clear();
+                piece.intersections(o, &mut hits);
+                ts.extend(hits.iter().map(|h| h.0));
+            }
+            ts.sort_by(f64::total_cmp);
+            ts.dedup_by(|a, b| (*a - *b).abs() <= 1e-12);
+            ts.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?))).filter(|(a, b)| b - a > 1e-12).collect()
+        };
+        let mut walls = Vec::new();
+        for piece in shape.loops().iter().flatten() {
+            for (t0, t1) in split(piece, &mut edges.iter()) {
+                if strictly_in(piece.point_at(0.5 * (t0 + t1))) {
+                    walls.push(piece.sub(t0, t1));
+                }
+            }
+        }
+        for e in &edges {
+            let inward = e.tangent_at(0.5).perp();
+            for (t0, t1) in split(e, &mut shape.loops().iter().flatten()) {
+                let m = e.point_at(0.5 * (t0 + t1)) + inward * nudge;
+                if !shape.inside(m, nudge) {
+                    walls.push(e.sub(t0, t1));
+                }
+            }
+        }
+        Fence { shape, lo, hi, walls, wall }
+    }
+
+    /// Whether a tool of radius `wall` centred on `p` stays off the stock outside the regions.
+    fn clear(&self, p: Vec2, wall: f64) -> bool {
+        if !p.is_finite() {
+            return false;
+        }
+        if self.shape.clear(p, wall) {
+            return true;
+        }
+        let in_stock = p.x >= self.lo.x && p.x <= self.hi.x && p.y >= self.lo.y && p.y <= self.hi.y;
+        if in_stock && !self.shape.inside(p, wall.max(1e-6)) {
+            return false;
+        }
+        self.walls.iter().all(|w| w.dist(p) >= wall - 1e-7)
+    }
+}
+
+impl Domain for Fence {
+    fn allowed(&self, p: Vec2) -> Result<bool> {
+        Ok(self.clear(p, self.wall))
+    }
+}
+
 /// The planner's knobs, derived from the tool and the parameters.
 #[derive(Clone, Copy, Debug)]
 struct Knobs {
@@ -470,6 +778,8 @@ struct Knobs {
     h: f64,
     /// Step length of a walk.
     step: f64,
+    /// The radial width of cut aimed at.
+    w: f64,
     /// Margin kept from where the centre may not go.
     margin: f64,
     /// Engagement the walk aims at, the most it takes, and the least it wants.
@@ -493,8 +803,11 @@ impl Knobs {
         // below the load's. The raster and the steps follow it, so a step into material (a
         // concave wall above all) stays within the limit.
         let w = (r * (1.0 - target.cos())).min(load);
-        let h = (r / 16.0).min(w / 4.0).max(r * 1e-3);
-        let step = (w * 0.5).clamp(2.0 * h, r * 0.25);
+        // The raster follows the tool, not the load: where the path is near the edge of what
+        // it has cut, the engagement is settled by exact distances to the moves, so a light
+        // load needs no finer cells (only more steps).
+        let h = r / 16.0;
+        let step = (w * 0.5).clamp(h, r * 0.25);
         // Only points in line with their neighbours are left out: the walk's engagement holds for
         // the points it took, and a corner cut short near the edge of a cut can bite much deeper.
         let simplify = (p.tolerance * 0.01).min(1e-4);
@@ -502,6 +815,7 @@ impl Knobs {
             r,
             h,
             step,
+            w,
             margin: step * step / (8.0 * r) + simplify + 1e-4 * r.max(1.0),
             target,
             limit,
@@ -511,6 +825,27 @@ impl Knobs {
             ramp: p.ramp_angle,
             simplify,
         }
+    }
+}
+
+impl Knobs {
+    /// How far a walk may go without cutting before it ends: a half turn at its tightest turn
+    /// and a quarter more, enough to round a corner of the material and come back to it, too
+    /// little to wander off through what is already cleared.
+    fn max_air(&self) -> f64 {
+        1.25 * PI * self.step / MAX_TURN
+    }
+
+    /// How far from material the distances to it are kept exact: past where a walk starts
+    /// and where it steers through air.
+    fn near(&self) -> f64 {
+        2.0 * self.r + 2.0 * self.step + 4.0 * self.h + self.max_air()
+    }
+
+    /// About how many cell visits a step of a walk takes: the cells its sweep looks at.
+    fn step_work(&self) -> f64 {
+        let span = 2.0 * (self.r + self.h) / self.h + 2.0 + self.step / self.h;
+        span * span * STEP_WORK_PER_SWEEP_CELL
     }
 }
 
@@ -550,7 +885,11 @@ struct Level<'a> {
     /// Distance from each cell's centre to the path so far (where it is within reach of it).
     dpath: Vec<f64>,
     /// The path so far, for exact distances.
-    index: Index,
+    segs: Vec<(Vec2, Vec2)>,
+    /// For each cell not yet settled by the raster (its centre neither well inside nor well
+    /// outside the radius of the path), the moves that come within the radius and the slack of
+    /// its centre: all the moves that may cut a point the cell settles.
+    band: std::collections::HashMap<usize, Vec<u32>>,
     /// Material still there: stock farther than the radius from the path (all of it, so the
     /// engagement sees what the tool cannot reach too).
     mat: Vec<bool>,
@@ -559,7 +898,19 @@ struct Level<'a> {
     /// Distance from each cell to the nearest material within reach (refreshed between walks).
     dmat: Vec<f64>,
     /// Distance from each cell to the nearest material of any kind (refreshed with `dmat`).
+    /// Both are exact up to [`Knobs::near`]; a larger distance only says the material is
+    /// farther than that.
     dall: Vec<f64>,
+    /// Whether `dmat` and `dall` have been worked out once.
+    fresh: bool,
+    /// The cells whose material the walks cleared since the distances were last refreshed.
+    dirty: Option<Window>,
+    /// Cells of material within reach still there.
+    left: usize,
+    /// The links' search: the cell each cell was reached from, and the search that reached it.
+    parent: Vec<u32>,
+    seen: Vec<u32>,
+    search: u32,
     /// Distance from each cell to the nearest cell the centre may not stand at.
     room: Vec<f64>,
     tried: Vec<bool>,
@@ -582,15 +933,17 @@ impl<'a> Level<'a> {
         steps: &'a mut usize,
         work: &'a mut Work,
     ) -> Result<Level<'a>> {
+        let mat: Vec<bool> = (0..g.len()).map(|c| stock_cell(g.center_of(c))).collect();
+        // The level's budget: its raster and the walks its material is expected to take.
+        let area = mat.iter().filter(|m| **m).count() as f64 * g.h * g.h;
+        work.start_level(level_work_limit(g.len(), expected_steps(&k, area), k.step_work()));
         let reach = distance_field(&g, &|c| allow.get(c).copied().unwrap_or(false), work)?;
         let room = distance_field(&g, &|c| !allow.get(c).copied().unwrap_or(false), work)?;
-        let mat: Vec<bool> = (0..g.len()).map(|c| stock_cell(g.center_of(c))).collect();
-        let reach: Vec<bool> = reach.iter().map(|d| *d <= k.r - k.h).collect();
+        let reach: Vec<bool> = reach.iter().map(|d| *d <= k.r - 0.5 * k.h).collect();
+        let left = mat.iter().zip(&reach).filter(|(m, r)| **m && **r).count();
         let rho = k.r * (1.0 - SKIN);
         let ring = (0..RING).map(|i| Vec2::from_angle(TAU * i as f64 / RING as f64) * rho).collect();
         let n = g.len();
-        let far = Vec2::new(g.nx as f64 * g.h, g.ny as f64 * g.h);
-        let index = Index::new(g.origin - Vec2::new(k.r, k.r), g.origin + far + Vec2::new(k.r, k.r), k.r);
         Ok(Level {
             g,
             k,
@@ -598,11 +951,18 @@ impl<'a> Level<'a> {
             allow,
             stock_at,
             dpath: vec![FAR; n],
-            index,
+            segs: Vec::new(),
+            band: std::collections::HashMap::new(),
             mat,
             reach,
             dmat: vec![FAR; n],
             dall: vec![FAR; n],
+            fresh: false,
+            dirty: None,
+            left,
+            parent: vec![0; n],
+            seen: vec![0; n],
+            search: 0,
             room,
             tried: vec![false; n],
             ring,
@@ -625,7 +985,7 @@ impl<'a> Level<'a> {
     }
 
     fn material_cells(&self) -> usize {
-        (0..self.g.len()).filter(|c| self.target(*c)).count()
+        self.left
     }
 
     /// Whether the point is still material: stock not within the radius of the path. The raster
@@ -644,10 +1004,10 @@ impl<'a> Level<'a> {
         if d > self.k.r + slack {
             return Ok(true);
         }
-        let mut tests = 0.0;
-        let cut = self.index.cut(q, 0.0, self.k.r, &mut tests);
-        self.work.add_shared(tests)?;
-        Ok(!cut)
+        let Some(near) = self.band.get(&c) else { return Ok(true) };
+        self.work.add_shared(near.len() as f64)?;
+        let r = self.k.r;
+        Ok(!near.iter().any(|id| self.segs.get(*id as usize).is_some_and(|(a, b)| seg_dist(q, *a, *b) < r)))
     }
 
     /// The engagement at `q` (radians of the circumference in material, at most a half turn)
@@ -666,7 +1026,10 @@ impl<'a> Level<'a> {
 
     /// Records the tool's centre moving from `a` to `b`; how many cells of material it cleared.
     fn sweep(&mut self, a: Vec2, b: Vec2) -> Result<usize> {
-        self.index.insert(a, b, 0.0);
+        let id = self.segs.len() as u32;
+        self.segs.push((a, b));
+        let slack = self.g.h * std::f64::consts::FRAC_1_SQRT_2 + 1e-9;
+        let (settled, unsettled) = (self.k.r - slack, self.k.r + slack);
         let lo = Vec2::new(a.x.min(b.x), a.y.min(b.y));
         let hi = Vec2::new(a.x.max(b.x), a.y.max(b.y));
         let (is, js) = self.g.span(lo, hi, self.k.r + self.g.h);
@@ -676,9 +1039,11 @@ impl<'a> Level<'a> {
             for i in is.clone() {
                 let c = j * self.g.nx + i;
                 let d = seg_dist(self.g.center(i, j), a, b);
-                if let Some(dp) = self.dpath.get_mut(c)
-                    && d < *dp
-                {
+                let Some(dp) = self.dpath.get_mut(c) else { continue };
+                if *dp <= settled {
+                    continue;
+                }
+                if d < *dp {
                     *dp = d;
                     if d <= self.k.r
                         && let Some(m) = self.mat.get_mut(c)
@@ -686,7 +1051,16 @@ impl<'a> Level<'a> {
                     {
                         *m = false;
                         n += 1;
+                        if self.reach.get(c).copied().unwrap_or(false) {
+                            self.left = self.left.saturating_sub(1);
+                        }
+                        self.dirty = Some(Window::with(self.dirty, i, j));
                     }
+                }
+                if *dp <= settled {
+                    self.band.remove(&c);
+                } else if d < unsettled {
+                    self.band.entry(c).or_default().push(id);
                 }
             }
         }
@@ -705,10 +1079,37 @@ impl<'a> Level<'a> {
         Ok(())
     }
 
+    /// Brings the distances to the material up to date with what the walks cleared: all of
+    /// them the first time, then only round the cells cleared since. Material is only ever
+    /// cleared, so a distance grows only where the material nearest it went: within
+    /// [`Knobs::near`] of a cell cleared. Those cells are worked out again from the material
+    /// within that much more round them; the rest keep theirs.
     fn refresh(&mut self) -> Result<()> {
+        let full = Window { i0: 0, i1: self.g.nx, j0: 0, j1: self.g.ny };
+        let (outer, inner) = if self.fresh {
+            let Some(d) = self.dirty.take() else { return Ok(()) };
+            let m = (self.k.near() / self.g.h).ceil() as usize + 1;
+            (d.grown(2 * m, &self.g), d.grown(m, &self.g))
+        } else {
+            self.fresh = true;
+            self.dirty = None;
+            (full, full)
+        };
         let (mat, reach) = (&self.mat, &self.reach);
-        self.dmat = distance_field(&self.g, &|c| mat.get(c).copied().unwrap_or(false) && reach.get(c).copied().unwrap_or(false), self.work)?;
-        self.dall = distance_field(&self.g, &|c| mat.get(c).copied().unwrap_or(false), self.work)?;
+        let dmat = distance_window(&self.g, &|c| mat.get(c).copied().unwrap_or(false) && reach.get(c).copied().unwrap_or(false), outer, self.work)?;
+        let dall = distance_window(&self.g, &|c| mat.get(c).copied().unwrap_or(false), outer, self.work)?;
+        let wnx = outer.i1 - outer.i0;
+        for j in inner.j0..inner.j1 {
+            for i in inner.i0..inner.i1 {
+                let (c, w) = (j * self.g.nx + i, (j - outer.j0) * wnx + (i - outer.i0));
+                if let (Some(d), Some(v)) = (self.dmat.get_mut(c), dmat.get(w)) {
+                    *d = *v;
+                }
+                if let (Some(d), Some(v)) = (self.dall.get_mut(c), dall.get(w)) {
+                    *d = *v;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -743,11 +1144,16 @@ impl<'a> Level<'a> {
     fn linked_frontier(&mut self, from: Vec2) -> Result<Option<(Vec<Vec2>, usize)>> {
         let Some(start) = self.g.index(from) else { return Ok(None) };
         let n = self.g.len();
-        self.work.add(n as f64 * 0.25)?;
-        let mut parent = vec![u32::MAX; n];
+        self.search = self.search.wrapping_add(1);
+        if self.search == 0 {
+            self.seen.fill(0);
+            self.search = 1;
+        }
+        let search = self.search;
         let mut queue = VecDeque::new();
-        if let Some(p) = parent.get_mut(start) {
+        if let (Some(p), Some(s)) = (self.parent.get_mut(start), self.seen.get_mut(start)) {
             *p = start as u32;
+            *s = search;
         }
         queue.push_back(start);
         let (nx, ny) = (self.g.nx as isize, self.g.ny as isize);
@@ -766,9 +1172,10 @@ impl<'a> Level<'a> {
                     continue;
                 }
                 let d = (j * nx + i) as usize;
-                if parent.get(d).is_some_and(|p| *p == u32::MAX) && self.free(d) {
-                    if let Some(p) = parent.get_mut(d) {
+                if self.seen.get(d).is_some_and(|s| *s != search) && self.free(d) {
+                    if let (Some(p), Some(s)) = (self.parent.get_mut(d), self.seen.get_mut(d)) {
                         *p = c as u32;
+                        *s = search;
                     }
                     queue.push_back(d);
                 }
@@ -779,7 +1186,7 @@ impl<'a> Level<'a> {
         let mut cells = vec![end];
         let mut c = end;
         while c != start {
-            let Some(p) = parent.get(c).map(|p| *p as usize) else { break };
+            let Some(p) = self.parent.get(c).map(|p| *p as usize) else { break };
             if p == c || cells.len() > n {
                 break;
             }
@@ -902,7 +1309,7 @@ impl<'a> Level<'a> {
         let (mut pos, mut dir) = (start, heading.normalized().unwrap_or(Vec2::new(1.0, 0.0)));
         let mut air = 0.0;
         let mut last_cut = 0usize;
-        let max_air = (3.0 * k.r).max(8.0 * k.step);
+        let max_air = k.max_air();
         let side = if k.climb { 1.0 } else { -1.0 };
         // Steps through air not yet recorded: they are recorded when the walk cuts again, and
         // dropped with the end of the walk otherwise, so the model holds only what is cut.
@@ -973,7 +1380,10 @@ impl<'a> Level<'a> {
                 // Recorded in the model: the path must keep it.
                 last_cut = pts.len() - 1;
             }
-            if cleared > 0 {
+            // Material in the tool's circle at the new point is cut by the move there: the
+            // walk is cutting, whether or not a cell's centre was cleared (a load lighter than
+            // the raster's cell clears few of them).
+            if cleared > 0 || phi > 0.0 {
                 air = 0.0;
             } else {
                 air += pos.dist(pts.get(pts.len().saturating_sub(2)).copied().unwrap_or(pos)).max(1e-9);
@@ -1262,17 +1672,31 @@ fn cutting_samples(path: &Toolpath, spacing: f64) -> Vec<Vec3> {
     out
 }
 
-/// Adaptive clearing of `regions` (holes are islands) in depth passes: every level the same
-/// engagement-limited path, entered with a helix and cleared out to the walls (less the stock to
-/// leave). Refused when the helix has no room.
+/// Adaptive clearing of `regions` (holes are islands) in depth passes, with nothing known of
+/// the stock but that it fills the regions: [`adaptive_in`] with the default [`StockModel`].
 pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: &Cut) -> Result<AdaptivePath> {
+    adaptive_in(regions, tool, params, cut, &StockModel::default())
+}
+
+/// Adaptive clearing of `regions` (holes are islands) in depth passes, cleared out to the walls
+/// (less the stock to leave), of the material `stock` says is there.
+///
+/// With the stock's extent, the material is the regions' part of it, and the tool may also
+/// stand past a region's boundary where it meets no stock outside the regions: it goes down in
+/// the open air beside the stock and cuts in from there, and never cuts air where a region
+/// reaches past the stock. Material no walk can reach from open or cleared space is entered with
+/// a helix, refused when the helix has no room. Levels at or above the stock's top are left
+/// out. Without a map of earlier cuts every level is the same and is planned once; with one,
+/// each level is planned on what the map leaves at it (rest machining).
+pub fn adaptive_in(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: &Cut, stock: &StockModel) -> Result<AdaptivePath> {
     mills(tool, params.ramp_angle)?;
     params.validate(tool)?;
     cut.heights.validate()?;
     cut.feeds.validate()?;
     check_stepdown(cut.stepdown)?;
-    let zs = levels(cut.heights.top, cut.heights.bottom, cut.stepdown, false)?;
-    check_flutes(tool, cut.heights.top, &zs)?;
+    stock.validate()?;
+    let all = levels(cut.heights.top, cut.heights.bottom, cut.stepdown, false)?;
+    check_flutes(tool, cut.heights.top, &all)?;
     let k = Knobs::new(tool, params);
     let shape = Shape::from_regions(regions, params.tolerance)?;
     let (mut lo, mut hi) = (Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY));
@@ -1281,44 +1705,98 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
         lo = Vec2::new(lo.x.min(a.x), lo.y.min(a.y));
         hi = Vec2::new(hi.x.max(b.x), hi.y.max(b.y));
     }
-    let g = Grid::new(lo - Vec2::new(2.0 * k.h, 2.0 * k.h), hi + Vec2::new(2.0 * k.h, 2.0 * k.h), k.h)?;
+    let wall = k.r + params.stock_to_leave + k.margin;
+    // With the stock's extent the tool may go past the regions' boundary into open air: the
+    // raster reaches as far round them as an adaptive roughing's round its stock.
+    let grow = if stock.rect.is_some() { k.r + 2.0 * k.step + 4.0 * k.h } else { 2.0 * k.h };
+    let g = Grid::new(lo - Vec2::new(grow, grow), hi + Vec2::new(grow, grow), k.h)?;
     let pieces = shape.loops().iter().map(Vec::len).sum::<usize>().max(1);
-    let mut work = Work::new();
-    work.add(g.len() as f64 * pieces as f64 * 0.05)?;
-    let walls = Walls { shape, wall: k.r + params.stock_to_leave + k.margin };
-    let allow: Vec<bool> = (0..g.len()).map(|c| walls.shape.clear(g.center_of(c), walls.wall)).collect();
-    if !allow.iter().any(|a| *a) {
+    let fence = stock.rect.map(|[slo, shi]| Fence::new(shape.clone(), slo, shi, wall));
+    let walls = Walls { shape, wall };
+    let domain: &dyn Domain = match &fence {
+        Some(f) => f,
+        None => &walls,
+    };
+    let fence_pieces = fence.as_ref().map_or(0, |f| f.walls.len());
+    let top = stock.top.map_or(cut.heights.top, |t| t.min(cut.heights.top));
+    let zs: Vec<f64> = all.iter().copied().filter(|z| *z < top - 1e-9).collect();
+    let per_level = stock.heights.is_some();
+    let planned_levels = if per_level { zs.len() } else { zs.len().min(1) };
+    let mut work = Work::new(MAX_WORK);
+    work.add(g.len() as f64 * (pieces + fence_pieces) as f64 * 0.05)?;
+    let mut allow = Vec::with_capacity(g.len());
+    for c in 0..g.len() {
+        allow.push(domain.allowed(g.center_of(c))?);
+    }
+    let room = allow.iter().filter(|a| **a).count();
+    if room == 0 {
         return invalid("the tool does not fit the region");
     }
-    let mut steps_taken = 0usize;
-    let inside = |p: Vec2| walls.shape.inside(p, k.h);
-    let anywhere = |_: Vec2| true;
-    let (plan, helices, left) = {
-        let mut lv = Level::new(g, k, &walls, allow, &inside, &anywhere, &mut steps_taken, &mut work)?;
-        let (plan, helices) = lv.plan(None, &|_, _| None)?;
-        let left = lv.material_cells();
-        (plan, helices, left)
-    };
+    // Refused at once where the walks would take too many steps: the area the centre may
+    // cover and the tool's reach round it, at every level planned.
+    let area = room as f64 * k.h * k.h + (hi.x - lo.x + hi.y - lo.y) * 2.0 * k.r;
+    let fits = |kn: &Knobs| expected_steps(kn, area) * planned_levels as f64 <= MAX_STEPS as f64;
+    if !fits(&k) {
+        return Err(CamError::TooLarge(format!(
+            "the adaptive clearing at an optimal load of {} mm needs some {:.2e} steps over {area:.0} mm² and {planned_levels} planned levels, more than {MAX_STEPS}; {}",
+            params.optimal_load,
+            expected_steps(&k, area) * planned_levels as f64,
+            load_hint(tool, params, &fits)
+        )));
+    }
     let mut e = Emit::new(cut.heights, cut.feeds);
-    let mut slab_top = cut.heights.top;
+    let mut slab_top = top;
+    let (mut helices, mut left, mut cut_levels) = (0usize, 0usize, 0usize);
+    let mut once: Option<(Vec<Step>, usize, usize)> = None;
     for &z in &zs {
+        let (plan, n_helix, n_left) = match &once {
+            Some(p) if !per_level => p.clone(),
+            _ => {
+                let mut steps_taken = 0usize;
+                let cell_stock = |p: Vec2| walls.shape.inside(p, k.h) && stock.material_at(p, z);
+                let at = |p: Vec2| stock.material_at(p, z);
+                let cap = slab_top;
+                let floor_at = |c: Vec2, rad: f64| Some(stock.top_over(c, rad, cap).max(z));
+                let mut lv = Level::new(g, k, domain, allow.clone(), &cell_stock, &at, &mut steps_taken, &mut work)?;
+                let (plan, n_helix) = lv.plan(None, &floor_at)?;
+                let n_left = lv.material_cells();
+                (plan, n_helix, n_left)
+            }
+        };
+        if !per_level && once.is_none() {
+            once = Some((plan.clone(), n_helix, n_left));
+        }
+        if !plan.is_empty() {
+            cut_levels += 1;
+        }
+        helices += n_helix;
+        left += n_left;
         emit_level(&mut e, &plan, z, slab_top, &k)?;
         slab_top = z;
     }
     let (path, roles, lifts) = e.finish()?;
-    // The path's own check: every cutting point stays inside the walls.
+    // The path's own check: every cutting point stays inside the walls (off the stock outside
+    // the regions).
     let wall = k.r + params.stock_to_leave;
     for p in cutting_samples(&path, k.r * 0.25) {
-        if !walls.shape.clear(Vec2::new(p.x, p.y), wall - 1e-6) {
+        let q = Vec2::new(p.x, p.y);
+        let ok = match &fence {
+            Some(f) => f.clear(q, wall - 1e-6),
+            None => walls.shape.clear(q, wall - 1e-6),
+        };
+        if !ok {
             return Err(CamError::Unsafe(format!("the adaptive path comes closer than the tool radius to a wall at ({:.4}, {:.4})", p.x, p.y)));
         }
     }
-    let left_area = left as f64 * k.h * k.h * zs.len() as f64;
+    let left_area = left as f64 * k.h * k.h;
     let mut warnings = Vec::new();
+    if cut_levels == 0 {
+        warnings.push("there is no stock to clear in the regions between the operation's top and bottom".to_string());
+    }
     if left > 0 {
         warnings.push(format!("about {left_area:.2} mm² of material within reach was left (narrow corners the walk did not get into)"));
     }
-    Ok(AdaptivePath { path, roles, levels: zs.len(), helices: helices * zs.len(), lifts, left_area, warnings })
+    Ok(AdaptivePath { path, roles, levels: cut_levels, helices, lifts, left_area, warnings })
 }
 
 /// The stock rectangle of an adaptive roughing.
@@ -1432,18 +1910,29 @@ pub fn adaptive_roughing(surface: &Surface, tool: &Tool, p: &AdaptiveRoughingPar
         c.validate()?;
         c
     };
-    // Refused at once where the levels over this raster would take minutes; each level is then
-    // held to a limit of its own.
-    check_roughing_work(zs.len(), g.len())?;
+    if let Some(m) = &p.rest {
+        m.validate()?;
+    }
+    // What earlier cuts left (rest machining): material thinner than this above a level is
+    // not chased.
+    let left_by = StockModel { rect: None, top: None, heights: p.rest.clone(), rest_tolerance: p.adaptive.tolerance.max(REST_TOLERANCE) };
+    // Refused at once where the levels over this raster would take minutes or their walks too
+    // many steps, with the smallest load that would plan; each level is then held to a budget
+    // of its own.
+    let area = (shi.x - slo.x) * (shi.y - slo.y);
+    let fits = |kn: &Knobs| {
+        let steps = expected_steps(kn, area);
+        zs.len() as f64 * (g.len() as f64 * TYPICAL_LEVEL_WORK_PER_CELL + steps * kn.step_work()) <= MAX_ROUGHING_WORK && steps <= MAX_STEPS as f64
+    };
+    check_roughing_work(zs.len(), g.len(), expected_steps(&k, area), k.step_work(), &|| load_hint(tool, &p.adaptive, &fits))?;
     let budget = Budget::new();
-    let mut work = Work::for_levels(zs.len(), g.len());
-    // How far down each cell has been cleared by the levels so far.
-    let mut floor = vec![p.heights.top; g.len()];
+    let mut work = Work::new(0.0);
+    // How far down each cell has been cleared by the levels so far (or by earlier cuts).
+    let mut floor: Vec<f64> = (0..g.len()).map(|c| left_by.top_over(g.center_of(c), 0.0, p.heights.top)).collect();
     let mut e = Emit::new(p.heights, p.feeds);
     let (mut helices, mut cut_levels, mut left) = (0usize, 0usize, 0usize);
     for &z in &zs {
         // Each level's work and walk steps are its own.
-        work.start_level();
         let mut steps_taken = 0usize;
         let domain = Clear { surface, cutter: grown, grown_by: leave, z, lo: rlo, hi: rhi, budget: &budget };
         let mut allow = Vec::with_capacity(g.len());
@@ -1452,7 +1941,8 @@ pub fn adaptive_roughing(surface: &Surface, tool: &Tool, p: &AdaptiveRoughingPar
         }
         let before: Vec<bool>;
         let (plan, n_helix, n_left) = {
-            let mut lv = Level::new(g, k, &domain, allow, &in_stock, &in_stock, &mut steps_taken, &mut work)?;
+            let here = |q: Vec2| in_stock(q) && left_by.material_at(q, z);
+            let mut lv = Level::new(g, k, &domain, allow, &here, &here, &mut steps_taken, &mut work)?;
             before = lv.mat.clone();
             let floor_ref = &floor;
             let floor_at = |c: Vec2, rad: f64| -> Option<f64> {

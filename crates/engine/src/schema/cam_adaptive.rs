@@ -58,6 +58,14 @@ operation! {
         /// adaptive path. Default: true.
         #[serde(default)]
         pub compare: Option<bool>,
+        /// Take the job's stock box as what there is to cut: the material is the profiles'
+        /// part of it, the tool goes down in the open air beside the stock (also past a
+        /// profile drawn round the stock) and cuts in from there, and levels above the stock's
+        /// top are left out. false: the profiles are full of material and entered with a helix
+        /// (as before). Without a stock box, or seen other than straight down, the profiles
+        /// are full of material. Default: true.
+        #[serde(default)]
+        pub from_stock: Option<bool>,
     }
 }
 

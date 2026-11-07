@@ -245,7 +245,7 @@ are `{clearance, retract, top, bottom}` in the operation's coordinates.
 | `pencil` | `heights`; `min_angle_deg` (30); `passes` (0: the crease alone); `stepover` (tool's, else 10% of its diameter); `min_length` (the tool's radius); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` |
 | `rest_finish` | `heights`; `previous_tool` (a tool number of the job); `threshold` (twice the tolerance); `scallop_height` or `stepover`; `overlap` (a quarter of the diameter); `boundary`; `stock_to_leave` (0); `step`; `tolerance`; `climb` |
 | `drill` | `sketch` (circle centres, `circles` (true), filtered by `diameter_range: [min, max]`, and lone points, `sketch_points` (true)) or `points: [[x, y], …]`; `heights` (`retract` is the R height, `top` the hole's top, `bottom` its depth); `cycle`: `simple` \| `dwell` \| `peck` \| `chip_break` (simple); `peck` (tool's stepdown, else its diameter); `peck_clearance` (0.5); `back_off` (0.5); `dwell_seconds` (0.5); `to_full_diameter` (false); `stay_at_retract` (false). See [Drilling](#drilling). |
-| `adaptive` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown` (tool's, else its diameter); `optimal_load` (tool's `stepover`, else 10% of its diameter); `min_engagement_deg`, `max_engagement_deg` (from the load: see [Adaptive clearing](#adaptive-clearing)); `helix_diameter` (80% of the tool's); `ramp_angle_deg` (2); `climb`; `stock_to_leave` (0); `tolerance`; `compare` (true) |
+| `adaptive` | `sketch` + `profiles?` or `polygon`; `heights`; `stepdown` (tool's, else its diameter); `optimal_load` (tool's `stepover`, else 10% of its diameter); `min_engagement_deg`, `max_engagement_deg` (from the load: see [Adaptive clearing](#adaptive-clearing)); `helix_diameter` (80% of the tool's); `ramp_angle_deg` (2); `climb`; `stock_to_leave` (0); `tolerance`; `compare` (true); `from_stock` (true: see [Adaptive clearing](#adaptive-clearing)) |
 | `adaptive_roughing` | `heights` (`top` is the stock's top); `stepdown`; `optimal_load`; `min_engagement_deg`, `max_engagement_deg`; `helix_diameter`; `ramp_angle_deg`; `climb`; `boundary` (the stock's extent; the part's extent); `stock_to_leave` (0.25); `flats` (true); `tolerance` |
 | `chamfer` | `sketch` + `profiles?` or `polygon`; `heights: {clearance, retract, top}` (no `bottom`: the depth follows from the width); `width` (across the top); `tip_offset` (0.2); `side`: `outside` \| `inside` (outside); `climb` (true); `tolerance`. A chamfer mill only; see [Chamfers](#chamfers) |
 | `indexed` | `a_deg` and `operation`: any of the 3-axis operations above, run with A held at `a_deg` (3+1); optionally `name`, used when the inner operation has none. The inner operation carries the tool and feeds. |
@@ -542,27 +542,36 @@ the tool's engagement held down: the share of its circumference in material neve
 small, not very rigid mill best: take a deep `stepdown` (the flute length the tool's data allows)
 with a light `optimal_load` (5% to 15% of the diameter) and the full feed.
 
-The path is planned on a raster of the material a sixteenth of the tool radius fine, with exact
-distances to the path already planned near the edge of the cut. It is walked in short steps,
+The path is planned on a raster of the material a sixteenth of the tool radius fine, whatever
+the load, with exact distances to the path already planned near the edge of the cut (so a light
+load needs more steps, not finer cells). It is walked in short steps,
 turning at most 25° a step, so its corners are rounded; at each step it takes the heading whose
 engagement is nearest the optimal load's (on a straight edge `acos(1 − load / radius)`), with the
 material on the climb (or conventional) side, and never one above the limit. Where a walk can
-cut no more, the next starts where cleared space meets material, reached by a feed through
-cleared material when there is one with the tool down, by lifting to `retract` otherwise.
+cut no more (a walk that has gone a little more than a half turn at its tightest without
+cutting ends there rather than wander through what it cleared), the next starts where cleared
+space meets material, reached by a feed through cleared material when there is one with the
+tool down, by lifting to `retract` otherwise.
 
 - **Entry.** Where the tool can reach the material from open air (round the stock in
-  `adaptive_roughing`) it goes down outside it. Material enclosed on every side is entered with
+  `adaptive_roughing`, and in `adaptive` round the job's stock box: see Stock) it goes down
+  outside it. Material enclosed on every side is entered with
   a helix of `helix_diameter` at `ramp_angle_deg`, then a circle at the level; with no room for
   the helix the operation is refused, saying so.
-- **Levels.** `adaptive` cuts the same path at every depth pass. `adaptive_roughing` plans each
+- **Levels.** `adaptive` cuts the same path at every depth pass, leaving out those at or above
+  the stock's top. `adaptive_roughing` plans each
   level where the dropped cutter (grown by `stock_to_leave`) is at or below it; with `flats` it
   adds a level at every flat area of the part (raised by the stock to leave). Levels further
   apart than the tool's `flute_length` are refused: the shank would rub on the wall the flutes
   leave.
-- **Work.** Each level of an `adaptive_roughing` may take a number of raster cell visits in
-  proportion to its raster (not to the number of levels, so a larger stepdown is never refused
-  where a smaller one passes); a job whose levels over its raster would typically take minutes
-  is refused before any is planned, saying how many levels and cells and what to change.
+- **Work.** Each level may take a number of raster cell visits in proportion to its raster and
+  to the steps its area and load call for (not to the number of levels, so a larger stepdown is
+  never refused where a smaller one passes). A clearing whose walks would take more than
+  3,000,000 steps, or an `adaptive_roughing` whose levels would typically take minutes, is
+  refused before any is planned, saying how many levels, cells and steps, and naming the
+  smallest `optimal_load` that would plan (its engagement limit raised with it as by default).
+  A 6 mm tool plans 2% of its diameter (0.12 mm) round a boss on a 100 × 60 mm stock in about
+  25 s on the test build.
 - **Corners.** An inside corner sharper than the limit allows is not driven into: a fillet
   somewhat larger than the tool's is left there for a finishing contour (`left_area` in the
   report).
@@ -571,9 +580,20 @@ Defaults: `optimal_load` is the tool's `stepover` (a tool library's adaptive sta
 10% of its diameter; `max_engagement_deg` one and a half times the optimal load's engagement and
 at least 15° more than it; `min_engagement_deg` a third of it, and at most half the
 `max_engagement_deg`. A `max_engagement_deg` below the load's engagement wins: the path aims at
-the narrower width the limit allows, which is slower to plan; a width under about 3% of the
-tool's radius can be refused as too much work.
+the narrower width the limit allows, which takes more steps.
 
+- **Stock in 2D.** `adaptive` takes the job's stock box (with `from_stock`, true by default)
+  as what there is to cut: the material is the profiles' part of it, from its top down. The
+  tool may also stand past a profile's edge where it meets no stock outside the profiles (beyond
+  the stock's edge, or past a profile drawn round the stock), so it goes down in the open air
+  beside the stock and cuts in from there, and never cuts air where a profile reaches past the
+  stock. Stock outside the profiles is a wall like the profiles' own. A profile enclosed by
+  stock is still entered with a helix. Without a stock box, with `from_stock: false`, or in a
+  frame that does not look straight down on the stock, the profiles are taken as full of
+  material and entered with a helix. Round a 30 × 20 mm boss on a 60 × 50 mm stock at 0.6 mm
+  with a 6 mm tool the path is 1.3 times the area over the load (it was 7.6 times, entered with
+  a helix); a closed 40 mm square pocket is about 1.9 times (it was 3.3), the corners needing a
+  way back to each new cut when every cut climbs.
 - **Stock.** `adaptive_roughing` takes the material as the box over `boundary` (its rectangle,
   and inside its polygon too) from `top` down, and goes down to a level in the open air outside
   it. Without `boundary.rect` the stock is the part's extent seen from above, and the report

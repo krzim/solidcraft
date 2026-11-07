@@ -3,9 +3,11 @@
 //! planned, and its engagement measured against the material (and, for `adaptive`, against a
 //! plain offset pocket of the same profiles) for the report.
 
+use solidcore_record::Vec3;
 use solidcore_record::{Loop2, Region2, Seg2, Vec2};
-use solidcraft_cam::adaptive::{AdaptiveParams, AdaptivePath, AdaptiveRoughingParams, adaptive, adaptive_roughing};
+use solidcraft_cam::adaptive::{AdaptiveParams, AdaptivePath, AdaptiveRoughingParams, StockModel, adaptive_in, adaptive_roughing};
 use solidcraft_cam::engagement::{Engagement, Material, engagement};
+use solidcraft_cam::stock::Stock;
 use solidcraft_cam::{Cut, Frame, PocketParams, Surface, Toolpath, pocket};
 
 use super::{Ctx, Resolved, heights, or_tool};
@@ -107,6 +109,25 @@ fn rect_region(lo: Vec2, hi: Vec2) -> Region2 {
     Region2 { outer: Loop2 { segs }, holes: vec![] }
 }
 
+/// The job's stock box seen in the operation's frame `frame`, when the operation looks straight
+/// down on it (its Z along work Z): the box round its corners there, and its top. Any other
+/// stock, or none, says nothing (the regions are then taken as full of material).
+fn stock_in(stock: Option<&Stock>, frame: &Frame) -> StockModel {
+    let Some(Stock::Box { min, max }) = stock else { return StockModel::default() };
+    if !(frame.z.z > 1.0 - 1e-9) {
+        return StockModel::default();
+    }
+    let (mut lo, mut hi) =
+        (Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY));
+    for k in 0..8 {
+        let c = Vec3::new(if k & 1 == 0 { min.x } else { max.x }, if k & 2 == 0 { min.y } else { max.y }, if k & 4 == 0 { min.z } else { max.z });
+        let l = frame.to_local(c);
+        lo = Vec3::new(lo.x.min(l.x), lo.y.min(l.y), lo.z.min(l.z));
+        hi = Vec3::new(hi.x.max(l.x), hi.y.max(l.y), hi.z.max(l.z));
+    }
+    StockModel { rect: Some([Vec2::new(lo.x, lo.y), Vec2::new(hi.x, hi.y)]), top: Some(hi.z), ..Default::default() }
+}
+
 /// `adaptive`: 2D adaptive clearing of profiles.
 pub(super) fn plan(ctx: &Ctx<'_>, o: &AdaptiveOp, frame: &Frame) -> Result<(Toolpath, Resolved, &'static str)> {
     let c = o.common();
@@ -128,9 +149,10 @@ pub(super) fn plan(ctx: &Ctx<'_>, o: &AdaptiveOp, frame: &Frame) -> Result<(Tool
             o.tolerance,
         ),
     )?;
-    let a = adaptive(&regions, &r.tool, &p, &cut).map_err(|e| ctx.bad(c.name, e))?;
+    let stock = if o.from_stock.unwrap_or(true) { stock_in(ctx.stock, frame) } else { StockModel::default() };
+    let a = adaptive_in(&regions, &r.tool, &p, &cut, &stock).map_err(|e| ctx.bad(c.name, e))?;
     let mut warnings = a.warnings.clone();
-    let material = Material { regions: regions.clone(), top: cut.heights.top, within: None };
+    let material = Material { regions: regions.clone(), top: stock.top.map_or(cut.heights.top, |t| t.min(cut.heights.top)), within: stock.rect };
     let radius = r.tool.radius();
     let e = measure(&a.path, Some(&a.roles), radius, &material, &mut warnings);
     let mut rep = report(&a, e, p.max_engagement.to_degrees());
@@ -189,6 +211,7 @@ pub(super) fn plan_roughing(ctx: &Ctx<'_>, o: &AdaptiveRoughingOp, surface: &Sur
         boundary: boundary.clone(),
         flats: o.flats.unwrap_or(true),
         adaptive: p,
+        rest: None,
     };
     let a = adaptive_roughing(surface, &r.tool, &rp).map_err(|e| ctx.bad(c.name, e))?;
     let mut warnings = a.warnings.clone();

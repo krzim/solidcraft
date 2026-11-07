@@ -7,7 +7,7 @@ use std::f64::consts::PI;
 use solidcore_record::{Loop2, Region2, Seg2, Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
-use crate::adaptive::{AdaptiveParams, AdaptivePath, AdaptiveRoughingParams, MoveRole, adaptive, adaptive_roughing};
+use crate::adaptive::{AdaptiveParams, AdaptivePath, AdaptiveRoughingParams, MoveRole, StockModel, adaptive, adaptive_in, adaptive_roughing};
 use crate::dropcutter::drop_z;
 use crate::engagement::{Material, engagement};
 use crate::ops::{Cut, Feeds, Heights, PocketParams, pocket};
@@ -363,6 +363,7 @@ fn roughing_params() -> AdaptiveRoughingParams {
         boundary: Boundary::default(),
         flats: true,
         adaptive: AdaptiveParams { stock_to_leave: 0.25, ..params() },
+        rest: None,
     }
 }
 
@@ -483,23 +484,26 @@ fn adaptive_clearing_refuses_tools_that_cannot_clear() {
 }
 
 /// The work an adaptive roughing may take is bounded level by level, each level's bound scaled
-/// to its raster and not to how many levels there are, so a larger stepdown (fewer levels) is
-/// never refused where a smaller one is planned (the old bound on the whole operation refused a
-/// 100 x 80 mm plate round a boss at a 4 mm stepdown after 50 s of planning and passed it at
-/// 6 mm). A job that would take minutes is refused at once, with the numbers and what to change.
+/// to its raster and to the walks its area and load call for, not to how many levels there are,
+/// so a larger stepdown (fewer levels) is never refused where a smaller one is planned. A job
+/// that would take minutes is refused at once, with the numbers and what to change.
 #[test]
 fn adaptive_roughing_work_is_bounded_per_level_and_refused_at_once_when_too_large() {
     use crate::adaptive::{MAX_ROUGHING_WORK, TYPICAL_LEVEL_WORK_PER_CELL, check_roughing_work, level_work_limit};
     let cells = 400_000;
+    let (steps, step_work) = (20_000.0, 4000.0);
+    let hint = || "a hint".to_string();
     // Monotonic in the number of levels: once refused, refused for every larger number.
-    let first = (1..=200).find(|&n| check_roughing_work(n, cells).is_err()).unwrap();
-    assert!((first..=200).all(|n| check_roughing_work(n, cells).is_err()));
-    assert!((1..first).all(|n| check_roughing_work(n, cells).is_ok()));
-    assert!(first as f64 * cells as f64 * TYPICAL_LEVEL_WORK_PER_CELL > MAX_ROUGHING_WORK);
+    let first = (1..=200).find(|&n| check_roughing_work(n, cells, steps, step_work, &hint).is_err()).unwrap();
+    assert!((first..=200).all(|n| check_roughing_work(n, cells, steps, step_work, &hint).is_err()));
+    assert!((1..first).all(|n| check_roughing_work(n, cells, steps, step_work, &hint).is_ok()));
+    assert!(first as f64 * (cells as f64 * TYPICAL_LEVEL_WORK_PER_CELL + steps * step_work) > MAX_ROUGHING_WORK);
     // A 2 mm stepdown down 20 mm of that raster is planned.
-    assert!(check_roughing_work(11, cells).is_ok());
-    // The level's own bound does not shrink with more levels; it grows with the raster.
-    assert!(level_work_limit(2 * cells) > level_work_limit(cells));
+    assert!(check_roughing_work(11, cells, steps, step_work, &hint).is_ok());
+    // The level's own bound does not shrink with more levels; it grows with the raster and with
+    // the steps its walks are expected to take.
+    assert!(level_work_limit(2 * cells, steps, step_work) > level_work_limit(cells, steps, step_work));
+    assert!(level_work_limit(cells, 2.0 * steps, step_work) > level_work_limit(cells, steps, step_work));
     // Refused at once, naming the fix.
     let start = std::time::Instant::now();
     let surface = Surface::new(plate_and_boss()).unwrap();
@@ -518,4 +522,156 @@ fn adaptive_roughing_work_is_bounded_per_level_and_refused_at_once_when_too_larg
     p.stepdown = 1.0;
     let a = adaptive_roughing(&surface, &flat(6.0), &p).unwrap();
     assert!(a.levels >= 6, "{a:?}");
+}
+
+/// A 6 mm end mill's adaptive parameters at `load` mm, the engagement limits as a job sets them
+/// by default (one and a half times the load's, a third of it at least).
+fn light(load: f64) -> AdaptiveParams {
+    let opt = (1.0 - load / 3.0f64).acos();
+    let most = (opt * 1.5).max(opt + 15.0 * DEG).min(PI);
+    AdaptiveParams { optimal_load: load, min_engagement: (opt / 3.0).min(most * 0.5), max_engagement: most, ..params() }
+}
+
+/// A 60 x 50 mm plate 5 mm thick under a 30 x 20 mm boss 5 mm high, its top at Z 0.
+fn plate_under_boss(half: Vec2) -> Surface {
+    let mut t = Vec::new();
+    box_tris(Vec3::new(-half.x, -half.y, -10.0), Vec3::new(half.x, half.y, -5.0), &mut t);
+    box_tris(Vec3::new(-15.0, -10.0, -5.0), Vec3::new(15.0, 10.0, 0.0), &mut t);
+    Surface::new(t).unwrap()
+}
+
+/// The light loads a small mill's tool library sets (5% of the diameter, and 2% for the larger
+/// tools) are planned, not refused: the planner's raster follows the tool, not the load, and
+/// its budget scales with the area and the load. Before, a 6 mm tool at 0.3 mm round a boss on
+/// a 60 x 50 mm stock was refused after half a minute, and 0.45 mm on 100 x 60 mm took 26 s.
+#[test]
+fn light_loads_plan_round_a_boss() {
+    let tool = flat(6.0);
+    for (half, load) in [(Vec2::new(30.0, 25.0), 0.3), (Vec2::new(50.0, 30.0), 0.12)] {
+        let surface = plate_under_boss(half);
+        let p = AdaptiveRoughingParams {
+            heights: Heights { clearance: 10.0, retract: 2.0, top: 0.0, bottom: -5.0 },
+            feeds: Feeds { cut: 1000.0, plunge: 200.0 },
+            stepdown: 5.0,
+            boundary: Boundary { rect: Some([-half, half]), region: None },
+            flats: true,
+            adaptive: AdaptiveParams { stock_to_leave: 0.0, ..light(load) },
+            rest: None,
+        };
+        let start = std::time::Instant::now();
+        let a = adaptive_roughing(&surface, &tool, &p).unwrap();
+        let took = start.elapsed();
+        let area = 4.0 * half.x * half.y - 600.0;
+        let ratio = a.path.stats().cut_length / (area / load);
+        eprintln!("{half:?} at {load} mm: {took:?}, path {:.0} mm, {ratio:.2} x area/load", a.path.stats().cut_length);
+        assert!(ratio <= 1.5, "{ratio}");
+        assert!(took.as_secs() < 120, "{took:?}");
+        assert_eq!(a.helices, 0);
+    }
+}
+
+/// Where the walks would take more steps than a clearing may, the refusal comes at once and
+/// names the smallest load that plans.
+#[test]
+fn a_refusal_names_the_smallest_load_that_plans() {
+    let start = std::time::Instant::now();
+    let tool = flat(6.0);
+    let big = square(400.0);
+    let e = adaptive(std::slice::from_ref(&big), &tool, &light(0.05), &cut(0.0, -1.0)).unwrap_err();
+    let msg = e.to_string();
+    assert!(matches!(e, CamError::TooLarge(_)) && msg.contains("optimal load of at least"), "{msg}");
+    assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+    // The load named is one the estimate lets through.
+    let at: f64 = msg.split("at least ").nth(1).and_then(|t| t.split(' ').next()).and_then(|t| t.parse().ok()).unwrap();
+    assert!(at > 0.05 && at <= 6.0, "{at}");
+}
+
+/// The cut length of `a` against the area it clears over the load (one level).
+fn length_ratio(a: &AdaptivePath, area: f64, load: f64) -> f64 {
+    a.path.stats().cut_length / (area / load)
+}
+
+/// A 60 x 50 mm ring round a 30 x 20 mm boss whose outside is the stock's edge.
+fn ring() -> Region2 {
+    region(&[(-30.0, -25.0), (30.0, -25.0), (30.0, 25.0), (-30.0, 25.0)], &[&[(-15.0, -10.0), (-15.0, 10.0), (15.0, 10.0), (15.0, -10.0)]])
+}
+
+fn ring_stock() -> StockModel {
+    StockModel { rect: Some([Vec2::new(-30.0, -25.0), Vec2::new(30.0, 25.0)]), top: Some(0.0), ..Default::default() }
+}
+
+/// Given the stock, a 2D clearing goes down in the open air beside it and cuts in from there,
+/// as an adaptive roughing does: no helix, and a path about as long as the area over the load.
+/// Without it (the regions taken as full of material, entered with a helix) the same ring took
+/// 30.5 m at 0.6 mm, 7.6 times the area over the load, and was refused at 0.3 mm.
+#[test]
+fn a_2d_clearing_given_the_stock_enters_from_open_air() {
+    let tool = flat(6.0);
+    for load in [0.6, 0.3] {
+        let c = Cut {
+            heights: Heights { clearance: 10.0, retract: 2.0, top: 0.0, bottom: -5.0 },
+            feeds: Feeds { cut: 1000.0, plunge: 200.0 },
+            stepdown: 5.0,
+        };
+        let p = light(load);
+        let a = adaptive_in(&[ring()], &tool, &p, &c, &ring_stock()).unwrap();
+        verify(&a.path, &c.heights).unwrap();
+        assert_eq!(a.helices, 0, "{a:?}");
+        let ratio = length_ratio(&a, 2400.0, load);
+        eprintln!("ring at {load} mm: {:.0} mm, {ratio:.2} x area/load", a.path.stats().cut_length);
+        assert!(ratio <= 1.5, "{ratio}");
+        // Every move that cuts below the top keeps the tool off the boss.
+        for (q, cutting) in a.path.points(1e-3) {
+            if cutting && q.z < 0.0 {
+                let (dx, dy) = ((-15.0 - q.x).max(q.x - 15.0).max(0.0), (-10.0 - q.y).max(q.y - 10.0).max(0.0));
+                assert!(dx.hypot(dy) >= 3.0 - 1e-6, "{q:?}");
+            }
+        }
+        let stock = Material { regions: vec![region(&[(-30.0, -25.0), (30.0, -25.0), (30.0, 25.0), (-30.0, 25.0)], &[])], top: 0.0, within: None };
+        let e = engagement(&a.path, Some(&a.roles), 3.0, &stock, 0.1).unwrap();
+        assert!(e.max_deg <= p.max_engagement / DEG + ENGAGEMENT_TOL, "{e:?}");
+        assert_eq!(e.full_slot_share, 0.0, "{e:?}");
+        assert_cleared(&[ring()], &a.path, 3.0, 0.0, -5.0, 0.4);
+    }
+}
+
+/// Where a region reaches past the stock, the part outside it is air: the clearing does not cut
+/// there, so its path is as long as the stock's part of the region needs. A level at or above
+/// the stock's top is left out.
+#[test]
+fn a_2d_clearing_does_not_cut_air_past_the_stock() {
+    let tool = flat(6.0);
+    let wide = region(&[(-40.0, -25.0), (40.0, -25.0), (40.0, 25.0), (-40.0, 25.0)], &[]);
+    let stock = StockModel { rect: Some([Vec2::new(-20.0, -25.0), Vec2::new(20.0, 25.0)]), top: Some(-1.0), ..Default::default() };
+    let c = Cut {
+        heights: Heights { clearance: 10.0, retract: 2.0, top: 0.0, bottom: -3.0 },
+        feeds: Feeds { cut: 1000.0, plunge: 200.0 },
+        stepdown: 1.0,
+    };
+    let a = adaptive_in(&[wide], &tool, &params(), &c, &stock).unwrap();
+    // Levels at -1 (the stock's top: nothing to cut), -2 and -3.
+    assert_eq!(a.levels, 2, "{a:?}");
+    assert_eq!(a.helices, 0);
+    let ratio = a.path.stats().cut_length / (2.0 * 40.0 * 50.0 / 0.6);
+    assert!(ratio <= 1.5, "{ratio}");
+    // Nothing cuts past the stock but to come in from the air.
+    for (q, cutting) in a.path.points(1e-3) {
+        if cutting && q.z < -1.0 {
+            assert!(q.x.abs() <= 20.0 + 3.0 + 0.5 * 6.0, "{q:?}");
+        }
+    }
+}
+
+/// A pocket closed all round is entered with a helix and cleared out to its corners. The walk
+/// ends where it runs out of material instead of wandering through what it cleared, and the next
+/// starts where cleared space meets material again: a 40 mm square at 0.6 mm took 3.3 times the
+/// area over the load, and takes under 2.1 (the corners need a way back to each new cut when
+/// every cut climbs).
+#[test]
+fn a_closed_pocket_path_is_not_much_longer_than_its_area_over_the_load() {
+    let a = adaptive(&[square(40.0)], &flat(6.0), &light(0.6), &cut(0.0, -1.0)).unwrap();
+    let ratio = length_ratio(&a, 1600.0, 0.6);
+    eprintln!("closed square: {:.0} mm, {ratio:.2} x area/load", a.path.stats().cut_length);
+    assert!(ratio <= 2.1, "{ratio}");
+    assert_cleared(&[square(40.0)], &a.path, 3.0, 0.0, -1.0, 0.4);
 }

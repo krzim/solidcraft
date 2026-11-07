@@ -1625,6 +1625,46 @@ fn adaptive_roughing_says_when_it_takes_the_stock_from_the_part() {
     assert_eq!(a["full_slot_share"].as_f64(), Some(0.0), "{a}");
 }
 
+/// A 60 × 50 mm plate under a 30 × 20 mm boss 5 mm high, its top at Z 0, and a sketch on XY
+/// of the plate's outline and the boss's.
+fn plate_with_boss() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 50, "height": 5, "corner": [-30, -25, -10], "body_name": "Part"}));
+    run(&mut s, "solid.box", json!({"length": 30, "width": 20, "height": 5, "corner": [-15, -10, -5], "operation": "join"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Clear"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-30, -25], "p1": [30, 25]}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-15, -10], "p1": [15, 10]}));
+    run(&mut s, "sketch.finish", json!({}));
+    s
+}
+
+/// A 2D adaptive clearing takes the job's stock box: round a boss on a plate drawn to the
+/// stock's edge it goes down in the open air beside the stock and cuts in from there, with a
+/// path about as long as the area over the load (it took 30.5 m, 7.6 times that, entered with a
+/// helix and cutting the ring from the inside out). `from_stock: false` keeps the old way.
+#[test]
+fn a_2d_adaptive_clearing_takes_the_jobs_stock() {
+    let mut s = plate_with_boss();
+    let job = |from: bool| {
+        json!({"job": {"name": "ring", "machine": "3axis", "post": "mach3_4axis", "tools": [flat(1, 6.0)],
+                       "stock": {"box": {"min": [-30, -25, -10], "max": [30, 25, 0]}},
+                       "operations": [{"name": "clear", "type": "adaptive", "tool": 1, "sketch": "Clear", "profiles": [0],
+                                       "heights": {"clearance": 10, "retract": 2, "top": 0, "bottom": -5}, "stepdown": 5,
+                                       "optimal_load": 0.6, "compare": false, "from_stock": from}]},
+               "dry_run": true})
+    };
+    let r = run(&mut s, "cam.job", job(true));
+    assert_clean(&r);
+    let op = &r["operations"][0];
+    assert_eq!(op["adaptive"]["helices"], 0, "{op}");
+    assert_eq!(op["adaptive"]["full_slot_share"].as_f64(), Some(0.0), "{op}");
+    let ratio = op["cut_length"].as_f64().unwrap() / (2400.0 / 0.6);
+    assert!(ratio <= 1.5, "{ratio}: {op}");
+    let r = run(&mut s, "cam.job", job(false));
+    assert_clean(&r);
+    assert!(r["operations"][0]["adaptive"]["helices"].as_u64().is_some_and(|h| h >= 1), "{r}");
+}
+
 /// A block 30 × 20 × 10, its top at Z 0, with its four top edges chamfered 1 mm at 45° when
 /// `chamfered`.
 fn plate(chamfered: bool) -> Session {
