@@ -592,8 +592,13 @@ fn operations(
     }
     let curved = if three { curved } else { Vec::new() };
     if !r.surfaces.is_empty() && three {
-        let floor = curved.iter().map(|c| c.1).fold(top, f64::min);
-        if let Some(t) = flats.first() {
+        // No lower than the part's bottom (a curved face's reported extent may run past its edges).
+        let floor = curved.iter().map(|c| c.1).fold(top, f64::min).max(bottom);
+        // A tool that stands out of its holder deeper than the roughing goes, else the largest.
+        let depth = top + stock_top - floor;
+        let reach = |t: &&&Pick| t.tool.stickout.unwrap_or(t.tool.flute_length) >= depth + 1.0;
+        if let Some(t) = flats.iter().find(reach).or(flats.first()) {
+            let floor = within_reach(plan, &t.tool, top + stock_top, floor, "rough 3D");
             let m = t.tool.radius() + 1.0;
             let op = json!({
                 "name": "rough 3D", "type": "adaptive_roughing", "tool": t.tool.number,
@@ -750,6 +755,15 @@ fn operations(
     let mut drilled: Vec<(u32, [f64; 4], Option<f64>, bool, Vec<[f64; 2]>, Vec<String>, f64)> = Vec::new();
     for h in holes {
         let Ok(g) = set.get(&h.id) else { continue };
+        if !(h.depth > tol) {
+            plan.skipped.push(format!(
+                "{} (diameter {} mm): no depth to cut from its setup's side (its wall starts and ends at Z {}): drill or mill it with an operation of your own",
+                h.id,
+                num(h.diameter),
+                num(h.top_z)
+            ));
+            continue;
+        }
         let regions = regions_of(g, g.bottom, tol);
         // A drill of its diameter, where a drill's point is what the hole ends in (through, or a
         // drill point) and its flutes reach.
@@ -868,7 +882,8 @@ fn operations(
             let m = t.tool.radius() + 0.5;
             let lo = curved.iter().map(|c| c.2[0]).fold([f64::INFINITY; 2], |a, b| [a[0].min(b[0]), a[1].min(b[1])]);
             let hi = curved.iter().map(|c| c.2[1]).fold([f64::NEG_INFINITY; 2], |a, b| [a[0].max(b[0]), a[1].max(b[1])]);
-            let floor = curved.iter().map(|c| c.1).fold(top, f64::min);
+            let floor = curved.iter().map(|c| c.1).fold(top, f64::min).max(bottom);
+            let floor = within_reach(plan, &t.tool, top, floor, "finish 3D");
             let op = json!({
                 "name": "finish 3D", "type": "parallel", "tool": t.tool.number,
                 "heights": {"clearance": top + stock_top + 10.0, "retract": top + stock_top + 2.0, "top": top, "bottom": floor},
@@ -895,7 +910,7 @@ fn operations(
             let x1 = r.turned.iter().map(|x| x.x_max).fold(f64::NEG_INFINITY, f64::max);
             let step = (t.tool.diameter * 0.25 / swing.max(1.0)).to_degrees().clamp(2.0, 15.0);
             let op = json!({
-                "name": "finish turned", "type": "rotary_finish", "tool": t.tool.number,
+                "name": "finish turned", "type": "rotary_finish", "tool": t.tool.number, "tolerance": tol * 0.5,
                 "pattern": {"type": "lines", "angle_step_deg": step},
                 "clearance": swing + 10.0, "retract": swing + 3.0, "range": [x0, x1]
             });
@@ -961,6 +976,25 @@ fn operations(
         num(WALL_STOCK)
     ));
     let _ = bottom;
+}
+
+/// `floor`, or as deep below `top` as `t` stands out of its holder (less a millimetre) where
+/// that is higher, with a check line saying what is left: the holder would touch the part.
+fn within_reach(plan: &mut Plan, t: &Tool, top: f64, floor: f64, what: &str) -> f64 {
+    let reach = t.stickout.unwrap_or(t.flute_length) - 1.0;
+    if top - floor <= reach {
+        return floor;
+    }
+    let lowest = top - reach.max(0.0);
+    plan.check.push(format!(
+        "{what}: tool {} stands out {} mm from its holder, so it goes down to Z {} only (the curved areas reach Z {}): finish below with a \
+         longer tool, or give it more stickout and its `stickout`",
+        t.number,
+        num(t.stickout.unwrap_or(t.flute_length)),
+        num(lowest),
+        num(floor)
+    ));
+    lowest
 }
 
 /// The points of a circle within `tol`, for a polygon round a hole.
